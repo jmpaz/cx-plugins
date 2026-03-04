@@ -745,7 +745,7 @@ def _download_to_temp(
     url: str, suffix: str = "", *, media_cache_identity: str | None = None
 ) -> Path | None:
     from contextualize.cache.arena import get_cached_media_bytes, store_media_bytes
-    from .media import download_cached_media_to_temp
+    from ..shared.media import download_cached_media_to_temp
     from contextualize.runtime import get_refresh_media
 
     cache_identity = media_cache_identity or url
@@ -767,7 +767,10 @@ def _render_block_binary(
     media_cache_identity: str | None = None,
     send_label: str | None = None,
 ) -> str:
-    from contextualize.render.markitdown import MarkItDownConversionError, convert_path_to_markdown
+    from contextualize.render.markitdown import (
+        MarkItDownConversionError,
+        convert_path_to_markdown,
+    )
 
     tmp = _download_to_temp(
         url, suffix=suffix, media_cache_identity=media_cache_identity
@@ -975,7 +978,10 @@ def _append_comments_section(rendered: str | None, comments_section: str) -> str
 
 
 def _block_comments_output(block: dict, *, include_comments: bool) -> str:
-    from contextualize.cache.arena import get_cached_block_comments, store_block_comments
+    from contextualize.cache.arena import (
+        get_cached_block_comments,
+        store_block_comments,
+    )
     from contextualize.runtime import get_refresh_cache
 
     if not include_comments:
@@ -1100,7 +1106,11 @@ def _render_block(
 
     block_id = block.get("id")
     updated_at = block.get("updated_at") or ""
-    from contextualize.runtime import get_refresh_images, get_refresh_media, get_refresh_videos
+    from contextualize.runtime import (
+        get_refresh_images,
+        get_refresh_media,
+        get_refresh_videos,
+    )
 
     title = block.get("title") or ""
     if include_descriptions is None:

@@ -7,7 +7,9 @@ PLUGIN_NAME = "atproto"
 PLUGIN_PRIORITY = 100
 
 
-def normalize_manifest_config(raw_config: dict[str, Any] | None) -> dict[str, Any] | None:
+def normalize_manifest_config(
+    raw_config: dict[str, Any] | None,
+) -> dict[str, Any] | None:
     if raw_config is None:
         return None
     if not isinstance(raw_config, dict):

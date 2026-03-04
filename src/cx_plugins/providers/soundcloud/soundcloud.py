@@ -689,7 +689,10 @@ def _build_auth_context() -> _AuthContext:
     if not client_id or not client_secret:
         return _AuthContext(access_token=None, has_user_token=False)
 
-    from contextualize.cache.soundcloud import get_cached_client_token, store_client_token
+    from contextualize.cache.soundcloud import (
+        get_cached_client_token,
+        store_client_token,
+    )
 
     identity = _auth_identity(client_id)
     cached = get_cached_client_token(identity)
@@ -1316,7 +1319,7 @@ def _describe_artwork(
     )
     from contextualize.render.markitdown import convert_path_to_markdown
     from contextualize.runtime import get_refresh_images
-    from .media import download_cached_media_to_temp
+    from ..shared.media import download_cached_media_to_temp
 
     render_identity = _media_render_cache_identity(
         media_cache_identity=cache_identity,

@@ -7,7 +7,9 @@ PLUGIN_NAME = "arena"
 PLUGIN_PRIORITY = 100
 
 
-def normalize_manifest_config(raw_config: dict[str, Any] | None) -> dict[str, Any] | None:
+def normalize_manifest_config(
+    raw_config: dict[str, Any] | None,
+) -> dict[str, Any] | None:
     if raw_config is None:
         return None
     if not isinstance(raw_config, dict):
@@ -94,9 +96,7 @@ def _arena_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
                 result["recurse_users"] = {value}
         elif isinstance(recurse_users, list):
             values = {
-                str(item).strip().lower()
-                for item in recurse_users
-                if str(item).strip()
+                str(item).strip().lower() for item in recurse_users if str(item).strip()
             }
             result["recurse_users"] = values
         else:

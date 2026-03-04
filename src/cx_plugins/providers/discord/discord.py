@@ -13,7 +13,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from contextualize.references.helpers import parse_compound_duration, parse_timestamp_or_duration
+from contextualize.references.helpers import (
+    parse_compound_duration,
+    parse_timestamp_or_duration,
+)
 from contextualize.render.text import process_text
 from contextualize.utils import count_tokens
 
@@ -1506,7 +1509,7 @@ def _extract_utf8_remote_media(
         store_rendered,
     )
     from contextualize.runtime import get_refresh_media
-    from .media import download_cached_media_to_temp
+    from ..shared.media import download_cached_media_to_temp
 
     cache_identity = media_cache_identity or url
     render_identity = _media_render_cache_identity(
@@ -1557,7 +1560,10 @@ def _transcribe_media_path(
     filename: str,
     content_type: str,
 ) -> str | None:
-    from contextualize.references.audio_transcription import transcribe_audio_bytes, transcribe_audio_file
+    from contextualize.references.audio_transcription import (
+        transcribe_audio_bytes,
+        transcribe_audio_file,
+    )
 
     if kind == "audio":
         try:
@@ -1635,7 +1641,7 @@ def _describe_remote_media(
         store_rendered,
     )
     from contextualize.runtime import get_refresh_media
-    from .media import download_cached_media_to_temp
+    from ..shared.media import download_cached_media_to_temp
 
     cache_identity = media_cache_identity or url
     render_identity = _media_render_cache_identity(

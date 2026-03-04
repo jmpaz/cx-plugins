@@ -1508,7 +1508,7 @@ def _describe_media(
     )
     from contextualize.render.markitdown import convert_path_to_markdown
     from contextualize.references.audio_transcription import transcribe_audio_file
-    from .media import download_cached_media_to_temp
+    from ..shared.media import download_cached_media_to_temp
 
     url = media.get("url")
     if not isinstance(url, str) or not url:
