@@ -26,13 +26,23 @@ _SETUP_LINE_RE = re.compile(
     r"newcommand|renewcommand|providecommand|newtheorem|theoremstyle|setlength|"
     r"addtolength|hypersetup|bibliographystyle|bibliography|pagestyle|"
     r"thispagestyle|title|author|date|icmltitlerunning|icmlsetsymbol|icmlkeywords|"
-    r"icmlcorrespondingauthor|icmlcode|icmldata|icmladdress)\b"
+    r"icmlcorrespondingauthor|icmlcode|icmldata|icmladdress|maketitle)\b"
 )
 _SETUP_INPUT_RE = re.compile(
     r"^\s*\\input\{[^}]*?(?:preamble|math_commands)[^}]*\}\s*$", re.IGNORECASE
 )
-_FIGURE_ENV_RE = re.compile(r"\\begin\{figure\*?\}.*?\\end\{figure\*?\}", re.S)
+_GRAPHICS_MARKER_RE = re.compile(
+    r"(?im)^[ \t]*<\s*g\s*r\s*a\s*p\s*h\s*i\s*c\s*s\s*>[ \t]*$"
+)
 _LATEX_COMMAND_TOKEN_RE = re.compile(r"\\[A-Za-z@]+")
+_FIGURE_BEGIN_RE = re.compile(r"\\begin\{figure\*?\}")
+_FIGURE_END_RE = re.compile(r"\\end\{figure\*?\}")
+_DATE_LINE_RE = re.compile(r"^[A-Za-z]+ \d{1,2}, \d{4}$")
+_UNDERLINE_LINE_RE = re.compile(r"^=+$")
+_INDENTED_LIST_RE = re.compile(r"^\s{4}(?:[-*+] |\d+\.\s)")
+_SECTION_START_RE = re.compile(
+    r"(?im)^\s*(?:§\s+[^\n]+|#{1,6}\s+[^\n]+|\\section\*?\{)"
+)
 
 
 @dataclass(frozen=True)
@@ -404,6 +414,46 @@ def _resolve_include_path(current_path: str, include_token: str) -> str | None:
     return normalized
 
 
+def _expand_tex_includes(main_path: str, files: dict[str, str]) -> str:
+    cache: dict[str, str] = {}
+
+    def _expand(path: str, active: set[str]) -> str:
+        cached = cache.get(path)
+        if cached is not None:
+            return cached
+
+        source = files.get(path)
+        if source is None:
+            return ""
+
+        out_parts: list[str] = []
+        for line in source.splitlines(keepends=True):
+            cleaned = _line_without_unescaped_comments(line)
+            matches = list(_INCLUDE_RE.finditer(cleaned))
+            if not matches:
+                out_parts.append(line)
+                continue
+
+            cursor = 0
+            for match in matches:
+                out_parts.append(line[cursor : match.start()])
+                include_raw = line[match.start() : match.end()]
+                include_target = match.group(1)
+                resolved = _resolve_include_path(path, include_target)
+                if resolved is None or resolved not in files or resolved in active:
+                    out_parts.append(include_raw)
+                else:
+                    out_parts.append(_expand(resolved, active | {resolved}))
+                cursor = match.end()
+            out_parts.append(line[cursor:])
+
+        expanded = "".join(out_parts)
+        cache[path] = expanded
+        return expanded
+
+    return _expand(main_path, {main_path})
+
+
 def _select_tex_sidecars(
     files: dict[str, str],
     *,
@@ -465,6 +515,10 @@ def _fetch_source_bundle(
     if not isinstance(main_text, str) or not main_text.strip():
         return None
 
+    expanded_main_text = _expand_tex_includes(main_path, tex_files).strip()
+    if expanded_main_text:
+        main_text = expanded_main_text
+
     sidecar_limit = max(1, max_tex_sidecars)
     sidecars = _select_tex_sidecars(
         tex_files,
@@ -519,11 +573,104 @@ def _strip_setup_lines(tex: str) -> str:
 
 
 def _extract_figure_blocks(tex: str) -> tuple[str, ...]:
-    blocks = [
-        match.group(0).strip()
-        for match in _FIGURE_ENV_RE.finditer(tex)
-        if match.group(0).strip()
-    ]
+    ast_blocks = _extract_figure_blocks_via_ast(tex)
+    if ast_blocks:
+        return ast_blocks
+    return _extract_figure_blocks_via_scan(tex)
+
+
+def _extract_figure_blocks_via_ast(tex: str) -> tuple[str, ...]:
+    try:
+        from pylatexenc.latexwalker import LatexEnvironmentNode, LatexWalker
+    except Exception:
+        return ()
+
+    try:
+        nodes, _, _ = LatexWalker(tex).get_latex_nodes(pos=0)
+    except Exception:
+        return ()
+
+    blocks: list[str] = []
+
+    def _walk(node_list: list[Any]) -> None:
+        for node in node_list:
+            if isinstance(node, LatexEnvironmentNode):
+                env_name = getattr(node, "environmentname", "")
+                if env_name in {"figure", "figure*"}:
+                    start = getattr(node, "pos", None)
+                    length = getattr(node, "len", None)
+                    if (
+                        isinstance(start, int)
+                        and isinstance(length, int)
+                        and length > 0
+                    ):
+                        block = tex[start : start + length].strip()
+                        if block:
+                            blocks.append(block)
+
+            child_nodes = getattr(node, "nodelist", None)
+            if isinstance(child_nodes, list) and child_nodes:
+                _walk(child_nodes)
+
+            nodeargd = getattr(node, "nodeargd", None)
+            arg_nodes = getattr(nodeargd, "argnlist", None) if nodeargd else None
+            if isinstance(arg_nodes, list):
+                for arg in arg_nodes:
+                    if arg is None:
+                        continue
+                    nested = getattr(arg, "nodelist", None)
+                    if isinstance(nested, list) and nested:
+                        _walk(nested)
+
+    _walk(nodes)
+    return tuple(blocks)
+
+
+def _line_without_unescaped_comments(line: str) -> str:
+    escaped = False
+    for idx, char in enumerate(line):
+        if char == "\\":
+            escaped = not escaped
+            continue
+        if char == "%" and not escaped:
+            return line[:idx]
+        escaped = False
+    return line
+
+
+def _extract_figure_blocks_via_scan(tex: str) -> tuple[str, ...]:
+    blocks: list[str] = []
+    line_starts: list[int] = []
+    cursor = 0
+    lines = tex.splitlines(keepends=True)
+    for line in lines:
+        line_starts.append(cursor)
+        cursor += len(line)
+
+    depth = 0
+    start_offset: int | None = None
+    for line_index, line in enumerate(lines):
+        cleaned = _line_without_unescaped_comments(line)
+
+        begin_count = len(_FIGURE_BEGIN_RE.findall(cleaned))
+        end_count = len(_FIGURE_END_RE.findall(cleaned))
+
+        if depth == 0 and begin_count > 0:
+            start_offset = line_starts[line_index]
+
+        if begin_count > 0:
+            depth += begin_count
+
+        if end_count > 0 and depth > 0:
+            depth -= end_count
+            if depth <= 0 and start_offset is not None:
+                end_offset = line_starts[line_index] + len(line)
+                block = tex[start_offset:end_offset].strip()
+                if block:
+                    blocks.append(block)
+                start_offset = None
+                depth = 0
+
     return tuple(blocks)
 
 
@@ -542,6 +689,8 @@ def _latex_to_text(source: str) -> str:
 def _postprocess_converted_text(text: str) -> str:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = [line.rstrip() for line in normalized.split("\n")]
+    lines = _strip_maketitle_artifacts(lines)
+    lines = _normalize_prose_indentation(lines)
     out: list[str] = []
     blank_count = 0
     for line in lines:
@@ -557,18 +706,169 @@ def _postprocess_converted_text(text: str) -> str:
     return "\n".join(out)
 
 
-def _converted_mentions_figures(text: str) -> bool:
-    if "![" in text:
+def _strip_maketitle_artifacts(lines: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped in {"[NO \\title GIVEN]", "[NO \\author GIVEN]"}:
+            continue
+        cleaned.append(line)
+
+    first_nonempty = 0
+    while first_nonempty < len(cleaned) and not cleaned[first_nonempty].strip():
+        first_nonempty += 1
+
+    if first_nonempty >= len(cleaned):
+        return cleaned
+
+    trailing = cleaned[first_nonempty:]
+    if not trailing:
+        return cleaned
+
+    idx = 0
+    while idx < len(trailing):
+        stripped = trailing[idx].strip()
+        if stripped and (
+            _DATE_LINE_RE.fullmatch(stripped) or _UNDERLINE_LINE_RE.fullmatch(stripped)
+        ):
+            idx += 1
+            continue
+        break
+
+    if idx > 0:
+        return cleaned[:first_nonempty] + trailing[idx:]
+    return cleaned
+
+
+def _normalize_prose_indentation(lines: list[str]) -> list[str]:
+    normalized: list[str] = []
+    in_fence = False
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            normalized.append(line.lstrip())
+            continue
+
+        if in_fence or not line.startswith("    "):
+            normalized.append(line)
+            continue
+
+        if _INDENTED_LIST_RE.match(line):
+            normalized.append(line)
+            continue
+
+        candidate = line[4:]
+        if candidate.startswith((">", "|", "`")):
+            normalized.append(line)
+            continue
+        normalized.append(candidate)
+
+    return normalized
+
+
+def _inject_figure_blocks_at_markers(
+    text: str, figure_blocks: tuple[str, ...]
+) -> tuple[str, tuple[str, ...]]:
+    if not figure_blocks:
+        return text, ()
+
+    lines = text.split("\n")
+    out: list[str] = []
+    next_index = 0
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        if _GRAPHICS_MARKER_RE.fullmatch(line) is None:
+            out.append(line)
+            i += 1
+            continue
+
+        if next_index >= len(figure_blocks):
+            out.append(line)
+            i += 1
+            continue
+
+        block = figure_blocks[next_index]
+        next_index += 1
+        out.extend(["```tex", block, "```"])
+        i += 1
+
+        caption = _extract_caption_text(block)
+        if not caption:
+            continue
+
+        scan = i
+        while scan < len(lines) and not lines[scan].strip():
+            scan += 1
+        if scan >= len(lines):
+            continue
+
+        if _texts_equivalent_caption(lines[scan], caption):
+            i = scan + 1
+
+    replaced = "\n".join(out)
+    return replaced, figure_blocks[next_index:]
+
+
+def _extract_caption_text(figure_block: str) -> str:
+    marker = "\\caption{"
+    start = figure_block.find(marker)
+    if start < 0:
+        return ""
+
+    i = start + len(marker)
+    depth = 1
+    out_chars: list[str] = []
+    while i < len(figure_block):
+        char = figure_block[i]
+        if char == "{":
+            depth += 1
+            out_chars.append(char)
+            i += 1
+            continue
+        if char == "}":
+            depth -= 1
+            if depth == 0:
+                break
+            out_chars.append(char)
+            i += 1
+            continue
+        out_chars.append(char)
+        i += 1
+
+    if depth != 0:
+        return ""
+
+    raw = "".join(out_chars)
+    cleaned = re.sub(r"\\ref\{[^}]+\}", "<ref>", raw)
+    cleaned = re.sub(r"\\[A-Za-z@]+\*?(?:\[[^\]]*\])?", "", cleaned)
+    cleaned = cleaned.replace("{", "").replace("}", "")
+    return " ".join(cleaned.split()).strip()
+
+
+def _normalize_captionish_text(text: str) -> str:
+    collapsed = " ".join(text.split()).lower()
+    collapsed = collapsed.replace("“", '"').replace("”", '"').replace("’", "'")
+    collapsed = re.sub(r"\\ref\{[^}]+\}", "<ref>", collapsed)
+    collapsed = re.sub(r"[`\"'.,;:!?()\[\]{}]", "", collapsed)
+    return collapsed.strip()
+
+
+def _texts_equivalent_caption(candidate: str, caption: str) -> bool:
+    cand_norm = _normalize_captionish_text(candidate)
+    cap_norm = _normalize_captionish_text(caption)
+    if not cand_norm or not cap_norm:
+        return False
+    if cand_norm == cap_norm:
         return True
-    if "```tex" in text and "\\begin{figure" in text:
-        return True
-    return bool(re.search(r"(?im)^\s*(?:figure|fig\.)\b", text))
+    return cand_norm.startswith(cap_norm) or cap_norm.startswith(cand_norm)
 
 
 def _append_figure_fallback(text: str, figure_blocks: tuple[str, ...]) -> str:
     if not figure_blocks:
-        return text
-    if _converted_mentions_figures(text):
         return text
 
     parts = [text.rstrip(), "", "## Figures (LaTeX)", ""]
@@ -610,7 +910,8 @@ def _convert_latex_source_to_markdown(source_text: str) -> str | None:
     converted = _postprocess_converted_text(converted_raw)
     if _conversion_is_low_quality(converted, prepared):
         return None
-    return _append_figure_fallback(converted, figure_blocks)
+    with_inline, unmatched = _inject_figure_blocks_at_markers(converted, figure_blocks)
+    return _append_figure_fallback(with_inline, unmatched)
 
 
 def _render_source_main_text(source_text: str, settings: ArxivSettings) -> str:
@@ -628,26 +929,58 @@ def _format_main_document(
     *,
     entry: ArxivEntry,
     canonical_id: str,
-    source_mode: str,
     paper_text: str,
 ) -> str:
-    lines: list[str] = [f"# {entry.title}", ""]
-    lines.append(f"arxiv_id: {canonical_id}")
-    lines.append(f"text_source: {source_mode}")
+    abstract_text = (entry.summary or "").strip()
+    body_text = _body_from_converted_paper_text(paper_text, abstract_text)
+
+    lines: list[str] = [f"title: {entry.title}"]
+    lines.append(f"url: https://arxiv.org/abs/{canonical_id}")
     if entry.published:
         lines.append(f"published: {entry.published}")
     if entry.updated:
         lines.append(f"updated: {entry.updated}")
-    if entry.primary_category:
-        lines.append(f"primary_category: {entry.primary_category}")
     if entry.categories:
         lines.append(f"categories: {', '.join(entry.categories)}")
     if entry.authors:
         lines.append(f"authors: {', '.join(entry.authors)}")
-    lines.extend(["", "## Abstract", "", entry.summary or "", "", "## Paper", ""])
-    lines.append(paper_text.strip())
+    lines.extend(["", "§ ABSTRACT", ""])
+    if abstract_text:
+        lines.append(abstract_text)
+    elif body_text:
+        lines.append(body_text)
+        lines.append("")
+        return "\n".join(lines)
+    lines.extend(["", body_text.strip()])
     lines.append("")
     return "\n".join(lines)
+
+
+def _body_from_converted_paper_text(paper_text: str, abstract_text: str) -> str:
+    cleaned = paper_text.strip()
+    if not cleaned:
+        return ""
+
+    section_match = _SECTION_START_RE.search(cleaned)
+    if section_match is not None:
+        return cleaned[section_match.start() :].strip()
+
+    if _looks_like_summary_prefix(cleaned, abstract_text):
+        parts = re.split(r"\n\s*\n", cleaned, maxsplit=1)
+        if len(parts) == 2:
+            return parts[1].strip()
+
+    return cleaned
+
+
+def _looks_like_summary_prefix(text: str, summary: str) -> bool:
+    if not text or not summary:
+        return False
+    return _normalize_space(text).startswith(_normalize_space(summary))
+
+
+def _normalize_space(text: str) -> str:
+    return " ".join(text.split()).strip().lower()
 
 
 def _safe_source_relpath(path: str) -> str:
@@ -699,10 +1032,8 @@ def resolve_arxiv_paper(
     )
 
     paper_text: str | None = None
-    source_mode = "pdf"
     if source_bundle is not None and source_bundle.main_text.strip():
         paper_text = _render_source_main_text(source_bundle.main_text, settings)
-        source_mode = "source"
 
     if not paper_text:
         paper_text = _fetch_pdf_text(
@@ -711,7 +1042,6 @@ def resolve_arxiv_paper(
             cache_ttl=cache_ttl,
             refresh_cache=refresh_cache,
         )
-        source_mode = "pdf"
 
     if not paper_text:
         raise ValueError(f"Unable to resolve arXiv paper content: {target}")
@@ -719,11 +1049,10 @@ def resolve_arxiv_paper(
     dir_name = _canonical_dir_name(canonical_id)
     documents: list[ArxivResolvedDocument] = [
         ArxivResolvedDocument(
-            label=f"{canonical_id}/paper.md",
+            label=f"arXiv/{canonical_id}",
             rendered=_format_main_document(
                 entry=entry,
                 canonical_id=canonical_id,
-                source_mode=source_mode,
                 paper_text=paper_text,
             ),
             source_path=canonical_id,

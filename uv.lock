@@ -205,6 +205,7 @@ dependencies = [
     { name = "cryptography" },
     { name = "lexrpc" },
     { name = "pyjwt" },
+    { name = "pylatexenc" },
     { name = "pyyaml" },
     { name = "requests" },
 ]
@@ -215,6 +216,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=46.0.0" },
     { name = "lexrpc", specifier = ">=2.1" },
     { name = "pyjwt", specifier = ">=2.10.1" },
+    { name = "pylatexenc", specifier = ">=2.10" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "requests", specifier = ">=2.25.0" },
 ]
@@ -395,6 +397,12 @@ sdist = { url = "https://files.pythonhosted.org/packages/5c/5a/b46fa56bf322901ee
 wheels = [
     { url = "https://files.pythonhosted.org/packages/6f/01/c26ce75ba460d5cd503da9e13b21a33804d38c2165dec7b716d06b13010c/pyjwt-2.11.0-py3-none-any.whl", hash = "sha256:94a6bde30eb5c8e04fee991062b534071fd1439ef58d2adc9ccb823e7bcd0469", size = 28224, upload-time = "2026-01-30T19:59:54.539Z" },
 ]
+
+[[package]]
+name = "pylatexenc"
+version = "2.10"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5d/ab/34ec41718af73c00119d0351b7a2531d2ebddb51833a36448fc7b862be60/pylatexenc-2.10.tar.gz", hash = "sha256:3dd8fd84eb46dc30bee1e23eaab8d8fb5a7f507347b23e5f38ad9675c84f40d3", size = 162597, upload-time = "2021-04-06T07:56:07.854Z" }
 
 [[package]]
 name = "pyyaml"
