@@ -1,0 +1,28 @@
+[project]
+name = "cx-plugins"
+version = "0.1.0"
+description = "External provider plugins for contextualize"
+readme = "README.md"
+authors = [
+    { name = "jmpaz" }
+]
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "click>=8.1.0",
+    "cryptography>=46.0.0",
+    "lexrpc>=2.1",
+    "pyjwt>=2.10.1",
+    "pyyaml>=6.0",
+    "requests>=2.25.0",
+]
+
+[project.entry-points."contextualize.plugins"]
+arena = "cx_plugins.providers.arena.plugin"
+atproto = "cx_plugins.providers.atproto.plugin"
+discord = "cx_plugins.providers.discord.plugin"
+soundcloud = "cx_plugins.providers.soundcloud.plugin"
+youtube = "cx_plugins.providers.youtube.plugin"
+
+[build-system]
+requires = ["uv_build>=0.10.2,<0.11.0"]
+build-backend = "uv_build"
