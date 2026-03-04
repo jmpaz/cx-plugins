@@ -1,5 +1,0 @@
-name: youtube
-module: plugin
-api_version: "1"
-priority: 100
-enabled: true
