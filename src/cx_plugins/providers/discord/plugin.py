@@ -8,22 +8,65 @@ PLUGIN_NAME = "discord"
 PLUGIN_PRIORITY = 100
 
 
+def normalize_manifest_config(raw_config: dict[str, Any] | None) -> dict[str, Any] | None:
+    if raw_config is None:
+        return None
+    if not isinstance(raw_config, dict):
+        raise ValueError("discord config must be a mapping")
+    return dict(raw_config)
+
+
+def _discord_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
+    uses_manifest_style = (
+        "window" in raw
+        or "media" in raw
+        or any(isinstance(key, str) and "-" in key for key in raw)
+    )
+    if not uses_manifest_style:
+        return dict(raw) or None
+
+    from .discord import parse_discord_config_mapping
+
+    return parse_discord_config_mapping(raw, prefix="discord overrides")
+
+
 def _discord_overrides(context: dict[str, Any]) -> dict[str, Any] | None:
     overrides = context.get("overrides")
     if not isinstance(overrides, dict):
         return None
     value = overrides.get("discord")
-    return value if isinstance(value, dict) else None
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("discord overrides must be a mapping")
+    return _discord_runtime_overrides(value)
 
 
 def can_resolve(target: str, context: dict[str, Any]) -> bool:
-    from contextualize.references.discord import is_discord_url
+    from .discord import is_discord_url
 
     return is_discord_url(target)
 
 
+def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | None:
+    from .discord import parse_discord_url
+
+    parsed = parse_discord_url(target)
+    if not isinstance(parsed, dict):
+        return None
+    kind = parsed.get("kind")
+    if not isinstance(kind, str) or not kind:
+        return None
+    return {
+        "provider": PLUGIN_NAME,
+        "kind": kind,
+        "is_external": True,
+        "group_key": kind,
+    }
+
+
 def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
-    from contextualize.references.discord import (
+    from .discord import (
         DiscordResolutionError,
         build_discord_settings,
         discord_document_timestamps,

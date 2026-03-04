@@ -38,7 +38,7 @@ def _soundcloud_me_profile(access_token: str) -> dict[str, str] | None:
 
 def _run_soundcloud_login(timeout: int, no_browser: bool) -> None:
     from contextualize.cache.soundcloud import store_user_token
-    from contextualize.references.soundcloud_auth import (
+    from .oauth import (
         build_authorize_url,
         build_pkce_challenge,
         exchange_authorization_code,
@@ -118,7 +118,7 @@ def _print_soundcloud_auth_status() -> None:
         get_cached_user_access_token,
         get_cached_user_token_record,
     )
-    from contextualize.references.soundcloud_auth import (
+    from .oauth import (
         load_soundcloud_client_credentials,
     )
 

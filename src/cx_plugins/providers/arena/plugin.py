@@ -7,18 +7,140 @@ PLUGIN_NAME = "arena"
 PLUGIN_PRIORITY = 100
 
 
+def normalize_manifest_config(raw_config: dict[str, Any] | None) -> dict[str, Any] | None:
+    if raw_config is None:
+        return None
+    if not isinstance(raw_config, dict):
+        raise ValueError("arena config must be a mapping")
+    return dict(raw_config)
+
+
+def _arena_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
+    result: dict[str, Any] = {}
+    for key in (
+        "max_depth",
+        "sort_order",
+        "max_blocks_per_channel",
+        "connected_after",
+        "connected_before",
+        "created_after",
+        "created_before",
+        "recurse_users",
+        "include_descriptions",
+        "include_comments",
+        "include_link_image_descriptions",
+        "include_pdf_content",
+        "include_media_descriptions",
+    ):
+        if key in raw:
+            result[key] = raw[key]
+
+    recurse_depth = raw.get("recurse-depth")
+    max_depth_alias = raw.get("max-depth")
+    if (
+        recurse_depth is not None
+        and max_depth_alias is not None
+        and recurse_depth != max_depth_alias
+    ):
+        raise ValueError("arena recurse-depth and max-depth cannot differ")
+    if recurse_depth is None:
+        recurse_depth = max_depth_alias
+    if recurse_depth is not None:
+        result["max_depth"] = recurse_depth
+
+    block_sort = raw.get("block-sort")
+    sort_alias = raw.get("sort")
+    if block_sort is not None and sort_alias is not None:
+        if str(block_sort).strip().lower() != str(sort_alias).strip().lower():
+            raise ValueError("arena block-sort and sort cannot differ")
+    if block_sort is None:
+        block_sort = sort_alias
+    if block_sort is not None:
+        result["sort_order"] = str(block_sort).strip().lower()
+
+    if "max-blocks-per-channel" in raw:
+        result["max_blocks_per_channel"] = raw.get("max-blocks-per-channel")
+
+    for config_key, result_key in (
+        ("connected-after", "connected_after"),
+        ("connected-before", "connected_before"),
+        ("created-after", "created_after"),
+        ("created-before", "created_before"),
+    ):
+        if config_key in raw:
+            result[result_key] = raw.get(config_key)
+
+    block_cfg = raw.get("block")
+    if block_cfg is not None:
+        if not isinstance(block_cfg, dict):
+            raise ValueError("arena block config must be a mapping")
+        for config_key, result_key in (
+            ("description", "include_descriptions"),
+            ("comments", "include_comments"),
+            ("link-image-desc", "include_link_image_descriptions"),
+            ("pdf-content", "include_pdf_content"),
+            ("media-desc", "include_media_descriptions"),
+        ):
+            if config_key in block_cfg:
+                result[result_key] = block_cfg.get(config_key)
+
+    if "recurse-users" in raw:
+        recurse_users = raw.get("recurse-users")
+        if isinstance(recurse_users, str):
+            value = recurse_users.strip().lower()
+            if value == "all":
+                result["recurse_users"] = None
+            elif value:
+                result["recurse_users"] = {value}
+        elif isinstance(recurse_users, list):
+            values = {
+                str(item).strip().lower()
+                for item in recurse_users
+                if str(item).strip()
+            }
+            result["recurse_users"] = values
+        else:
+            raise ValueError("arena recurse-users must be a string or list")
+
+    return result or None
+
+
 def _arena_overrides(context: dict[str, Any]) -> dict[str, Any] | None:
     overrides = context.get("overrides")
     if not isinstance(overrides, dict):
         return None
     value = overrides.get("arena")
-    return value if isinstance(value, dict) else None
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("arena overrides must be a mapping")
+    return _arena_runtime_overrides(value)
 
 
 def can_resolve(target: str, context: dict[str, Any]) -> bool:
-    from contextualize.references.arena import is_arena_url
+    from .arena import is_arena_url
 
     return is_arena_url(target)
+
+
+def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | None:
+    from .arena import is_arena_block_url, is_arena_channel_url
+
+    if is_arena_channel_url(target):
+        return {
+            "provider": PLUGIN_NAME,
+            "kind": "channel",
+            "is_external": True,
+            "group_key": "channel",
+        }
+    if is_arena_block_url(target):
+        return {
+            "provider": PLUGIN_NAME,
+            "kind": "block",
+            "is_external": True,
+            "group_key": "block",
+        }
+    return None
 
 
 def _settings_key(settings: Any) -> tuple[Any, ...]:
@@ -42,7 +164,7 @@ def _settings_key(settings: Any) -> tuple[Any, ...]:
 
 
 def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
-    from contextualize.references.arena import (
+    from .arena import (
         ArenaReference,
         _fetch_block,
         build_arena_settings,

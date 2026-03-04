@@ -35,7 +35,7 @@ def _atproto_session_profile(
         and dpop_public_jwk
         and token_type.strip().lower() == "dpop"
     ):
-        from contextualize.references.atproto_auth import AtprotoDPoPAuth
+        from .oauth import AtprotoDPoPAuth
 
         current_nonce = (resource_nonce or "").strip() or None
         for _ in range(2):
@@ -141,7 +141,7 @@ def _atproto_subject_from_access_token(access_token: str) -> str | None:
 
 def _atproto_refresh_cached_oauth_session() -> dict[str, object] | None:
     try:
-        from contextualize.references.atproto import _refresh_cached_oauth_session
+        from .atproto import _refresh_cached_oauth_session
 
         refreshed = _refresh_cached_oauth_session()
         return refreshed if isinstance(refreshed, dict) else None
@@ -272,7 +272,7 @@ def _run_atproto_logout() -> None:
 
 def _run_atproto_login(timeout: int, no_browser: bool) -> None:
     from contextualize.cache.atproto import store_oauth_session
-    from contextualize.references.atproto_auth import (
+    from .oauth import (
         build_authorize_url,
         build_pkce_challenge,
         exchange_authorization_code,

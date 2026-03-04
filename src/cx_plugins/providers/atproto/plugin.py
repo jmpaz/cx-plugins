@@ -7,18 +7,94 @@ PLUGIN_NAME = "atproto"
 PLUGIN_PRIORITY = 100
 
 
+def normalize_manifest_config(raw_config: dict[str, Any] | None) -> dict[str, Any] | None:
+    if raw_config is None:
+        return None
+    if not isinstance(raw_config, dict):
+        raise ValueError("atproto config must be a mapping")
+    return dict(raw_config)
+
+
+def _atproto_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
+    result: dict[str, Any] = {}
+    for key in (
+        "max_items",
+        "thread_depth",
+        "post_ancestors",
+        "quote_depth",
+        "max_replies",
+        "reply_quote_depth",
+        "replies_filter",
+        "reposts_filter",
+        "likes_filter",
+        "created_after",
+        "created_before",
+        "include_media_descriptions",
+        "include_embed_media_descriptions",
+        "media_mode",
+        "include_lineage",
+    ):
+        if key in raw:
+            result[key] = raw[key]
+
+    for config_key, result_key in (
+        ("max-items", "max_items"),
+        ("thread-depth", "thread_depth"),
+        ("post-ancestors", "post_ancestors"),
+        ("quote-depth", "quote_depth"),
+        ("max-replies", "max_replies"),
+        ("reply-quote-depth", "reply_quote_depth"),
+        ("created-after", "created_after"),
+        ("created-before", "created_before"),
+        ("include-media-descriptions", "include_media_descriptions"),
+        ("include-embed-media-descriptions", "include_embed_media_descriptions"),
+        ("media-mode", "media_mode"),
+        ("include-lineage", "include_lineage"),
+    ):
+        if config_key in raw:
+            result[result_key] = raw.get(config_key)
+
+    for config_key, result_key in (
+        ("replies", "replies_filter"),
+        ("reposts", "reposts_filter"),
+        ("likes", "likes_filter"),
+    ):
+        if config_key in raw:
+            result[result_key] = raw.get(config_key)
+
+    return result or None
+
+
 def _atproto_overrides(context: dict[str, Any]) -> dict[str, Any] | None:
     overrides = context.get("overrides")
     if not isinstance(overrides, dict):
         return None
     value = overrides.get("atproto")
-    return value if isinstance(value, dict) else None
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("atproto overrides must be a mapping")
+    return _atproto_runtime_overrides(value)
 
 
 def can_resolve(target: str, context: dict[str, Any]) -> bool:
-    from contextualize.references.atproto import is_atproto_url
+    from .atproto import is_atproto_url
 
     return is_atproto_url(target)
+
+
+def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | None:
+    from .atproto import parse_atproto_target
+
+    parsed = parse_atproto_target(target)
+    if parsed is None:
+        return None
+    return {
+        "provider": PLUGIN_NAME,
+        "kind": parsed.kind,
+        "is_external": True,
+        "group_key": parsed.kind,
+    }
 
 
 def _parse_frontmatter(rendered: str) -> dict[str, Any] | None:
@@ -70,7 +146,7 @@ def _source_path(uri: str, fallback: str) -> str:
 
 
 def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
-    from contextualize.references.atproto import (
+    from .atproto import (
         atproto_settings_cache_key,
         build_atproto_settings,
         resolve_atproto_url,

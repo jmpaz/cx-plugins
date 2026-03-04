@@ -7,14 +7,36 @@ PLUGIN_NAME = "youtube"
 PLUGIN_PRIORITY = 100
 
 
+def normalize_manifest_config(raw_config: dict[str, Any] | None) -> dict[str, Any] | None:
+    if raw_config is None:
+        return None
+    if not isinstance(raw_config, dict):
+        raise ValueError("youtube config must be a mapping")
+    return dict(raw_config)
+
+
 def can_resolve(target: str, context: dict[str, Any]) -> bool:
-    from contextualize.references.youtube import is_youtube_url
+    from .youtube import is_youtube_url
 
     return is_youtube_url(target)
 
 
+def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | None:
+    from .youtube import extract_video_id, is_youtube_url
+
+    if not is_youtube_url(target):
+        return None
+    kind = "video" if extract_video_id(target) else "resource"
+    return {
+        "provider": PLUGIN_NAME,
+        "kind": kind,
+        "is_external": True,
+        "group_key": kind,
+    }
+
+
 def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
-    from contextualize.references.youtube import YouTubeReference, extract_video_id
+    from .youtube import YouTubeReference, extract_video_id
 
     reference = YouTubeReference(
         target,
