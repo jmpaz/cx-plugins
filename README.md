@@ -1,17 +1,18 @@
 # cx-plugins
 
-External provider plugins for `contextualize`.
+[`contextualize`](https://github.com/jmpaz/contextualize) plugins resolve supported targets to plaintext.
 
-This package exposes plugins through the `contextualize.plugins` entrypoint group.
+This package provides the following plugins:
 
-Included providers:
-- arena
-- atproto
-- discord
-- soundcloud
-- youtube
+| Plugin | Provider | Handles |
+| --- | --- | --- |
+| `arena` | [Are.na](https://www.are.na/) | blocks, channels |
+| `atproto` | [AT Protocol](https://atproto.com/docs) | posts, profiles, lists, starter packs |
+| `discord` | Discord | messages, threads, channels |
+| `soundcloud` | SoundCloud | tracks, playlists, profiles |
+| `youtube` | YouTube | videos |
 
-## Install
+## Installation
 
 Install via `contextualize` optional dependency:
 
