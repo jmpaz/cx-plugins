@@ -13,6 +13,7 @@ _WIKI_HOST_RE = re.compile(r"^(?P<lang>[a-z]{2,12})(?:\.m)?\.wikipedia\.org$")
 _WIKI_PATH_RE = re.compile(r"^/wiki/(?P<title>[^#?]+)")
 _LANG_PREFIX_RE = re.compile(r"^[a-z]{2,12}$")
 _TAG_RE = re.compile(r"<[^>]+>")
+_MEDIA_TAG_RE = re.compile(r"^#?\s*description\s*\(auto-generated\)\s*:?\s*$", re.I)
 _STRIP_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"[\u2018\u2019]"), "'"),
     (re.compile(r"[\u201C\u201D]"), '"'),
@@ -84,12 +85,20 @@ class WikipediaSection:
 
 @dataclass(frozen=True)
 class WikipediaMedia:
+    kind: str
     url: str
+    filename: str | None
     caption: str | None
     description: str | None
     width: int
     height: int
     section_index: int | None
+
+
+@dataclass(frozen=True)
+class WikipediaSummary:
+    description: str | None
+    extract: str | None
 
 
 @dataclass(frozen=True)
@@ -168,6 +177,19 @@ def _escape_xml_attr(value: str) -> str:
 
 def _strip_html_tags(text: str) -> str:
     return _clean_text(_TAG_RE.sub(" ", text))
+
+
+def _escape_yaml_string(value: str) -> str:
+    if not value:
+        return '""'
+    if "\n" in value:
+        indented = "\n".join(f"  {line}" for line in value.splitlines())
+        return f"|\n{indented}"
+    needs_quotes = any(c in value for c in ":{}[],\"'|>&*!?#%@`")
+    if needs_quotes or value.startswith(" "):
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return value
 
 
 def _target_from_http_url(target: str) -> ParsedWikipediaTarget | None:
@@ -355,42 +377,44 @@ def _resolve_parse_payload(
     return parse_obj
 
 
-def _resolve_intro(
+def _resolve_summary(
     parsed: ParsedWikipediaTarget,
     *,
     timeout_seconds: int,
-) -> str:
-    base_url = f"https://{parsed.language}.wikipedia.org"
-    params: dict[str, str] = {
-        "action": "query",
-        "prop": "extracts",
-        "exintro": "1",
-        "format": "json",
-        "formatversion": "2",
-    }
+) -> WikipediaSummary:
     if parsed.revision_id is not None:
-        params["revids"] = str(parsed.revision_id)
-    else:
-        params["titles"] = parsed.title
+        return WikipediaSummary(description=None, extract=None)
 
-    payload = _wiki_api_request(
-        base_url=base_url,
-        params=params,
-        timeout_seconds=timeout_seconds,
+    encoded_title = quote(parsed.title.replace(" ", "_"), safe="")
+    url = f"https://{parsed.language}.wikipedia.org/api/rest_v1/page/summary/{encoded_title}"
+    try:
+        response = _http_get(
+            url,
+            timeout=timeout_seconds,
+            headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
+        )
+    except Exception:
+        return WikipediaSummary(description=None, extract=None)
+
+    data = response.json()
+    if not isinstance(data, dict):
+        return WikipediaSummary(description=None, extract=None)
+
+    description_raw = data.get("description")
+    description = (
+        _clean_text(description_raw)
+        if isinstance(description_raw, str) and description_raw.strip()
+        else None
     )
-    query = payload.get("query")
-    if not isinstance(query, dict):
-        return ""
-    pages = query.get("pages")
-    if not isinstance(pages, list) or not pages:
-        return ""
-    page = pages[0]
-    if not isinstance(page, dict):
-        return ""
-    extract = page.get("extract")
-    if not isinstance(extract, str) or not extract.strip():
-        return ""
-    return _strip_html_tags(extract)
+
+    extract_raw = data.get("extract")
+    extract = (
+        _clean_text(extract_raw)
+        if isinstance(extract_raw, str) and extract_raw.strip()
+        else None
+    )
+
+    return WikipediaSummary(description=description, extract=extract)
 
 
 def _node_tag(node: Any) -> str:
@@ -668,10 +692,26 @@ def extract_article_data(html_text: str) -> _ExtractedArticle:
         return _extract_article_fallback(html_text)
 
 
+def _normalize_media_kind(raw: Any) -> str | None:
+    value = str(raw or "").strip().lower()
+    if value in {"image", "video"}:
+        return value
+    return None
+
+
+def _filename_from_media_title(raw: Any) -> str | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    cleaned = raw.strip()
+    if ":" in cleaned:
+        cleaned = cleaned.split(":", 1)[1]
+    cleaned = cleaned.replace(" ", "_")
+    return cleaned or None
+
+
 def _resolve_media_list(
     parsed: ParsedWikipediaTarget,
     *,
-    include_descriptions: bool,
     timeout_seconds: int,
 ) -> tuple[WikipediaMedia, ...]:
     if parsed.revision_id is not None:
@@ -701,7 +741,8 @@ def _resolve_media_list(
     for item in items:
         if not isinstance(item, dict):
             continue
-        if str(item.get("type", "")).lower() != "image":
+        kind = _normalize_media_kind(item.get("type"))
+        if kind is None:
             continue
 
         src = ""
@@ -725,18 +766,18 @@ def _resolve_media_list(
         if src.startswith("//"):
             src = f"https:{src}"
 
+        filename = _filename_from_media_title(item.get("title"))
+        if not filename:
+            parsed_url = urlparse(src)
+            tail = parsed_url.path.rsplit("/", 1)[-1].strip()
+            filename = tail or None
+
         caption = None
         caption_obj = item.get("caption")
         if isinstance(caption_obj, dict):
             text = caption_obj.get("text")
             if isinstance(text, str):
                 caption = _clean_text(text)
-        if not caption:
-            maybe_title = item.get("title")
-            if isinstance(maybe_title, str):
-                caption = _clean_text(maybe_title.replace("_", " ")) or None
-
-        description = caption if include_descriptions else None
 
         width = item.get("original_width")
         height = item.get("original_height")
@@ -748,9 +789,11 @@ def _resolve_media_list(
 
         out.append(
             WikipediaMedia(
+                kind=kind,
                 url=src,
+                filename=filename,
                 caption=caption,
-                description=description,
+                description=None,
                 width=width_val,
                 height=height_val,
                 section_index=section_index,
@@ -837,38 +880,144 @@ def wikipedia_settings_cache_key(settings: WikipediaSettings) -> tuple[Any, ...]
     )
 
 
-def _attachment_filename(url: str) -> str | None:
-    parsed = urlparse(url)
-    tail = parsed.path.rsplit("/", 1)[-1].strip()
-    return tail or None
+def _extract_intro_section(
+    sections: tuple[WikipediaSection, ...],
+) -> tuple[str, tuple[WikipediaSection, ...]]:
+    for index, section in enumerate(sections):
+        if section.title.strip().lower() == "introduction":
+            intro = section.content.strip()
+            remaining = sections[:index] + sections[index + 1 :]
+            return intro, remaining
+    return "", sections
 
 
-def _format_attachment(media: WikipediaMedia) -> list[str]:
-    attrs: list[str] = ['type="image"']
-    attrs.append(f'url="{_escape_xml_attr(media.url)}"')
-    filename = _attachment_filename(media.url)
-    if filename:
-        attrs.append(f'filename="{_escape_xml_attr(filename)}"')
-    if media.width > 0 and media.height > 0:
-        attrs.append(f'dimensions="{media.width}x{media.height}"')
+def _media_suffix(url: str, filename: str | None) -> str:
+    candidate = filename or url.rsplit("/", 1)[-1]
+    if "." not in candidate:
+        return ""
+    suffix = "." + candidate.rsplit(".", 1)[-1].lower()
+    return suffix if re.fullmatch(r"\.[A-Za-z0-9]+", suffix) else ""
+
+
+def _normalize_media_description(value: str) -> str:
+    text = value.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.rstrip() for line in text.split("\n")]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if lines and _MEDIA_TAG_RE.fullmatch(lines[0].strip()):
+        lines.pop(0)
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return _clean_text("\n".join(lines), preserve_newlines=True)
+
+
+def _describe_media(media: WikipediaMedia) -> str | None:
+    if not media.url.startswith(("http://", "https://")):
+        return None
+
+    try:
+        from contextualize.render.markitdown import convert_path_to_markdown
+        from ..shared.media import download_cached_media_to_temp
+    except Exception:
+        return None
+
+    cache_identity = (
+        f"wikipedia:{media.kind}:{media.filename or media.url.rsplit('/', 1)[-1]}"
+    )
+    tmp = download_cached_media_to_temp(
+        media.url,
+        suffix=_media_suffix(media.url, media.filename),
+        headers={"User-Agent": _USER_AGENT},
+        cache_identity=cache_identity,
+        get_cached_media_bytes=lambda _identity: None,
+        store_media_bytes=lambda _identity, _content: None,
+        refresh_cache=True,
+    )
+    if tmp is None:
+        return None
+
+    try:
+        prompt_append = (
+            f"Caption context: {media.caption}"
+            if media.caption
+            else "Describe the media."
+        )
+        result = convert_path_to_markdown(
+            str(tmp),
+            prompt_append=prompt_append,
+        )
+        markdown = _normalize_media_description(result.markdown or "")
+    except Exception:
+        return None
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    return markdown or None
+
+
+def _describe_media_items(
+    media: tuple[WikipediaMedia, ...],
+    *,
+    enabled: bool,
+) -> tuple[WikipediaMedia, ...]:
+    if not enabled:
+        return tuple(
+            WikipediaMedia(
+                kind=item.kind,
+                url=item.url,
+                filename=item.filename,
+                caption=item.caption,
+                description=None,
+                width=item.width,
+                height=item.height,
+                section_index=item.section_index,
+            )
+            for item in media
+        )
+
+    enriched: list[WikipediaMedia] = []
+    for item in media:
+        enriched.append(
+            WikipediaMedia(
+                kind=item.kind,
+                url=item.url,
+                filename=item.filename,
+                caption=item.caption,
+                description=_describe_media(item),
+                width=item.width,
+                height=item.height,
+                section_index=item.section_index,
+            )
+        )
+    return tuple(enriched)
+
+
+def _format_media_tag(media: WikipediaMedia) -> list[str]:
+    tag = "video" if media.kind == "video" else "image"
+    attrs: list[str] = []
+    if media.filename:
+        attrs.append(f'filename="{_escape_xml_attr(media.filename)}"')
+    if media.caption:
+        attrs.append(f'caption="{_escape_xml_attr(media.caption)}"')
+    attr_suffix = f" {' '.join(attrs)}" if attrs else ""
 
     if media.description:
-        lines = [f"<attachment {' '.join(attrs)}>"]
+        lines = [f"<{tag}{attr_suffix}>"]
         lines.extend(
             _clean_text(media.description, preserve_newlines=True).splitlines()
         )
-        lines.append("</attachment>")
+        lines.append(f"</{tag}>")
         return lines
-
-    return [f"<attachment {' '.join(attrs)} />"]
+    return [f"<{tag}{attr_suffix} />"]
 
 
 def _render_article_document(
     *,
     title: str,
     canonical_url: str,
-    language: str,
-    revision_id: int | None,
+    summary_description: str | None,
     intro: str,
     sections: tuple[WikipediaSection, ...],
     media: tuple[WikipediaMedia, ...],
@@ -876,14 +1025,10 @@ def _render_article_document(
     categories: tuple[str, ...],
     settings: WikipediaSettings,
 ) -> str:
-    lines: list[str] = [
-        f"# {title}",
-        "",
-        f"- URL: {canonical_url}",
-        f"- Language: {language}",
-    ]
-    if revision_id is not None:
-        lines.append(f"- Revision: {revision_id}")
+    lines: list[str] = ["---", f"url: {canonical_url}"]
+    if summary_description:
+        lines.append(f"description: {_escape_yaml_string(summary_description)}")
+    lines.extend(["---", "", f"# {title}"])
 
     media_by_section: dict[int | None, list[WikipediaMedia]] = {}
     for item in media:
@@ -897,7 +1042,7 @@ def _render_article_document(
         if intro_media:
             lines.append("")
             for item in intro_media:
-                lines.extend(_format_attachment(item))
+                lines.extend(_format_media_tag(item))
 
     for section in sections:
         heading = section.title.strip()
@@ -918,7 +1063,7 @@ def _render_article_document(
             if section_media:
                 lines.append("")
                 for item in section_media:
-                    lines.extend(_format_attachment(item))
+                    lines.extend(_format_media_tag(item))
 
     if settings.include_references and references:
         lines.extend(["", "# References", ""])
@@ -963,13 +1108,20 @@ def resolve_wikipedia_article(
             html_text = star
 
     extracted = extract_article_data(html_text)
-    intro = _resolve_intro(parsed, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS)
+    summary = _resolve_summary(parsed, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS)
+    intro, body_sections = _extract_intro_section(extracted.sections)
+    if not intro and summary.extract:
+        intro = summary.extract
+
     media = ()
     if settings.include_media:
         media = _resolve_media_list(
             parsed,
-            include_descriptions=settings.include_media_descriptions,
             timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+        )
+        media = _describe_media_items(
+            media,
+            enabled=settings.include_media_descriptions,
         )
 
     categories = _extract_categories(parse_payload)
@@ -993,10 +1145,9 @@ def resolve_wikipedia_article(
     rendered = _render_article_document(
         title=display_title,
         canonical_url=canonical_url,
-        language=parsed.language,
-        revision_id=parsed.revision_id,
+        summary_description=summary.description,
         intro=intro,
-        sections=extracted.sections,
+        sections=body_sections,
         media=media,
         references=extracted.references,
         categories=categories,
@@ -1013,7 +1164,7 @@ def resolve_wikipedia_article(
         source_path = f"{source_path}@oldid={parsed.revision_id}"
 
     return WikipediaResolvedDocument(
-        label=f"Wikipedia/{parsed.language}/{title.replace(' ', '_')}",
+        label=f"wikipedia/{parsed.language}/{title.replace(' ', '_')}",
         rendered=rendered,
         source_ref=f"{parsed.language}.wikipedia.org",
         source_path=source_path,

@@ -50,7 +50,7 @@ def test_extract_article_data_keeps_inline_wiki_links_and_strips_citations() -> 
     assert "citation needed" not in content.lower()
 
 
-def test_resolve_wikipedia_article_renders_inline_attachments_and_no_media_h1(
+def test_resolve_wikipedia_article_renders_frontmatter_and_media_tags(
     monkeypatch,
 ) -> None:
     target = "https://en.wikipedia.org/wiki/Alan_Turing"
@@ -67,8 +67,11 @@ def test_resolve_wikipedia_article_renders_inline_attachments_and_no_media_h1(
     )
     monkeypatch.setattr(
         wikipedia,
-        "_resolve_intro",
-        lambda _parsed, timeout_seconds: "Intro paragraph.",
+        "_resolve_summary",
+        lambda _parsed, timeout_seconds: wikipedia.WikipediaSummary(
+            description="Argentine writer (1899-1986)",
+            extract="Fallback intro.",
+        ),
     )
     monkeypatch.setattr(
         wikipedia,
@@ -101,19 +104,49 @@ def test_resolve_wikipedia_article_renders_inline_attachments_and_no_media_h1(
     monkeypatch.setattr(
         wikipedia,
         "_resolve_media_list",
-        lambda _parsed, include_descriptions, timeout_seconds: (
+        lambda _parsed, timeout_seconds: (
             wikipedia.WikipediaMedia(
+                kind="image",
                 url="https://upload.wikimedia.org/image.jpg",
+                filename="Jorge_Luis_Borges.jpg",
                 caption="Portrait",
-                description="Portrait",
+                description=None,
                 width=640,
                 height=480,
                 section_index=0,
             ),
             wikipedia.WikipediaMedia(
-                url="https://upload.wikimedia.org/work.jpg",
-                caption="Work",
-                description="Work",
+                kind="video",
+                url="https://upload.wikimedia.org/interview.ogv",
+                filename="Interview.ogv",
+                caption="Interview clip",
+                description=None,
+                width=320,
+                height=200,
+                section_index=1,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        wikipedia,
+        "_describe_media_items",
+        lambda media, enabled: (
+            wikipedia.WikipediaMedia(
+                kind="image",
+                url="https://upload.wikimedia.org/image.jpg",
+                filename="Jorge_Luis_Borges.jpg",
+                caption="Portrait",
+                description="LLM alt text.",
+                width=640,
+                height=480,
+                section_index=0,
+            ),
+            wikipedia.WikipediaMedia(
+                kind="video",
+                url="https://upload.wikimedia.org/interview.ogv",
+                filename="Interview.ogv",
+                caption="Interview clip",
+                description=None,
                 width=320,
                 height=200,
                 section_index=1,
@@ -130,17 +163,96 @@ def test_resolve_wikipedia_article_renders_inline_attachments_and_no_media_h1(
     )
 
     rendered = document.rendered
-    assert rendered.startswith("# Alan Turing\n")
-    assert "title:" not in rendered.lower()
+    assert rendered.startswith("---\nurl: https://en.wikipedia.org/wiki/Alan_Turing\n")
+    assert "description: Argentine writer (1899-1986)" in rendered
+    assert "\n# Alan Turing\n" in rendered
+    assert "- URL:" not in rendered
+    assert "- Language:" not in rendered
     assert "## Works" in rendered
     assert "# Media" not in rendered
     assert "# External Links" not in rendered
-    assert '<attachment type="image"' in rendered
-    assert rendered.count("<attachment") == 2
+    assert "<attachment" not in rendered
+    assert (
+        '<image filename="Jorge_Luis_Borges.jpg" caption="Portrait">\n'
+        "LLM alt text.\n"
+        "</image>"
+    ) in rendered
+    assert '<video filename="Interview.ogv" caption="Interview clip" />' in rendered
     assert "[Example](https://example.com)" not in rendered
     assert "[[Labyrinth]]" in rendered
     assert "# References" in rendered
     assert "# Categories" in rendered
+
+
+def test_resolve_wikipedia_article_self_closes_media_when_descriptions_disabled(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        wikipedia,
+        "_resolve_parse_payload",
+        lambda _parsed, timeout_seconds: {
+            "title": "Alan Turing",
+            "displaytitle": "Alan Turing",
+            "text": {"*": "<p>unused</p>"},
+            "categories": [],
+        },
+    )
+    monkeypatch.setattr(
+        wikipedia,
+        "_resolve_summary",
+        lambda _parsed, timeout_seconds: wikipedia.WikipediaSummary(
+            description=None,
+            extract=None,
+        ),
+    )
+    monkeypatch.setattr(
+        wikipedia,
+        "extract_article_data",
+        lambda _html: wikipedia._ExtractedArticle(  # noqa: SLF001
+            sections=(
+                wikipedia.WikipediaSection(
+                    index=0,
+                    level=1,
+                    title="Introduction",
+                    content="Intro body.",
+                ),
+            ),
+            references=(),
+            external_links=(),
+        ),
+    )
+    monkeypatch.setattr(
+        wikipedia,
+        "_resolve_media_list",
+        lambda _parsed, timeout_seconds: (
+            wikipedia.WikipediaMedia(
+                kind="image",
+                url="https://upload.wikimedia.org/image.jpg",
+                filename="Jorge_Luis_Borges.jpg",
+                caption="Borges in 1967",
+                description=None,
+                width=640,
+                height=480,
+                section_index=0,
+            ),
+        ),
+    )
+
+    document = wikipedia.resolve_wikipedia_article(
+        "https://en.wikipedia.org/wiki/Alan_Turing",
+        settings=wikipedia.build_wikipedia_settings(
+            {"include_media_descriptions": False}
+        ),
+        use_cache=True,
+        cache_ttl=None,
+        refresh_cache=False,
+    )
+
+    rendered = document.rendered
+    assert (
+        '<image filename="Jorge_Luis_Borges.jpg" caption="Borges in 1967" />'
+    ) in rendered
+    assert "</image>" not in rendered
 
 
 def test_runtime_overrides_parse_manifest_style_aliases() -> None:
@@ -166,7 +278,7 @@ def test_plugin_resolve_emits_metadata_and_dedupe(monkeypatch) -> None:
         wikipedia,
         "resolve_wikipedia_article",
         lambda *_args, **_kwargs: wikipedia.WikipediaResolvedDocument(
-            label="Wikipedia/en/Alan_Turing",
+            label="wikipedia/en/Alan_Turing",
             rendered="# Alan Turing",
             source_ref="en.wikipedia.org",
             source_path="en/Alan_Turing",
