@@ -23,7 +23,7 @@ arxiv = "cx_plugins.providers.arxiv.plugin"
 atproto = "cx_plugins.providers.atproto.plugin"
 discord = "cx_plugins.providers.discord.plugin"
 soundcloud = "cx_plugins.providers.soundcloud.plugin"
-youtube = "cx_plugins.providers.youtube.plugin"
+ytdlp = "cx_plugins.providers.ytdlp.plugin"
 
 [build-system]
 requires = ["uv_build>=0.10.2,<0.11.0"]

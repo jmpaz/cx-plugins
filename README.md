@@ -11,7 +11,7 @@ This package provides the following plugins:
 | `atproto` | [AT Protocol](https://atproto.com/docs) | posts, profiles, lists, starter packs |
 | `discord` | Discord | messages, threads, channels |
 | `soundcloud` | SoundCloud | tracks, playlists, profiles |
-| `youtube` | YouTube | videos |
+| `ytdlp` | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | supported media URLs (YouTube/Vimeo, TikTok/IG, etc)|
 
 ## Installation
 

@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 PLUGIN_API_VERSION = "1"
-PLUGIN_NAME = "youtube"
-PLUGIN_PRIORITY = 100
+PLUGIN_NAME = "ytdlp"
+PLUGIN_PRIORITY = 10
 
 
 def normalize_manifest_config(
@@ -13,22 +13,26 @@ def normalize_manifest_config(
     if raw_config is None:
         return None
     if not isinstance(raw_config, dict):
-        raise ValueError("youtube config must be a mapping")
+        raise ValueError("ytdlp config must be a mapping")
     return dict(raw_config)
 
 
 def can_resolve(target: str, context: dict[str, Any]) -> bool:
-    from .youtube import is_youtube_url
+    from .ytdlp import probe_ytdlp_url
 
-    return is_youtube_url(target)
+    return probe_ytdlp_url(target, timeout_seconds=5)
 
 
 def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | None:
-    from .youtube import extract_video_id, is_youtube_url
+    from .ytdlp import probe_ytdlp_metadata
 
-    if not is_youtube_url(target):
+    metadata = probe_ytdlp_metadata(target, timeout_seconds=5)
+    if metadata is None:
         return None
-    kind = "video" if extract_video_id(target) else "resource"
+    duration = metadata.get("duration")
+    kind = (
+        "video" if isinstance(duration, (int, float)) and duration > 0 else "resource"
+    )
     return {
         "provider": PLUGIN_NAME,
         "kind": kind,
@@ -38,9 +42,9 @@ def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | No
 
 
 def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
-    from .youtube import YouTubeReference, extract_video_id
+    from .ytdlp import YtDlpReference
 
-    reference = YouTubeReference(
+    reference = YtDlpReference(
         target,
         format="raw",
         label="relative",
@@ -49,7 +53,6 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
         cache_ttl=context.get("cache_ttl"),
         refresh_cache=bool(context.get("refresh_cache", False)),
     )
-    video_id = extract_video_id(target) or "video"
     return [
         {
             "source": target,
@@ -58,9 +61,10 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
             "metadata": {
                 "trace_path": reference.get_label(),
                 "provider": PLUGIN_NAME,
-                "source_ref": "youtube.com",
-                "source_path": video_id,
-                "context_subpath": f"youtube-{video_id}.md",
+                "source_ref": reference.source_ref(),
+                "source_path": reference.source_path(),
+                "context_subpath": reference.context_subpath(),
+                "kind": reference.get_kind(),
             },
         }
     ]

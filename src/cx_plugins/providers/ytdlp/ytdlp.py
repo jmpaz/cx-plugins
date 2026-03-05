@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -9,42 +10,90 @@ import tempfile
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
-
-from contextualize.render.text import process_text
-from contextualize.utils import count_tokens
-from contextualize.references.audio_transcription import transcribe_media_file
-
-_YOUTUBE_URL_RE = re.compile(
-    r"^https?://(?:www\.|m\.)?(?:"
-    r"youtube\.com/(?:watch\?.*v=|shorts/|live/)|"
-    r"youtu\.be/"
-    r")(?P<id>[\w-]{11})"
-)
+from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 
-def is_youtube_url(url: str) -> bool:
-    return bool(_YOUTUBE_URL_RE.match(url))
-
-
-def extract_video_id(url: str) -> str | None:
-    match = _YOUTUBE_URL_RE.match(url)
-    if match:
-        return match.group("id")
+def is_url_target(url: str) -> bool:
     parsed = urlparse(url)
-    if "youtube.com" in parsed.netloc:
-        params = parse_qs(parsed.query)
-        v = params.get("v")
-        if v:
-            return v[0]
-    return None
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _clean_identity_part(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _normalize_url_for_key(url: str) -> str:
+    parsed = urlparse(url.strip())
+    return urlunparse(parsed._replace(fragment=""))
+
+
+def _slugify(value: str, *, default: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-_.").lower()
+    return slug or default
 
 
 def _check_ytdlp() -> None:
     if not shutil.which("yt-dlp"):
         raise RuntimeError(
-            "YouTube processing requires yt-dlp: https://github.com/yt-dlp/yt-dlp"
+            "yt-dlp processing requires yt-dlp: https://github.com/yt-dlp/yt-dlp"
         )
+
+
+def _run_ytdlp(
+    command: list[str], *, timeout_seconds: int
+) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+    )
+
+
+def probe_ytdlp_metadata(
+    url: str, *, timeout_seconds: int = 10
+) -> dict[str, Any] | None:
+    if not is_url_target(url):
+        return None
+    try:
+        _check_ytdlp()
+        result = _run_ytdlp(
+            [
+                "yt-dlp",
+                "--dump-single-json",
+                "--no-download",
+                "--no-playlist",
+                "--socket-timeout",
+                str(timeout_seconds),
+                "--",
+                url,
+            ],
+            timeout_seconds=timeout_seconds,
+        )
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    payload = result.stdout.strip()
+    if not payload:
+        return None
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def probe_ytdlp_url(url: str, *, timeout_seconds: int = 10) -> bool:
+    return probe_ytdlp_metadata(url, timeout_seconds=timeout_seconds) is not None
 
 
 def _get_timestamp_interval(duration_seconds: int) -> int:
@@ -127,7 +176,57 @@ def _escape_yaml_string(s: str) -> str:
 
 
 @dataclass
-class YouTubeReference:
+class _YtDlpIdentity:
+    extractor: str | None
+    media_id: str | None
+    cache_identity: str
+    display_name: str
+    slug: str
+
+
+def _build_identity(url: str, metadata: dict[str, Any]) -> _YtDlpIdentity:
+    extractor_raw = _clean_identity_part(
+        metadata.get("extractor_key")
+    ) or _clean_identity_part(metadata.get("extractor"))
+    media_id = _clean_identity_part(metadata.get("id"))
+    extractor = extractor_raw.lower() if extractor_raw else None
+    if extractor and media_id:
+        cache_identity = f"{extractor}:{media_id}"
+        slug = f"{_slugify(extractor, default='extractor')}-{_slugify(media_id, default='id')}"
+        return _YtDlpIdentity(
+            extractor=extractor,
+            media_id=media_id,
+            cache_identity=cache_identity,
+            display_name=cache_identity,
+            slug=slug,
+        )
+
+    normalized = _normalize_url_for_key(url)
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    short_digest = digest[:12]
+    return _YtDlpIdentity(
+        extractor=extractor,
+        media_id=media_id,
+        cache_identity=f"url:{digest}",
+        display_name=f"url:{short_digest}",
+        slug=f"url-{short_digest}",
+    )
+
+
+def _source_ref(url: str, metadata: dict[str, Any], extractor: str | None) -> str:
+    webpage_url = _clean_identity_part(
+        metadata.get("webpage_url")
+    ) or _clean_identity_part(metadata.get("original_url"))
+    netloc = urlparse((webpage_url or url).strip()).netloc.strip().lower()
+    if netloc:
+        return netloc
+    if extractor:
+        return extractor
+    return "ytdlp"
+
+
+@dataclass
+class YtDlpReference:
     url: str
     format: str = "md"
     label: str = "relative"
@@ -136,18 +235,17 @@ class YouTubeReference:
     label_suffix: str | None = None
     inject: bool = False
     depth: int = 5
-    trace_collector: list = None
+    trace_collector: list[Any] | None = None
     use_cache: bool = True
     cache_ttl: timedelta | None = None
     refresh_cache: bool = False
-    _video_id: str | None = field(default=None, init=False, repr=False)
-    _metadata: dict | None = field(default=None, init=False, repr=False)
+    _metadata: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    _identity: _YtDlpIdentity | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         _check_ytdlp()
-        self._video_id = extract_video_id(self.url)
-        if not self._video_id:
-            raise ValueError(f"Could not extract video ID from URL: {self.url}")
+        if not is_url_target(self.url):
+            raise ValueError(f"Unsupported URL target: {self.url}")
         self.file_content = ""
         self.original_file_content = ""
         self.output = self._get_contents()
@@ -167,38 +265,73 @@ class YouTubeReference:
             return False
 
     def token_count(self, encoding: str = "cl100k_base") -> int:
+        from contextualize.utils import count_tokens
+
         return count_tokens(self.original_file_content, target=encoding)["count"]
 
     def get_label(self) -> str:
         if self.label == "relative":
             return self.url
         if self.label == "name":
-            return self._video_id or self.url
+            return self._get_identity().display_name
         if self.label == "ext":
             return ""
         return self.label
 
-    def _fetch_metadata(self) -> dict:
+    def source_ref(self) -> str:
+        metadata = self._fetch_metadata()
+        return _source_ref(self.url, metadata, self._get_identity().extractor)
+
+    def source_path(self) -> str:
+        return self._get_identity().cache_identity
+
+    def context_subpath(self) -> str:
+        return f"ytdlp-{self._get_identity().slug}.md"
+
+    def get_kind(self) -> str:
+        metadata = self._fetch_metadata()
+        duration = metadata.get("duration")
+        if isinstance(duration, (int, float)) and duration > 0:
+            return "video"
+        return "resource"
+
+    def _fetch_metadata(self) -> dict[str, Any]:
         if self._metadata is not None:
             return self._metadata
 
-        result = subprocess.run(
-            ["yt-dlp", "--dump-json", "--no-download", self.url],
-            capture_output=True,
-            text=True,
-            timeout=60,
+        result = _run_ytdlp(
+            [
+                "yt-dlp",
+                "--dump-single-json",
+                "--no-download",
+                "--no-playlist",
+                "--",
+                self.url,
+            ],
+            timeout_seconds=60,
         )
         if result.returncode != 0:
             raise RuntimeError(f"yt-dlp metadata failed: {result.stderr}")
 
-        self._metadata = json.loads(result.stdout)
+        try:
+            metadata = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"yt-dlp metadata parse failed: {exc}") from exc
+        if not isinstance(metadata, dict):
+            raise RuntimeError("yt-dlp metadata returned unexpected payload")
+        self._metadata = metadata
         return self._metadata
 
-    def _extract_audio(self) -> Path:
-        tmpdir = tempfile.mkdtemp()
-        output_path = os.path.join(tmpdir, f"{self._video_id}.mp3")
+    def _get_identity(self) -> _YtDlpIdentity:
+        if self._identity is None:
+            self._identity = _build_identity(self.url, self._fetch_metadata())
+        return self._identity
 
-        result = subprocess.run(
+    def _extract_audio(self) -> Path:
+        tmpdir = tempfile.mkdtemp(prefix="ytdlp-")
+        output_template = os.path.join(tmpdir, f"{self._get_identity().slug}.%(ext)s")
+
+        result = _run_ytdlp(
             [
                 "yt-dlp",
                 "-x",
@@ -206,23 +339,34 @@ class YouTubeReference:
                 "mp3",
                 "--audio-quality",
                 "5",
+                "--no-playlist",
                 "-o",
-                output_path,
+                output_template,
+                "--",
                 self.url,
             ],
-            capture_output=True,
-            text=True,
-            timeout=600,
+            timeout_seconds=600,
         )
         if result.returncode != 0:
             raise RuntimeError(f"yt-dlp audio extraction failed: {result.stderr}")
 
-        return Path(output_path)
+        audio_dir = Path(tmpdir)
+        audio_files = sorted(audio_dir.glob("*.mp3"))
+        if not audio_files:
+            audio_files = sorted(path for path in audio_dir.iterdir() if path.is_file())
+        if not audio_files:
+            raise RuntimeError("yt-dlp audio extraction produced no audio file")
+
+        return audio_files[0]
 
     def _get_transcript(self, _duration: int) -> tuple[str, str]:
         audio_path = None
         try:
             audio_path = self._extract_audio()
+            from contextualize.references.audio_transcription import (
+                transcribe_media_file,
+            )
+
             transcript = transcribe_media_file(audio_path)
             return transcript, "whisper"
         finally:
@@ -261,13 +405,18 @@ class YouTubeReference:
         return "\n".join(lines)
 
     def _get_contents(self) -> str:
+        from contextualize.render.text import process_text
+
         whisper_available = True
+        identity = self._get_identity()
 
         if self.use_cache and not self.refresh_cache:
             from contextualize.cache.youtube import get_cached_transcript
 
             cached = get_cached_transcript(
-                self._video_id, self.cache_ttl, whisper_available=whisper_available
+                identity.cache_identity,
+                self.cache_ttl,
+                whisper_available=whisper_available,
             )
             if cached is not None:
                 self.original_file_content = cached
@@ -290,7 +439,7 @@ class YouTubeReference:
                 )
 
         metadata = self._fetch_metadata()
-        duration = metadata.get("duration", 0)
+        duration = int(metadata.get("duration", 0) or 0)
         transcript, source = self._get_transcript(duration)
         text = self._format_output(metadata, transcript, source)
 
@@ -300,7 +449,11 @@ class YouTubeReference:
         if self.use_cache:
             from contextualize.cache.youtube import store_transcript
 
-            store_transcript(self._video_id, text, source)
+            store_transcript(
+                identity.cache_identity,
+                text,
+                source=source,
+            )
 
         if self.inject:
             from contextualize.render.inject import inject_content_in_text
@@ -321,37 +474,3 @@ class YouTubeReference:
 
     def get_contents(self) -> str:
         return self.output
-
-
-def _parse_vtt(vtt_content: str) -> str:
-    lines = vtt_content.split("\n")
-    text_lines = []
-    seen = set()
-
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("WEBVTT"):
-            continue
-        if line.startswith("Kind:") or line.startswith("Language:"):
-            continue
-        if re.match(r"^\d+$", line):
-            continue
-        if re.match(
-            r"^\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}", line
-        ):
-            continue
-        if line.startswith("NOTE"):
-            continue
-
-        clean = re.sub(r"<[^>]+>", "", line)
-        clean = re.sub(r"&nbsp;", " ", clean)
-        clean = clean.strip()
-
-        if clean and clean not in seen:
-            seen.add(clean)
-            text_lines.append(clean)
-
-    text = " ".join(text_lines)
-    return _split_into_paragraphs(text)
