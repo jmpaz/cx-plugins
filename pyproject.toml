@@ -15,6 +15,7 @@ dependencies = [
     "pyjwt>=2.10.1",
     "pyyaml>=6.0",
     "requests>=2.25.0",
+    "selectolax>=0.3.20",
 ]
 
 [project.entry-points."contextualize.plugins"]
@@ -23,6 +24,7 @@ arxiv = "cx_plugins.providers.arxiv.plugin"
 atproto = "cx_plugins.providers.atproto.plugin"
 discord = "cx_plugins.providers.discord.plugin"
 soundcloud = "cx_plugins.providers.soundcloud.plugin"
+wikipedia = "cx_plugins.providers.wikipedia.plugin"
 ytdlp = "cx_plugins.providers.ytdlp.plugin"
 
 [build-system]
