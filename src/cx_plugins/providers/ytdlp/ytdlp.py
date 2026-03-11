@@ -367,7 +367,11 @@ class YtDlpReference:
                 transcribe_media_file,
             )
 
-            transcript = transcribe_media_file(audio_path)
+            transcript = transcribe_media_file(
+                audio_path,
+                use_cache=self.use_cache,
+                refresh_cache=self.refresh_cache,
+            )
             return transcript, "whisper"
         finally:
             if audio_path and audio_path.exists():

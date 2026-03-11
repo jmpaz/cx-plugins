@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from cx_plugins.providers.atproto import plugin as atproto_plugin
 from cx_plugins.providers.soundcloud import plugin as soundcloud_plugin
 from cx_plugins.providers.ytdlp import plugin as ytdlp_plugin
@@ -131,3 +133,52 @@ def test_build_identity_uses_extractor_and_id_or_url_hash() -> None:
     assert without_id.display_name.startswith("url:")
     assert without_id.slug.startswith("url-")
     assert without_id.cache_identity == without_id_dupe.cache_identity
+
+
+def test_get_transcript_passes_transcription_cache_flags(
+    tmp_path: Path, monkeypatch
+) -> None:
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir()
+    audio_path = audio_dir / "clip.mp3"
+    audio_path.write_bytes(b"audio")
+
+    ref = object.__new__(ytdlp.YtDlpReference)
+    ref.use_cache = False
+    ref.refresh_cache = True
+
+    def _extract_audio(self: ytdlp.YtDlpReference) -> Path:
+        return audio_path
+
+    captured: dict[str, object] = {}
+
+    def _transcribe(
+        path: Path,
+        *,
+        use_cache: bool = True,
+        refresh_cache: bool | None = None,
+        timeout: float = 600,
+    ) -> str:
+        captured["path"] = path
+        captured["use_cache"] = use_cache
+        captured["refresh_cache"] = refresh_cache
+        captured["timeout"] = timeout
+        return "transcript"
+
+    monkeypatch.setattr(ytdlp.YtDlpReference, "_extract_audio", _extract_audio)
+    monkeypatch.setattr(
+        "contextualize.references.audio_transcription.transcribe_media_file",
+        _transcribe,
+    )
+
+    transcript, source = ytdlp.YtDlpReference._get_transcript(ref, 0)
+
+    assert transcript == "transcript"
+    assert source == "whisper"
+    assert captured == {
+        "path": audio_path,
+        "use_cache": False,
+        "refresh_cache": True,
+        "timeout": 600,
+    }
+    assert not audio_dir.exists()
