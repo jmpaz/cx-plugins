@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 PLUGIN_API_VERSION = "1"
 PLUGIN_NAME = "ytdlp"
 PLUGIN_PRIORITY = 10
+
+_EXPECTED_RESOLUTION_ERRORS = (RuntimeError, ValueError, OSError)
 
 
 def normalize_manifest_config(
@@ -18,17 +21,24 @@ def normalize_manifest_config(
 
 
 def can_resolve(target: str, context: dict[str, Any]) -> bool:
-    from .ytdlp import probe_ytdlp_url
+    from .ytdlp import looks_like_ytdlp_url
 
-    return probe_ytdlp_url(target, timeout_seconds=5)
+    return looks_like_ytdlp_url(target)
 
 
 def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | None:
-    from .ytdlp import probe_ytdlp_metadata
+    from .ytdlp import looks_like_ytdlp_url, probe_ytdlp_metadata
 
     metadata = probe_ytdlp_metadata(target, timeout_seconds=5)
     if metadata is None:
-        return None
+        if not looks_like_ytdlp_url(target):
+            return None
+        return {
+            "provider": PLUGIN_NAME,
+            "kind": "video",
+            "is_external": True,
+            "group_key": "video",
+        }
     duration = metadata.get("duration")
     kind = (
         "video" if isinstance(duration, (int, float)) and duration > 0 else "resource"
@@ -42,17 +52,41 @@ def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | No
 
 
 def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
-    from .ytdlp import YtDlpReference
+    from .ytdlp import YtDlpReference, looks_like_ytdlp_url
 
-    reference = YtDlpReference(
-        target,
-        format="raw",
-        label="relative",
-        inject=False,
-        use_cache=bool(context.get("use_cache", True)),
-        cache_ttl=context.get("cache_ttl"),
-        refresh_cache=bool(context.get("refresh_cache", False)),
-    )
+    try:
+        reference = YtDlpReference(
+            target,
+            format="raw",
+            label="relative",
+            inject=False,
+            use_cache=bool(context.get("use_cache", True)),
+            cache_ttl=context.get("cache_ttl"),
+            refresh_cache=bool(context.get("refresh_cache", False)),
+            plugin_overrides=context.get("overrides"),
+        )
+    except _EXPECTED_RESOLUTION_ERRORS as exc:
+        if not looks_like_ytdlp_url(target):
+            raise
+        netloc = urlparse(target).netloc or "ytdlp"
+        return [
+            {
+                "source": target,
+                "label": target,
+                "content": (
+                    f"yt-dlp claimed this media URL but failed to resolve it: {exc}"
+                ),
+                "metadata": {
+                    "trace_path": target,
+                    "provider": PLUGIN_NAME,
+                    "source_ref": netloc,
+                    "source_path": target,
+                    "context_subpath": "ytdlp-error.md",
+                    "kind": "video",
+                    "resolution_error": str(exc),
+                },
+            }
+        ]
     return [
         {
             "source": target,

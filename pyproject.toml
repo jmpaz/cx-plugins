@@ -16,6 +16,7 @@ dependencies = [
     "pyyaml>=6.0",
     "requests>=2.25.0",
     "selectolax>=0.3.20",
+    "yt-dlp>=2025.1.0",
 ]
 
 [project.entry-points."contextualize.plugins"]
@@ -24,6 +25,7 @@ arxiv = "cx_plugins.providers.arxiv.plugin"
 atproto = "cx_plugins.providers.atproto.plugin"
 discord = "cx_plugins.providers.discord.plugin"
 soundcloud = "cx_plugins.providers.soundcloud.plugin"
+transcribe = "cx_plugins.providers.transcribe.plugin"
 wikipedia = "cx_plugins.providers.wikipedia.plugin"
 ytdlp = "cx_plugins.providers.ytdlp.plugin"
 

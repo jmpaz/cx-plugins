@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from datetime import timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
@@ -17,6 +18,43 @@ from urllib.parse import urlparse, urlunparse
 def is_url_target(url: str) -> bool:
     parsed = urlparse(url)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+@lru_cache(maxsize=1)
+def _ytdlp_extractors() -> tuple[Any, ...]:
+    try:
+        from yt_dlp.extractor import gen_extractors
+    except Exception:
+        return ()
+    try:
+        return tuple(gen_extractors())
+    except Exception:
+        return ()
+
+
+@lru_cache(maxsize=512)
+def looks_like_ytdlp_url(url: str) -> bool:
+    if not is_url_target(url):
+        return False
+    for extractor in _ytdlp_extractors():
+        if getattr(extractor, "IE_NAME", "") == "generic":
+            continue
+        try:
+            if extractor.suitable(url):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _log(message: str) -> None:
+    try:
+        from contextualize.runtime import get_verbose_logging
+
+        if get_verbose_logging():
+            print(f"[ytdlp] {message}", file=sys.stderr, flush=True)
+    except Exception:
+        return
 
 
 def _clean_identity_part(value: Any) -> str | None:
@@ -239,6 +277,7 @@ class YtDlpReference:
     use_cache: bool = True
     cache_ttl: timedelta | None = None
     refresh_cache: bool = False
+    plugin_overrides: dict[str, Any] | None = None
     _metadata: dict[str, Any] | None = field(default=None, init=False, repr=False)
     _identity: _YtDlpIdentity | None = field(default=None, init=False, repr=False)
 
@@ -328,8 +367,27 @@ class YtDlpReference:
         return self._identity
 
     def _extract_audio(self) -> Path:
+        from contextualize.cache.youtube import (
+            get_cached_media_bytes,
+            store_media_bytes,
+        )
+        from contextualize.runtime import get_refresh_audio
+
+        identity = self._get_identity()
+        cache_identity = f"audio:{identity.cache_identity}"
+        if self.use_cache and not get_refresh_audio():
+            cached = get_cached_media_bytes(cache_identity)
+            if cached:
+                _log(f"audio cache hit for {identity.display_name}")
+                fd, path = tempfile.mkstemp(prefix="ytdlp-audio-", suffix=".mp3")
+                try:
+                    os.write(fd, cached)
+                finally:
+                    os.close(fd)
+                return Path(path)
+        _log(f"extracting audio with yt-dlp for {identity.display_name}")
         tmpdir = tempfile.mkdtemp(prefix="ytdlp-")
-        output_template = os.path.join(tmpdir, f"{self._get_identity().slug}.%(ext)s")
+        output_template = os.path.join(tmpdir, f"{identity.slug}.%(ext)s")
 
         result = _run_ytdlp(
             [
@@ -356,7 +414,12 @@ class YtDlpReference:
             audio_files = sorted(path for path in audio_dir.iterdir() if path.is_file())
         if not audio_files:
             raise RuntimeError("yt-dlp audio extraction produced no audio file")
-
+        if self.use_cache:
+            try:
+                store_media_bytes(cache_identity, audio_files[0].read_bytes())
+                _log(f"stored extracted audio cache for {identity.display_name}")
+            except OSError:
+                pass
         return audio_files[0]
 
     def _get_transcript(self, _duration: int) -> tuple[str, str]:
@@ -371,6 +434,7 @@ class YtDlpReference:
                 audio_path,
                 use_cache=self.use_cache,
                 refresh_cache=self.refresh_cache,
+                plugin_overrides=self.plugin_overrides,
             )
             return transcript, "whisper"
         finally:
@@ -423,6 +487,7 @@ class YtDlpReference:
                 whisper_available=whisper_available,
             )
             if cached is not None:
+                _log(f"render cache hit for {identity.display_name}")
                 self.original_file_content = cached
                 self.file_content = cached
                 text = cached
@@ -444,6 +509,10 @@ class YtDlpReference:
 
         metadata = self._fetch_metadata()
         duration = int(metadata.get("duration", 0) or 0)
+        _log(
+            f"building transcript for {identity.display_name} "
+            f"(duration={duration}s, refresh_cache={self.refresh_cache})"
+        )
         transcript, source = self._get_transcript(duration)
         text = self._format_output(metadata, transcript, source)
 
