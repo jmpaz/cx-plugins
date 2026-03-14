@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace as dataclass_replace
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -180,6 +180,36 @@ def _parse_message_id(value: str) -> str | None:
     if parsed and parsed.get("kind") == "message":
         return parsed.get("message_id")
     return None
+
+
+def _parse_type_set(value: str) -> frozenset[str] | None:
+    if not value or not value.strip():
+        return None
+    parts = {p.strip().lower() for p in value.split(",") if p.strip()}
+    return frozenset(parts) if parts else None
+
+
+def _truncate_to_tokens(text: str, max_tokens: int) -> str:
+    import tiktoken
+
+    enc = tiktoken.get_encoding("cl100k_base")
+    tokens = enc.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    return enc.decode(tokens[:max_tokens]) + "\n[truncated]"
+
+
+def _attachment_matches_type_set(
+    kind: str, content_type: str, filename: str, type_set: frozenset[str]
+) -> bool:
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    ext = Path(filename).suffix.lower().lstrip(".")
+    return bool(
+        kind in type_set
+        or (ctype and ctype in type_set)
+        or (ext and ext in type_set)
+        or (ext and f".{ext}" in type_set)
+    )
 
 
 def _normalize_message_id(value: Any) -> str | None:
@@ -425,6 +455,9 @@ class DiscordSettings:
     include_embed_media_descriptions: bool = True
     include_file_content: bool = True
     media_mode: str = "describe"
+    attachment_max_tokens: int | None = None
+    attachment_types_allow: frozenset[str] | None = None
+    attachment_types_deny: frozenset[str] | None = None
     hard_min_timestamp: datetime | None = None
     hard_max_timestamp: datetime | None = None
 
@@ -718,6 +751,15 @@ def _discord_settings_from_env() -> DiscordSettings:
         os.environ.get("DISCORD_MEDIA_MODE", ""),
         default="describe",
     )
+    attachment_max_tokens = _parse_optional_int(
+        os.environ.get("DISCORD_ATTACHMENT_MAX_TOKENS", "")
+    )
+    attachment_types_allow = _parse_type_set(
+        os.environ.get("DISCORD_ATTACHMENT_TYPES_ALLOW", "")
+    )
+    attachment_types_deny = _parse_type_set(
+        os.environ.get("DISCORD_ATTACHMENT_TYPES_DENY", "")
+    )
 
     around_messages = _parse_optional_int(os.environ.get("DISCORD_AROUND_MESSAGES", ""))
     before_messages = _parse_optional_int(os.environ.get("DISCORD_BEFORE_MESSAGES", ""))
@@ -788,6 +830,9 @@ def _discord_settings_from_env() -> DiscordSettings:
         include_embed_media_descriptions=embed_media_desc,
         include_file_content=include_file_content,
         media_mode=media_mode,
+        attachment_max_tokens=attachment_max_tokens,
+        attachment_types_allow=attachment_types_allow,
+        attachment_types_deny=attachment_types_deny,
         hard_min_timestamp=_normalize_datetime(hard_min_timestamp),
         hard_max_timestamp=_normalize_datetime(hard_max_timestamp),
     )
@@ -840,6 +885,9 @@ def _clamp_settings(settings: DiscordSettings) -> DiscordSettings:
         include_embed_media_descriptions=settings.include_embed_media_descriptions,
         include_file_content=settings.include_file_content,
         media_mode=settings.media_mode,
+        attachment_max_tokens=settings.attachment_max_tokens,
+        attachment_types_allow=settings.attachment_types_allow,
+        attachment_types_deny=settings.attachment_types_deny,
         hard_min_timestamp=hard_min,
         hard_max_timestamp=hard_max,
     )
@@ -875,6 +923,37 @@ def build_discord_settings(overrides: dict[str, Any] | None = None) -> DiscordSe
         str(overrides.get("media_mode", env.media_mode) or ""),
         default=env.media_mode,
     )
+    raw_attachment_max_tokens = overrides.get(
+        "attachment_max_tokens", env.attachment_max_tokens
+    )
+    try:
+        attachment_max_tokens = (
+            int(raw_attachment_max_tokens)
+            if raw_attachment_max_tokens is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        attachment_max_tokens = env.attachment_max_tokens
+
+    raw_allow = overrides.get("attachment_types_allow")
+    if raw_allow is not None:
+        attachment_types_allow = (
+            _parse_type_set(raw_allow)
+            if isinstance(raw_allow, str)
+            else (frozenset(str(t).lower() for t in raw_allow) if raw_allow else None)
+        )
+    else:
+        attachment_types_allow = env.attachment_types_allow
+
+    raw_deny = overrides.get("attachment_types_deny")
+    if raw_deny is not None:
+        attachment_types_deny = (
+            _parse_type_set(raw_deny)
+            if isinstance(raw_deny, str)
+            else (frozenset(str(t).lower() for t in raw_deny) if raw_deny else None)
+        )
+    else:
+        attachment_types_deny = env.attachment_types_deny
 
     before_messages = overrides.get("before_messages", env.before_messages)
     after_messages = overrides.get("after_messages", env.after_messages)
@@ -939,6 +1018,9 @@ def build_discord_settings(overrides: dict[str, Any] | None = None) -> DiscordSe
         include_embed_media_descriptions=include_embed_media_descriptions,
         include_file_content=include_file_content,
         media_mode=media_mode,
+        attachment_max_tokens=attachment_max_tokens,
+        attachment_types_allow=attachment_types_allow,
+        attachment_types_deny=attachment_types_deny,
         hard_min_timestamp=env.hard_min_timestamp,
         hard_max_timestamp=env.hard_max_timestamp,
     )
@@ -1720,6 +1802,9 @@ def _normalize_attachment_nodes(
     include_embed_media_descriptions: bool,
     include_file_content: bool,
     media_mode: str,
+    attachment_max_tokens: int | None = None,
+    attachment_types_allow: frozenset[str] | None = None,
+    attachment_types_deny: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
     message_id_raw = message.get("id")
@@ -1737,6 +1822,14 @@ def _normalize_attachment_nodes(
         content_type = str(attachment.get("content_type") or "")
         kind = _parse_media_kind(filename=filename, content_type=content_type)
         attachment_url = str(attachment.get("url") or "")
+        if attachment_types_allow is not None and not _attachment_matches_type_set(
+            kind, content_type, filename, attachment_types_allow
+        ):
+            continue
+        if attachment_types_deny is not None and _attachment_matches_type_set(
+            kind, content_type, filename, attachment_types_deny
+        ):
+            continue
         node: dict[str, Any] = {
             "type": kind,
             "filename": filename,
@@ -1774,6 +1867,10 @@ def _normalize_attachment_nodes(
                     send_label=attachment_label,
                 )
                 if text_content:
+                    if attachment_max_tokens is not None:
+                        text_content = _truncate_to_tokens(
+                            text_content, attachment_max_tokens
+                        )
                     node["text_content"] = text_content
             has_text_content = isinstance(node.get("text_content"), str) and bool(
                 str(node.get("text_content")).strip()
@@ -2140,6 +2237,9 @@ def _normalize_message(
     include_embed_media_descriptions: bool,
     include_file_content: bool,
     media_mode: str,
+    attachment_max_tokens: int | None = None,
+    attachment_types_allow: frozenset[str] | None = None,
+    attachment_types_deny: frozenset[str] | None = None,
     message_lookup: dict[str, dict[str, Any]] | None = None,
     forward_source_lookup: dict[tuple[str, str], str] | None = None,
 ) -> dict[str, Any] | None:
@@ -2165,6 +2265,9 @@ def _normalize_message(
         include_embed_media_descriptions=include_embed_media_descriptions,
         include_file_content=include_file_content,
         media_mode=media_mode,
+        attachment_max_tokens=attachment_max_tokens,
+        attachment_types_allow=attachment_types_allow,
+        attachment_types_deny=attachment_types_deny,
     )
 
     reply_to_id = _reply_to_id(message)
@@ -2768,13 +2871,15 @@ def split_discord_document_by_utc_day(
     if not grouped:
         return [document]
 
+    multi_day = len(grouped) > 1
     out: list[DiscordDocument] = []
     for day_key in sorted(grouped.keys()):
         day_messages = grouped[day_key]
+        trace_path = f"{document.trace_path}@{day_key}" if multi_day else document.trace_path
         base = DiscordDocument(
             source_url=document.source_url,
             label=document.label,
-            trace_path=document.trace_path,
+            trace_path=trace_path,
             guild_id=document.guild_id,
             channel_id=document.channel_id,
             channel_name=document.channel_name,
@@ -2836,10 +2941,13 @@ def _document_trace_path(
     channel_id: str,
     parent_channel_id: str | None,
     thread_id: str | None,
+    message_id: str | None = None,
 ) -> str:
     if thread_id:
         parent = parent_channel_id or channel_id
         return f"discord/{guild_id}/{parent}/{thread_id}"
+    if message_id:
+        return f"discord/{guild_id}/{channel_id}/{message_id}"
     return f"discord/{guild_id}/{channel_id}"
 
 
@@ -3002,6 +3110,9 @@ def _resolve_message_url(
             include_embed_media_descriptions=settings.include_embed_media_descriptions,
             include_file_content=settings.include_file_content,
             media_mode=settings.media_mode,
+            attachment_max_tokens=settings.attachment_max_tokens,
+            attachment_types_allow=settings.attachment_types_allow,
+            attachment_types_deny=settings.attachment_types_deny,
             message_lookup=message_lookup,
             forward_source_lookup=forward_source_lookup,
         )
@@ -3023,6 +3134,7 @@ def _resolve_message_url(
         channel_id=channel_id,
         parent_channel_id=parent_channel_id,
         thread_id=thread_id,
+        message_id=message_id,
     )
 
     base = DiscordDocument(
@@ -3176,6 +3288,9 @@ def _build_document(
             include_embed_media_descriptions=settings.include_embed_media_descriptions,
             include_file_content=settings.include_file_content,
             media_mode=settings.media_mode,
+            attachment_max_tokens=settings.attachment_max_tokens,
+            attachment_types_allow=settings.attachment_types_allow,
+            attachment_types_deny=settings.attachment_types_deny,
             message_lookup=message_lookup,
             forward_source_lookup=forward_source_lookup,
         )
@@ -3458,7 +3573,19 @@ def resolve_discord_url(
         cached_documents = _documents_from_cached_payload(cached_payload)
         if cached_documents is not None:
             _log(f"  Discord resolution cache hit: {url}")
-            return cached_documents
+            expected_trace_path = _document_trace_path(
+                guild_id=parsed.get("guild_id", ""),
+                channel_id=parsed.get("channel_id", ""),
+                parent_channel_id=parsed.get("parent_channel_id"),
+                thread_id=parsed.get("thread_id"),
+                message_id=parsed.get("message_id"),
+            )
+            return [
+                dataclass_replace(doc, trace_path=expected_trace_path)
+                if doc.trace_path != expected_trace_path
+                else doc
+                for doc in cached_documents
+            ]
 
     if parsed["kind"] == "message":
         documents = _resolve_message_url(
