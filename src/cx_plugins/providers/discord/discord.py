@@ -3226,6 +3226,52 @@ def _resolve_channel_messages(
     return messages
 
 
+def _fetch_thread_starter(
+    thread_id: str,
+    parent_channel_id: str,
+    *,
+    use_cache: bool,
+    cache_ttl: timedelta | None,
+    refresh_cache: bool,
+) -> dict[str, Any] | None:
+    try:
+        return _fetch_message(
+            parent_channel_id,
+            thread_id,
+            use_cache=use_cache,
+            cache_ttl=cache_ttl,
+            refresh_cache=refresh_cache,
+        )
+    except Exception:
+        _log(f"    Unable to fetch thread starter message {thread_id} from parent {parent_channel_id}")
+        return None
+
+
+def _prepend_thread_starter(
+    messages: list[dict[str, Any]],
+    thread_id: str,
+    parent_channel_id: str,
+    *,
+    use_cache: bool,
+    cache_ttl: timedelta | None,
+    refresh_cache: bool,
+) -> list[dict[str, Any]]:
+    starter = _fetch_thread_starter(
+        thread_id,
+        parent_channel_id,
+        use_cache=use_cache,
+        cache_ttl=cache_ttl,
+        refresh_cache=refresh_cache,
+    )
+    if starter is None:
+        return messages
+    starter_id = str(starter.get("id", ""))
+    if any(str(m.get("id", "")) == starter_id for m in messages):
+        return messages
+    _log(f"    Prepended thread starter message {starter_id}")
+    return [starter, *messages]
+
+
 def _thread_ids_from_messages(
     messages: list[dict[str, Any]],
 ) -> list[tuple[str, str | None]]:
@@ -3438,6 +3484,14 @@ def _resolve_channel_or_thread_url(
                 parent_channel_name = _channel_label(parent_channel, parent_channel_id)
             except Exception:
                 parent_channel_name = None
+            messages = _prepend_thread_starter(
+                messages,
+                channel_id,
+                parent_channel_id,
+                use_cache=use_cache,
+                cache_ttl=cache_ttl,
+                refresh_cache=refresh_cache,
+            )
         documents.append(
             _build_document(
                 source_url=url,
@@ -3511,6 +3565,14 @@ def _resolve_channel_or_thread_url(
             settings=settings,
             start=window_start,
             end=window_end,
+        )
+        thread_messages = _prepend_thread_starter(
+            thread_messages,
+            thread_id,
+            channel_id,
+            use_cache=use_cache,
+            cache_ttl=cache_ttl,
+            refresh_cache=refresh_cache,
         )
         _log(f"    Thread {thread_id} kept {len(thread_messages)} message(s)")
 
