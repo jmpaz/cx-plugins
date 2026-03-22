@@ -101,7 +101,10 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
 
     out: list[dict[str, Any]] = []
     for document in documents:
-        day_documents = split_discord_document_by_utc_day(document, settings=settings)
+        if document.kind == "thread":
+            day_documents = [document]
+        else:
+            day_documents = split_discord_document_by_utc_day(document, settings=settings)
         for day_document in day_documents:
             rendered_document = with_discord_document_rendered(
                 day_document,
