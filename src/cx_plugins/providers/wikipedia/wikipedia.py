@@ -466,12 +466,25 @@ def _render_link_node(node: Any) -> str:
     return display
 
 
+def _render_svg_node(node: Any) -> str:
+    for child in _iter_children(node):
+        if _node_tag(child) == "title":
+            text = str(getattr(child, "text", lambda *args, **kwargs: "")()).strip()
+            m = re.match(r"^\{\\displaystyle\s*(.*)\}$", text, re.DOTALL)
+            if m:
+                text = m.group(1).strip()
+            return text
+    return ""
+
+
 def _render_inline_node(node: Any) -> str:
     tag = _node_tag(node)
     if tag == "-text":
         return str(getattr(node, "text", lambda *args, **kwargs: "")())
 
-    if tag in {"style", "script", "noscript"}:
+    if tag in {"style", "script", "noscript", "svg"}:
+        if tag == "svg":
+            return _render_svg_node(node)
         return ""
 
     class_name = _node_attr(node, "class").lower()
@@ -765,6 +778,10 @@ def _resolve_media_list(
             continue
         if src.startswith("//"):
             src = f"https:{src}"
+
+        src_lower = src.lower()
+        if src_lower.endswith(".svg") or "/math/render/svg/" in src_lower:
+            continue
 
         filename = _filename_from_media_title(item.get("title"))
         if not filename:
