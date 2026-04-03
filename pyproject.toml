@@ -27,6 +27,7 @@ discord = "cx_plugins.providers.discord.plugin"
 soundcloud = "cx_plugins.providers.soundcloud.plugin"
 transcribe = "cx_plugins.providers.transcribe.plugin"
 wikipedia = "cx_plugins.providers.wikipedia.plugin"
+skill = "cx_plugins.providers.skill.plugin"
 ytdlp = "cx_plugins.providers.ytdlp.plugin"
 
 [build-system]
