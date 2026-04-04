@@ -30,6 +30,12 @@ _DISCORD_CHANNEL_RE = re.compile(
     r"(?P<guild_id>[^/]+)/(?P<channel_id>\d+)"
     r"(?:[/?#].*)?$"
 )
+_DISCORD_GUILD_RE = re.compile(
+    r"^https?://(?:ptb\.|canary\.)?discord(?:app)?\.com/channels/"
+    r"(?P<guild_id>\d+)/?$"
+)
+
+_GUILD_TEXT_CHANNEL_TYPES = frozenset({0, 5, 15})
 
 _DISCORD_EPOCH_MS = 1420070400000
 _DISCORD_THREAD_TYPES = frozenset({10, 11, 12})
@@ -108,8 +114,12 @@ def _load_dotenv() -> None:
         return
 
 
+def is_discord_guild_url(url: str) -> bool:
+    return bool(_DISCORD_GUILD_RE.match(url))
+
+
 def is_discord_url(url: str) -> bool:
-    return is_discord_message_url(url) or is_discord_channel_or_thread_url(url)
+    return is_discord_message_url(url) or is_discord_channel_or_thread_url(url) or is_discord_guild_url(url)
 
 
 def is_discord_message_url(url: str) -> bool:
@@ -123,6 +133,12 @@ def is_discord_channel_or_thread_url(url: str) -> bool:
 
 
 def parse_discord_url(url: str) -> dict[str, str] | None:
+    guild_match = _DISCORD_GUILD_RE.match(url)
+    if guild_match:
+        return {
+            "kind": "guild",
+            "guild_id": guild_match.group("guild_id"),
+        }
     msg_match = _DISCORD_MESSAGE_RE.match(url)
     if msg_match:
         return {
@@ -139,6 +155,108 @@ def parse_discord_url(url: str) -> dict[str, str] | None:
             "channel_id": channel_match.group("channel_id"),
         }
     return None
+
+
+@dataclass(frozen=True)
+class GuildChannelInfo:
+    channel_id: str
+    name: str
+    slug: str
+    channel_type: int
+    category_id: str | None
+    category_name: str | None
+    category_slug: str | None
+    position: int
+    url: str
+
+
+def _slugify_channel(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    return slug[:60] or "unnamed"
+
+
+def _fetch_guild_channels(
+    guild_id: str,
+    *,
+    use_cache: bool,
+    cache_ttl: timedelta | None,
+    refresh_cache: bool,
+) -> list[dict]:
+    return _api_get(
+        f"/guilds/{guild_id}/channels",
+        use_cache=use_cache,
+        cache_ttl=cache_ttl,
+        refresh_cache=refresh_cache,
+    )
+
+
+def discover_guild_channels(
+    guild_id: str,
+    *,
+    use_cache: bool = True,
+    cache_ttl: timedelta | None = None,
+    refresh_cache: bool = False,
+) -> list[GuildChannelInfo]:
+    raw_channels = _fetch_guild_channels(
+        guild_id,
+        use_cache=use_cache,
+        cache_ttl=cache_ttl,
+        refresh_cache=refresh_cache,
+    )
+
+    categories: dict[str, dict] = {
+        ch["id"]: ch for ch in raw_channels if ch.get("type") == 4
+    }
+
+    category_slugs: dict[str, str] = {}
+    cat_slug_counts: dict[str, int] = {}
+    for cat in categories.values():
+        slug = _slugify_channel(cat["name"])
+        cat_slug_counts[slug] = cat_slug_counts.get(slug, 0) + 1
+    seen_cat_slugs: dict[str, int] = {}
+    for cat in sorted(categories.values(), key=lambda c: c.get("position", 0)):
+        slug = _slugify_channel(cat["name"])
+        if cat_slug_counts[slug] > 1:
+            seen_cat_slugs[slug] = seen_cat_slugs.get(slug, 0) + 1
+            slug = f"{slug}-{cat['id'][:6]}"
+        category_slugs[cat["id"]] = slug
+
+    text_channels = [
+        ch for ch in raw_channels
+        if ch.get("type") in _GUILD_TEXT_CHANNEL_TYPES
+    ]
+    text_channels.sort(key=lambda c: (c.get("position", 0),))
+
+    slug_counts: dict[str, int] = {}
+    for ch in text_channels:
+        slug = _slugify_channel(ch["name"])
+        slug_counts[slug] = slug_counts.get(slug, 0) + 1
+
+    seen_slugs: dict[str, int] = {}
+    result: list[GuildChannelInfo] = []
+    for ch in text_channels:
+        slug = _slugify_channel(ch["name"])
+        if slug_counts[slug] > 1:
+            seen_slugs[slug] = seen_slugs.get(slug, 0) + 1
+            final_slug = f"{slug}-{ch['id'][:6]}"
+        else:
+            final_slug = slug
+
+        parent_id = ch.get("parent_id")
+        cat = categories.get(parent_id) if parent_id else None
+        result.append(GuildChannelInfo(
+            channel_id=ch["id"],
+            name=ch["name"],
+            slug=final_slug,
+            channel_type=ch["type"],
+            category_id=parent_id,
+            category_name=cat["name"] if cat else None,
+            category_slug=category_slugs.get(parent_id) if parent_id else None,
+            position=ch.get("position", 0),
+            url=f"https://discord.com/channels/{guild_id}/{ch['id']}",
+        ))
+
+    return result
 
 
 def _parse_bool(value: str, *, default: bool) -> bool:
@@ -3780,6 +3898,7 @@ def parse_discord_config_mapping(raw: Any, *, prefix: str) -> dict[str, Any] | N
         "include-thread-starters",
         "expand-threads",
         "gap-threshold",
+        "channel-batch-limit",
         "window",
         "media",
     }
@@ -3817,6 +3936,12 @@ def parse_discord_config_mapping(raw: Any, *, prefix: str) -> dict[str, Any] | N
         if parsed is None:
             raise ValueError(f"{prefix}.gap-threshold must use duration tokens like 6h")
         result["gap_threshold"] = parsed
+
+    if "channel-batch-limit" in raw:
+        value = raw.get("channel-batch-limit")
+        if not isinstance(value, int) or value < 1:
+            raise ValueError(f"{prefix}.channel-batch-limit must be a positive integer")
+        result["channel_batch_limit"] = value
 
     window_overrides = _parse_window_mapping(raw.get("window"), prefix=prefix)
     if window_overrides:
