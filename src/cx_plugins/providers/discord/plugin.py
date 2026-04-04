@@ -180,6 +180,37 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
     return _render_documents(documents, target, settings, settings_key)
 
 
+_CHANNEL_TYPE_LABELS = {0: "text", 2: "voice", 5: "announcement", 15: "forum"}
+
+
+def _build_guild_manifest(
+    guild_id: str,
+    all_channels: list,
+    skipped: list[str],
+) -> str:
+    from .discord import _slugify_channel
+
+    by_category: dict[str | None, list] = {}
+    for ch in all_channels:
+        key = ch.category_name
+        by_category.setdefault(key, []).append(ch)
+
+    lines = ["---", f"guild_id: \"{guild_id}\"", "kind: manifest", "---", ""]
+
+    for cat_name in sorted(by_category, key=lambda k: (k is None, k or "")):
+        heading = cat_name or "(uncategorized)"
+        lines.append(f"## {heading}")
+        for ch in by_category[cat_name]:
+            type_label = _CHANNEL_TYPE_LABELS.get(ch.channel_type, "channel")
+            note = ""
+            if ch.channel_id in skipped:
+                note = " (inaccessible)"
+            lines.append(f"- **#{ch.name}** — {type_label}{note}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 def _resolve_guild(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
     from .discord import (
         DiscordResolutionError,
@@ -199,7 +230,7 @@ def _resolve_guild(target: str, context: dict[str, Any]) -> list[dict[str, Any]]
     cache_ttl = context.get("cache_ttl")
     refresh_cache = bool(context.get("refresh_cache", False))
 
-    channels = discover_guild_channels(
+    all_channels = discover_guild_channels(
         guild_id,
         use_cache=use_cache,
         cache_ttl=cache_ttl,
@@ -219,13 +250,13 @@ def _resolve_guild(target: str, context: dict[str, Any]) -> list[dict[str, Any]]
             if isinstance(raw_limit, int) and raw_limit > 0:
                 channel_batch_limit = raw_limit
 
-    if channel_batch_limit is not None:
-        channels = channels[:channel_batch_limit]
+    channels = all_channels[:channel_batch_limit] if channel_batch_limit else all_channels
 
     settings = build_discord_settings(_discord_overrides(context))
     settings_key = discord_settings_cache_key(settings)
 
     out: list[dict[str, Any]] = []
+    skipped: list[str] = []
     for channel_info in channels:
         try:
             documents = resolve_discord_url(
@@ -242,6 +273,7 @@ def _resolve_guild(target: str, context: dict[str, Any]) -> list[dict[str, Any]]
                     file=sys.stderr,
                     flush=True,
                 )
+                skipped.append(channel_info.channel_id)
                 continue
             if isinstance(exc, DiscordResolutionError):
                 print(
@@ -249,6 +281,7 @@ def _resolve_guild(target: str, context: dict[str, Any]) -> list[dict[str, Any]]
                     file=sys.stderr,
                     flush=True,
                 )
+                skipped.append(channel_info.channel_id)
                 continue
             raise
 
@@ -262,5 +295,18 @@ def _resolve_guild(target: str, context: dict[str, Any]) -> list[dict[str, Any]]
             category_id=channel_info.category_id,
             category_name=channel_info.category_name,
         ))
+
+    manifest_body = _build_guild_manifest(guild_id, all_channels, skipped)
+    out.append({
+        "source": target,
+        "label": "manifest",
+        "content": manifest_body,
+        "metadata": {
+            "provider": PLUGIN_NAME,
+            "kind": "manifest",
+            "guild_id": guild_id,
+            "channel_count": len(all_channels),
+        },
+    })
 
     return out
