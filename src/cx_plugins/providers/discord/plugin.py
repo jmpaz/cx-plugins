@@ -67,37 +67,22 @@ def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | No
     }
 
 
-def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+def _render_documents(
+    documents: list[Any],
+    source_url: str,
+    settings: Any,
+    settings_key: str,
+    channel_id: str | None = None,
+    channel_name: str | None = None,
+    category_id: str | None = None,
+    category_name: str | None = None,
+) -> list[dict[str, Any]]:
     from .discord import (
-        DiscordResolutionError,
-        build_discord_settings,
         discord_document_timestamps,
-        discord_settings_cache_key,
         render_discord_document_with_metadata,
-        resolve_discord_url,
         split_discord_document_by_utc_day,
         with_discord_document_rendered,
     )
-
-    settings = build_discord_settings(_discord_overrides(context))
-    settings_key = discord_settings_cache_key(settings)
-    try:
-        documents = resolve_discord_url(
-            target,
-            settings=settings,
-            use_cache=bool(context.get("use_cache", True)),
-            cache_ttl=context.get("cache_ttl"),
-            refresh_cache=bool(context.get("refresh_cache", False)),
-        )
-    except ValueError as exc:
-        if isinstance(exc, DiscordResolutionError) and exc.is_skippable:
-            print(
-                f"Warning: skipping Discord URL: {target} ({exc})",
-                file=sys.stderr,
-                flush=True,
-            )
-            return []
-        raise
 
     out: list[dict[str, Any]] = []
     for document in documents:
@@ -111,7 +96,7 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
                 rendered=render_discord_document_with_metadata(
                     day_document,
                     settings=settings,
-                    source_url=target,
+                    source_url=source_url,
                     include_message_bounds=False,
                 ),
             )
@@ -119,9 +104,14 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
             day_slug = source_created[:10] if source_created else "undated"
             scope_id = rendered_document.thread_id or rendered_document.channel_id
             ext = ".yaml" if settings.format == "yaml" else ".md"
+            effective_channel_id = (
+                channel_id
+                or (rendered_document.channel_id if rendered_document.kind != "thread" else None)
+                or rendered_document.channel_id
+            )
             out.append(
                 {
-                    "source": target,
+                    "source": source_url,
                     "label": rendered_document.label,
                     "content": rendered_document.rendered,
                     "metadata": {
@@ -145,7 +135,132 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
                         "kind": rendered_document.kind,
                         "scope_id": scope_id,
                         "settings_key": settings_key,
+                        "channelId": effective_channel_id,
+                        "channelName": channel_name,
+                        "categoryId": category_id,
+                        "categoryName": category_name,
                     },
                 }
             )
+    return out
+
+
+def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+    from .discord import (
+        DiscordResolutionError,
+        build_discord_settings,
+        discord_settings_cache_key,
+        is_discord_guild_url,
+        resolve_discord_url,
+    )
+
+    if is_discord_guild_url(target):
+        return _resolve_guild(target, context)
+
+    settings = build_discord_settings(_discord_overrides(context))
+    settings_key = discord_settings_cache_key(settings)
+    try:
+        documents = resolve_discord_url(
+            target,
+            settings=settings,
+            use_cache=bool(context.get("use_cache", True)),
+            cache_ttl=context.get("cache_ttl"),
+            refresh_cache=bool(context.get("refresh_cache", False)),
+        )
+    except ValueError as exc:
+        if isinstance(exc, DiscordResolutionError) and exc.is_skippable:
+            print(
+                f"Warning: skipping Discord URL: {target} ({exc})",
+                file=sys.stderr,
+                flush=True,
+            )
+            return []
+        raise
+
+    return _render_documents(documents, target, settings, settings_key)
+
+
+def _resolve_guild(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+    from .discord import (
+        DiscordResolutionError,
+        build_discord_settings,
+        discover_guild_channels,
+        discord_settings_cache_key,
+        parse_discord_url,
+        resolve_discord_url,
+    )
+
+    parsed = parse_discord_url(target)
+    if not parsed or parsed["kind"] != "guild":
+        raise ValueError(f"Not a Discord guild URL: {target}")
+
+    guild_id = parsed["guild_id"]
+    use_cache = bool(context.get("use_cache", True))
+    cache_ttl = context.get("cache_ttl")
+    refresh_cache = bool(context.get("refresh_cache", False))
+
+    channels = discover_guild_channels(
+        guild_id,
+        use_cache=use_cache,
+        cache_ttl=cache_ttl,
+        refresh_cache=refresh_cache,
+    )
+
+    channel_batch_limit = None
+    overrides = context.get("overrides")
+    if isinstance(overrides, dict):
+        discord_opts = overrides.get("discord")
+        if isinstance(discord_opts, dict):
+            raw_limit = (
+                discord_opts.get("channel-batch-limit")
+                or discord_opts.get("channel_batch_limit")
+                or discord_opts.get("channelBatchLimit")
+            )
+            if isinstance(raw_limit, int) and raw_limit > 0:
+                channel_batch_limit = raw_limit
+
+    if channel_batch_limit is not None:
+        channels = channels[:channel_batch_limit]
+
+    settings = build_discord_settings(_discord_overrides(context))
+    settings_key = discord_settings_cache_key(settings)
+
+    out: list[dict[str, Any]] = []
+    for channel_info in channels:
+        try:
+            documents = resolve_discord_url(
+                channel_info.url,
+                settings=settings,
+                use_cache=use_cache,
+                cache_ttl=cache_ttl,
+                refresh_cache=refresh_cache,
+            )
+        except ValueError as exc:
+            if isinstance(exc, DiscordResolutionError) and exc.is_skippable:
+                print(
+                    f"Warning: skipping #{channel_info.name}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            if isinstance(exc, DiscordResolutionError):
+                print(
+                    f"Warning: error resolving #{channel_info.name}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            raise
+
+        out.extend(_render_documents(
+            documents,
+            channel_info.url,
+            settings,
+            settings_key,
+            channel_id=channel_info.channel_id,
+            channel_name=channel_info.name,
+            category_id=channel_info.category_id,
+            category_name=channel_info.category_name,
+        ))
+
     return out
