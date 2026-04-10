@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 from typing import Any
 
+import click
+
 PLUGIN_API_VERSION = "1"
 PLUGIN_NAME = "discord"
 PLUGIN_PRIORITY = 100
@@ -16,6 +18,13 @@ def normalize_manifest_config(
     if not isinstance(raw_config, dict):
         raise ValueError("discord config must be a mapping")
     return dict(raw_config)
+
+
+def _append_option(command: click.Command, option: click.Option) -> None:
+    existing = {name for param in command.params for name in getattr(param, "opts", ())}
+    if any(name in existing for name in option.opts):
+        return
+    command.params.append(option)
 
 
 def _discord_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -67,6 +76,71 @@ def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | No
     }
 
 
+def register_cli_options(command_name: str, command: click.Command) -> None:
+    if command_name not in {"cat", "hydrate"}:
+        return
+    _append_option(
+        command,
+        click.Option(
+            ["--discord-file-content/--discord-file-links-only"],
+            default=None,
+            help=(
+                "Inline generic file attachment bodies or leave them as link-only stubs."
+            ),
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--discord-skip-file-content-message"],
+            multiple=True,
+            help=(
+                "Skip file attachment body resolution for the given Discord message ID or message URL. "
+                "Repeatable."
+            ),
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--discord-max-file-content-size"],
+            default=None,
+            help=(
+                "Skip inlining generic file attachments larger than this size. "
+                "Accepts bytes or human-size strings like 50K or 50kb."
+            ),
+        ),
+    )
+
+
+def collect_cli_overrides(
+    command_name: str,
+    params: dict[str, Any],
+) -> dict[str, Any] | None:
+    if command_name not in {"cat", "hydrate"}:
+        return None
+
+    media: dict[str, Any] = {}
+
+    file_content = params.get("discord_file_content")
+    if file_content is not None:
+        media["file-content"] = bool(file_content)
+
+    skip_messages = [
+        value.strip()
+        for value in params.get("discord_skip_file_content_message") or ()
+        if isinstance(value, str) and value.strip()
+    ]
+    if skip_messages:
+        media["skip-file-content-messages"] = skip_messages
+
+    max_file_content_size = params.get("discord_max_file_content_size")
+    if isinstance(max_file_content_size, str) and max_file_content_size.strip():
+        media["max-file-content-size"] = max_file_content_size.strip()
+
+    return {"media": media} if media else None
+
+
 def _render_documents(
     documents: list[Any],
     source_url: str,
@@ -89,7 +163,9 @@ def _render_documents(
         if document.kind == "thread":
             day_documents = [document]
         else:
-            day_documents = split_discord_document_by_utc_day(document, settings=settings)
+            day_documents = split_discord_document_by_utc_day(
+                document, settings=settings
+            )
         for day_document in day_documents:
             rendered_document = with_discord_document_rendered(
                 day_document,
@@ -106,7 +182,11 @@ def _render_documents(
             ext = ".yaml" if settings.format == "yaml" else ".md"
             effective_channel_id = (
                 channel_id
-                or (rendered_document.channel_id if rendered_document.kind != "thread" else None)
+                or (
+                    rendered_document.channel_id
+                    if rendered_document.kind != "thread"
+                    else None
+                )
                 or rendered_document.channel_id
             )
             out.append(
@@ -150,7 +230,9 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
         DiscordResolutionError,
         build_discord_settings,
         discord_settings_cache_key,
+        parse_discord_url,
         is_discord_guild_url,
+        resolve_discord_attachment_target,
         resolve_discord_url,
     )
 
@@ -159,6 +241,18 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
 
     settings = build_discord_settings(_discord_overrides(context))
     settings_key = discord_settings_cache_key(settings)
+    parsed = parse_discord_url(target)
+    if isinstance(parsed, dict) and parsed.get("kind") == "attachment":
+        return resolve_discord_attachment_target(
+            target,
+            parsed,
+            settings=settings,
+            settings_key=settings_key,
+            use_cache=bool(context.get("use_cache", True)),
+            cache_ttl=context.get("cache_ttl"),
+            refresh_cache=bool(context.get("refresh_cache", False)),
+            plugin_overrides=context.get("overrides"),
+        )
     try:
         documents = resolve_discord_url(
             target,
@@ -195,7 +289,7 @@ def _build_guild_manifest(
         key = ch.category_name
         by_category.setdefault(key, []).append(ch)
 
-    lines = ["---", f"guild_id: \"{guild_id}\"", "kind: manifest", "---", ""]
+    lines = ["---", f'guild_id: "{guild_id}"', "kind: manifest", "---", ""]
 
     for cat_name in sorted(by_category, key=lambda k: (k is None, k or "")):
         heading = cat_name or "(uncategorized)"
@@ -250,7 +344,9 @@ def _resolve_guild(target: str, context: dict[str, Any]) -> list[dict[str, Any]]
             if isinstance(raw_limit, int) and raw_limit > 0:
                 channel_batch_limit = raw_limit
 
-    channels = all_channels[:channel_batch_limit] if channel_batch_limit else all_channels
+    channels = (
+        all_channels[:channel_batch_limit] if channel_batch_limit else all_channels
+    )
 
     settings = build_discord_settings(_discord_overrides(context))
     settings_key = discord_settings_cache_key(settings)
@@ -285,28 +381,32 @@ def _resolve_guild(target: str, context: dict[str, Any]) -> list[dict[str, Any]]
                 continue
             raise
 
-        out.extend(_render_documents(
-            documents,
-            channel_info.url,
-            settings,
-            settings_key,
-            channel_id=channel_info.channel_id,
-            channel_name=channel_info.name,
-            category_id=channel_info.category_id,
-            category_name=channel_info.category_name,
-        ))
+        out.extend(
+            _render_documents(
+                documents,
+                channel_info.url,
+                settings,
+                settings_key,
+                channel_id=channel_info.channel_id,
+                channel_name=channel_info.name,
+                category_id=channel_info.category_id,
+                category_name=channel_info.category_name,
+            )
+        )
 
     manifest_body = _build_guild_manifest(guild_id, all_channels, skipped)
-    out.append({
-        "source": target,
-        "label": "manifest",
-        "content": manifest_body,
-        "metadata": {
-            "provider": PLUGIN_NAME,
-            "kind": "manifest",
-            "guild_id": guild_id,
-            "channel_count": len(all_channels),
-        },
-    })
+    out.append(
+        {
+            "source": target,
+            "label": "manifest",
+            "content": manifest_body,
+            "metadata": {
+                "provider": PLUGIN_NAME,
+                "kind": "manifest",
+                "guild_id": guild_id,
+                "channel_count": len(all_channels),
+            },
+        }
+    )
 
     return out
