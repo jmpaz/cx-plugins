@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, quote, urlparse
 
 from contextualize.references.helpers import (
     parse_compound_duration,
@@ -55,6 +56,7 @@ _MEDIA_AUDIO_SUFFIXES = frozenset(
 )
 _MARKDOWN_ESCAPED_PUNCT_RE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!|])")
 _PNG_CHUNK_MARKER_RE = re.compile(r"\bIHDR\b.*\bIDAT\b.*\bIEND\b", flags=re.S)
+_FILE_SIZE_LIMIT_RE = re.compile(r"^(?P<value>\d+)\s*(?P<unit>[kmg]?b?)?$", re.I)
 _MEDIA_DOWNLOAD_HEADERS = {
     "User-Agent": "contextualize/discord",
     "Accept": "image/*,video/*,audio/*,application/pdf,application/octet-stream",
@@ -119,7 +121,11 @@ def is_discord_guild_url(url: str) -> bool:
 
 
 def is_discord_url(url: str) -> bool:
-    return is_discord_message_url(url) or is_discord_channel_or_thread_url(url) or is_discord_guild_url(url)
+    return (
+        is_discord_message_url(url)
+        or is_discord_channel_or_thread_url(url)
+        or is_discord_guild_url(url)
+    )
 
 
 def is_discord_message_url(url: str) -> bool:
@@ -141,6 +147,36 @@ def parse_discord_url(url: str) -> dict[str, str] | None:
         }
     msg_match = _DISCORD_MESSAGE_RE.match(url)
     if msg_match:
+        parsed_url = urlparse(url)
+        query = parse_qs(parsed_url.query)
+        attachment_id = next(
+            (
+                value
+                for value in query.get("attachment-id", ())
+                if isinstance(value, str) and value.strip()
+            ),
+            None,
+        )
+        attachment_name = next(
+            (
+                value
+                for value in query.get("attachment", ())
+                if isinstance(value, str) and value.strip()
+            ),
+            None,
+        )
+        if attachment_id or attachment_name:
+            return {
+                "kind": "attachment",
+                "guild_id": msg_match.group("guild_id"),
+                "channel_id": msg_match.group("channel_id"),
+                "message_id": msg_match.group("message_id"),
+                **(
+                    {"attachment_id": attachment_id.strip()}
+                    if attachment_id
+                    else {"attachment_name": attachment_name.strip()}
+                ),
+            }
         return {
             "kind": "message",
             "guild_id": msg_match.group("guild_id"),
@@ -222,8 +258,7 @@ def discover_guild_channels(
         category_slugs[cat["id"]] = slug
 
     text_channels = [
-        ch for ch in raw_channels
-        if ch.get("type") in _GUILD_TEXT_CHANNEL_TYPES
+        ch for ch in raw_channels if ch.get("type") in _GUILD_TEXT_CHANNEL_TYPES
     ]
     text_channels.sort(key=lambda c: (c.get("position", 0),))
 
@@ -244,17 +279,19 @@ def discover_guild_channels(
 
         parent_id = ch.get("parent_id")
         cat = categories.get(parent_id) if parent_id else None
-        result.append(GuildChannelInfo(
-            channel_id=ch["id"],
-            name=ch["name"],
-            slug=final_slug,
-            channel_type=ch["type"],
-            category_id=parent_id,
-            category_name=cat["name"] if cat else None,
-            category_slug=category_slugs.get(parent_id) if parent_id else None,
-            position=ch.get("position", 0),
-            url=f"https://discord.com/channels/{guild_id}/{ch['id']}",
-        ))
+        result.append(
+            GuildChannelInfo(
+                channel_id=ch["id"],
+                name=ch["name"],
+                slug=final_slug,
+                channel_type=ch["type"],
+                category_id=parent_id,
+                category_name=cat["name"] if cat else None,
+                category_slug=category_slugs.get(parent_id) if parent_id else None,
+                position=ch.get("position", 0),
+                url=f"https://discord.com/channels/{guild_id}/{ch['id']}",
+            )
+        )
 
     return result
 
@@ -305,6 +342,115 @@ def _parse_type_set(value: str) -> frozenset[str] | None:
         return None
     parts = {p.strip().lower() for p in value.split(",") if p.strip()}
     return frozenset(parts) if parts else None
+
+
+def _parse_file_size_limit(raw: Any) -> int | None:
+    if raw in (None, "") or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw > 0 else None
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    if cleaned.isdigit():
+        value = int(cleaned)
+        return value if value > 0 else None
+    match = _FILE_SIZE_LIMIT_RE.fullmatch(cleaned)
+    if match is None:
+        return None
+    value = int(match.group("value"))
+    if value <= 0:
+        return None
+    unit = (match.group("unit") or "").lower()
+    factor = {
+        "": 1,
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024**2,
+        "mb": 1024**2,
+        "g": 1024**3,
+        "gb": 1024**3,
+    }.get(unit)
+    if factor is None:
+        return None
+    return value * factor
+
+
+def _format_file_size_human(value: int | None) -> str | None:
+    if not isinstance(value, int) or value < 0:
+        return None
+    if value < 1024:
+        return f"{value}B"
+
+    for suffix, factor in (("G", 1024**3), ("M", 1024**2), ("K", 1024)):
+        if value < factor:
+            continue
+        amount = value / factor
+        if amount >= 10:
+            return f"{round(amount):.0f}{suffix}"
+        if amount.is_integer():
+            return f"{amount:.0f}{suffix}"
+        return f"{amount:.1f}{suffix}"
+    return f"{value}B"
+
+
+def _normalize_message_id_set(raw: Any) -> frozenset[str] | None:
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, str):
+        candidates = [item.strip() for item in raw.split(",") if item.strip()]
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        candidates = []
+        for item in raw:
+            if isinstance(item, bool):
+                continue
+            if isinstance(item, int):
+                candidates.append(str(item))
+                continue
+            if isinstance(item, str) and item.strip():
+                candidates.append(item.strip())
+                continue
+            return None
+    else:
+        return None
+
+    normalized = {_normalize_message_id(item) for item in candidates}
+    cleaned = {item for item in normalized if item}
+    if len(cleaned) != len(candidates):
+        return None
+    return frozenset(cleaned) if cleaned else None
+
+
+def _build_message_url(guild_id: str, channel_id: str, message_id: str) -> str:
+    return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+
+
+def _build_attachment_ref(
+    guild_id: str,
+    channel_id: str,
+    message_id: str,
+    *,
+    attachment_id: str | None,
+    filename: str | None,
+) -> str:
+    base = _build_message_url(guild_id, channel_id, message_id)
+    if attachment_id:
+        return f"{base}?attachment-id={quote(attachment_id, safe='')}"
+    if filename:
+        return f"{base}?attachment={quote(filename, safe='')}"
+    return base
+
+
+def _attachment_size_bytes(attachment: dict[str, Any]) -> int | None:
+    raw = attachment.get("size")
+    if isinstance(raw, int) and raw >= 0:
+        return raw
+    if isinstance(raw, str) and raw.isdigit():
+        return int(raw)
+    return None
 
 
 def _truncate_to_tokens(text: str, max_tokens: int) -> str:
@@ -576,6 +722,8 @@ class DiscordSettings:
     attachment_max_tokens: int | None = None
     attachment_types_allow: frozenset[str] | None = None
     attachment_types_deny: frozenset[str] | None = None
+    skip_file_content_messages: frozenset[str] | None = None
+    max_file_content_size_bytes: int | None = None
     hard_min_timestamp: datetime | None = None
     hard_max_timestamp: datetime | None = None
 
@@ -878,6 +1026,12 @@ def _discord_settings_from_env() -> DiscordSettings:
     attachment_types_deny = _parse_type_set(
         os.environ.get("DISCORD_ATTACHMENT_TYPES_DENY", "")
     )
+    skip_file_content_messages = _normalize_message_id_set(
+        os.environ.get("DISCORD_SKIP_FILE_CONTENT_MESSAGES", "")
+    )
+    max_file_content_size_bytes = _parse_file_size_limit(
+        os.environ.get("DISCORD_MAX_FILE_CONTENT_SIZE", "")
+    )
 
     around_messages = _parse_optional_int(os.environ.get("DISCORD_AROUND_MESSAGES", ""))
     before_messages = _parse_optional_int(os.environ.get("DISCORD_BEFORE_MESSAGES", ""))
@@ -951,6 +1105,8 @@ def _discord_settings_from_env() -> DiscordSettings:
         attachment_max_tokens=attachment_max_tokens,
         attachment_types_allow=attachment_types_allow,
         attachment_types_deny=attachment_types_deny,
+        skip_file_content_messages=skip_file_content_messages,
+        max_file_content_size_bytes=max_file_content_size_bytes,
         hard_min_timestamp=_normalize_datetime(hard_min_timestamp),
         hard_max_timestamp=_normalize_datetime(hard_max_timestamp),
     )
@@ -1006,6 +1162,8 @@ def _clamp_settings(settings: DiscordSettings) -> DiscordSettings:
         attachment_max_tokens=settings.attachment_max_tokens,
         attachment_types_allow=settings.attachment_types_allow,
         attachment_types_deny=settings.attachment_types_deny,
+        skip_file_content_messages=settings.skip_file_content_messages,
+        max_file_content_size_bytes=settings.max_file_content_size_bytes,
         hard_min_timestamp=hard_min,
         hard_max_timestamp=hard_max,
     )
@@ -1072,6 +1230,17 @@ def build_discord_settings(overrides: dict[str, Any] | None = None) -> DiscordSe
         )
     else:
         attachment_types_deny = env.attachment_types_deny
+    skip_file_content_messages = _normalize_message_id_set(
+        overrides.get("skip_file_content_messages", env.skip_file_content_messages)
+    )
+    if skip_file_content_messages is None:
+        skip_file_content_messages = env.skip_file_content_messages
+
+    max_file_content_size_bytes = _parse_file_size_limit(
+        overrides.get("max_file_content_size_bytes", env.max_file_content_size_bytes)
+    )
+    if max_file_content_size_bytes is None:
+        max_file_content_size_bytes = env.max_file_content_size_bytes
 
     before_messages = overrides.get("before_messages", env.before_messages)
     after_messages = overrides.get("after_messages", env.after_messages)
@@ -1139,6 +1308,8 @@ def build_discord_settings(overrides: dict[str, Any] | None = None) -> DiscordSe
         attachment_max_tokens=attachment_max_tokens,
         attachment_types_allow=attachment_types_allow,
         attachment_types_deny=attachment_types_deny,
+        skip_file_content_messages=skip_file_content_messages,
+        max_file_content_size_bytes=max_file_content_size_bytes,
         hard_min_timestamp=env.hard_min_timestamp,
         hard_max_timestamp=env.hard_max_timestamp,
     )
@@ -1916,6 +2087,8 @@ def _describe_remote_media(
 def _normalize_attachment_nodes(
     message: dict[str, Any],
     *,
+    guild_id: str,
+    channel_id: str,
     include_media_descriptions: bool,
     include_embed_media_descriptions: bool,
     include_file_content: bool,
@@ -1923,6 +2096,8 @@ def _normalize_attachment_nodes(
     attachment_max_tokens: int | None = None,
     attachment_types_allow: frozenset[str] | None = None,
     attachment_types_deny: frozenset[str] | None = None,
+    skip_file_content_messages: frozenset[str] | None = None,
+    max_file_content_size_bytes: int | None = None,
 ) -> list[dict[str, Any]]:
     nodes: list[dict[str, Any]] = []
     message_id_raw = message.get("id")
@@ -1948,21 +2123,37 @@ def _normalize_attachment_nodes(
             kind, content_type, filename, attachment_types_deny
         ):
             continue
+        attachment_id_raw = attachment.get("id")
+        attachment_id = (
+            str(attachment_id_raw) if attachment_id_raw is not None else None
+        )
+        attachment_bytes = _attachment_size_bytes(attachment)
+        attachment_size = _format_file_size_human(attachment_bytes)
+        attachment_ref = (
+            _build_attachment_ref(
+                guild_id,
+                channel_id,
+                message_id,
+                attachment_id=attachment_id,
+                filename=filename,
+            )
+            if message_id
+            else None
+        )
         node: dict[str, Any] = {
             "type": kind,
             "filename": filename,
             "url": attachment_url or None,
             "content_type": content_type or None,
-            "size": attachment.get("size"),
+            "attachment_id": attachment_id,
+            "bytes": attachment_bytes,
+            "size": attachment_size,
+            "ref": attachment_ref,
             "width": attachment.get("width"),
             "height": attachment.get("height"),
             "description": attachment.get("description"),
         }
         if include_media_descriptions and kind in {"image", "video", "audio", "file"}:
-            attachment_id_raw = attachment.get("id")
-            attachment_id = (
-                str(attachment_id_raw) if attachment_id_raw is not None else None
-            )
             attachment_label = f"msg:{message_id or 'unknown'}:attachment:{attachment_id or filename or kind}"
             attachment_suffix = _media_suffix(
                 filename=filename,
@@ -1977,7 +2168,20 @@ def _normalize_attachment_nodes(
                 filename=filename,
                 url=attachment_url,
             )
-            if kind == "file" and include_file_content:
+            skip_file_content = kind == "file" and (
+                not include_file_content
+                or (
+                    message_id is not None
+                    and skip_file_content_messages is not None
+                    and message_id in skip_file_content_messages
+                )
+                or (
+                    attachment_bytes is not None
+                    and max_file_content_size_bytes is not None
+                    and attachment_bytes > max_file_content_size_bytes
+                )
+            )
+            if kind == "file" and not skip_file_content:
                 text_content = _extract_utf8_remote_media(
                     attachment_url,
                     media_cache_identity=media_cache_identity,
@@ -1993,7 +2197,7 @@ def _normalize_attachment_nodes(
             has_text_content = isinstance(node.get("text_content"), str) and bool(
                 str(node.get("text_content")).strip()
             )
-            should_describe = not (kind == "file" and not include_file_content)
+            should_describe = not (kind == "file" and skip_file_content)
             if should_describe and not (kind == "file" and has_text_content):
                 media_desc = _describe_remote_media(
                     attachment_url,
@@ -2358,6 +2562,8 @@ def _normalize_message(
     attachment_max_tokens: int | None = None,
     attachment_types_allow: frozenset[str] | None = None,
     attachment_types_deny: frozenset[str] | None = None,
+    skip_file_content_messages: frozenset[str] | None = None,
+    max_file_content_size_bytes: int | None = None,
     message_lookup: dict[str, dict[str, Any]] | None = None,
     forward_source_lookup: dict[tuple[str, str], str] | None = None,
 ) -> dict[str, Any] | None:
@@ -2379,6 +2585,8 @@ def _normalize_message(
     message_with_media = _message_with_snapshot_media(message)
     attachments = _normalize_attachment_nodes(
         message_with_media,
+        guild_id=guild_id,
+        channel_id=channel_id,
         include_media_descriptions=include_media_descriptions,
         include_embed_media_descriptions=include_embed_media_descriptions,
         include_file_content=include_file_content,
@@ -2386,6 +2594,8 @@ def _normalize_message(
         attachment_max_tokens=attachment_max_tokens,
         attachment_types_allow=attachment_types_allow,
         attachment_types_deny=attachment_types_deny,
+        skip_file_content_messages=skip_file_content_messages,
+        max_file_content_size_bytes=max_file_content_size_bytes,
     )
 
     reply_to_id = _reply_to_id(message)
@@ -2759,6 +2969,15 @@ def _format_attachment_idiomatic(
             attrs.append(f'url="{_escape_xml_attr(url)}"')
     if filename:
         attrs.append(f'filename="{_escape_xml_attr(filename)}"')
+    ref = node.get("ref")
+    if isinstance(ref, str) and ref:
+        attrs.append(f'ref="{_escape_xml_attr(ref)}"')
+    size = node.get("size")
+    if isinstance(size, str) and size:
+        attrs.append(f'size="{_escape_xml_attr(size)}"')
+    raw_bytes = node.get("bytes")
+    if isinstance(raw_bytes, int) and raw_bytes >= 0:
+        attrs.append(f'bytes="{raw_bytes}"')
     if dimensions:
         attrs.append(f'dimensions="{dimensions}"')
 
@@ -2993,7 +3212,9 @@ def split_discord_document_by_utc_day(
     out: list[DiscordDocument] = []
     for day_key in sorted(grouped.keys()):
         day_messages = grouped[day_key]
-        trace_path = f"{document.trace_path}@{day_key}" if multi_day else document.trace_path
+        trace_path = (
+            f"{document.trace_path}@{day_key}" if multi_day else document.trace_path
+        )
         base = DiscordDocument(
             source_url=document.source_url,
             label=document.label,
@@ -3231,6 +3452,8 @@ def _resolve_message_url(
             attachment_max_tokens=settings.attachment_max_tokens,
             attachment_types_allow=settings.attachment_types_allow,
             attachment_types_deny=settings.attachment_types_deny,
+            skip_file_content_messages=settings.skip_file_content_messages,
+            max_file_content_size_bytes=settings.max_file_content_size_bytes,
             message_lookup=message_lookup,
             forward_source_lookup=forward_source_lookup,
         )
@@ -3361,7 +3584,9 @@ def _fetch_thread_starter(
             refresh_cache=refresh_cache,
         )
     except Exception:
-        _log(f"    Unable to fetch thread starter message {thread_id} from parent {parent_channel_id}")
+        _log(
+            f"    Unable to fetch thread starter message {thread_id} from parent {parent_channel_id}"
+        )
         return None
 
 
@@ -3455,6 +3680,8 @@ def _build_document(
             attachment_max_tokens=settings.attachment_max_tokens,
             attachment_types_allow=settings.attachment_types_allow,
             attachment_types_deny=settings.attachment_types_deny,
+            skip_file_content_messages=settings.skip_file_content_messages,
+            max_file_content_size_bytes=settings.max_file_content_size_bytes,
             message_lookup=message_lookup,
             forward_source_lookup=forward_source_lookup,
         )
@@ -3955,6 +4182,8 @@ def parse_discord_config_mapping(raw: Any, *, prefix: str) -> dict[str, Any] | N
             "describe",
             "embed-media-describe",
             "file-content",
+            "skip-file-content-messages",
+            "max-file-content-size",
             "mode",
         }
         unknown_media = sorted(
@@ -3984,6 +4213,26 @@ def parse_discord_config_mapping(raw: Any, *, prefix: str) -> dict[str, Any] | N
             if not isinstance(file_content, bool):
                 raise ValueError(f"{prefix}.media.file-content must be a boolean")
             result["include_file_content"] = file_content
+
+        if "skip-file-content-messages" in media:
+            skip_messages = _normalize_message_id_set(
+                media.get("skip-file-content-messages")
+            )
+            if skip_messages is None:
+                raise ValueError(
+                    f"{prefix}.media.skip-file-content-messages must be a string or list of Discord message IDs/URLs"
+                )
+            result["skip_file_content_messages"] = skip_messages
+
+        if "max-file-content-size" in media:
+            max_file_content_size = _parse_file_size_limit(
+                media.get("max-file-content-size")
+            )
+            if max_file_content_size is None:
+                raise ValueError(
+                    f"{prefix}.media.max-file-content-size must be a positive byte count or size string like 50K or 50kb"
+                )
+            result["max_file_content_size_bytes"] = max_file_content_size
 
         if "mode" in media:
             mode = media.get("mode")
@@ -4019,6 +4268,10 @@ def discord_overrides_cache_key(
             normalized.append((key, value.astimezone(timezone.utc).isoformat()))
         elif isinstance(value, timedelta):
             normalized.append((key, int(value.total_seconds())))
+        elif isinstance(value, (set, frozenset)):
+            normalized.append((key, tuple(sorted(value))))
+        elif isinstance(value, list):
+            normalized.append((key, tuple(value)))
         else:
             normalized.append((key, value))
     return tuple(normalized)
@@ -4053,6 +4306,10 @@ def discord_settings_cache_key(settings: DiscordSettings) -> tuple[Any, ...]:
         settings.include_embed_media_descriptions,
         settings.include_file_content,
         settings.media_mode,
+        tuple(sorted(settings.skip_file_content_messages))
+        if settings.skip_file_content_messages
+        else None,
+        settings.max_file_content_size_bytes,
         settings.hard_min_timestamp.isoformat()
         if settings.hard_min_timestamp
         else None,
@@ -4060,3 +4317,129 @@ def discord_settings_cache_key(settings: DiscordSettings) -> tuple[Any, ...]:
         if settings.hard_max_timestamp
         else None,
     )
+
+
+def _select_attachment_for_target(
+    message: dict[str, Any],
+    parsed: dict[str, str],
+) -> dict[str, Any]:
+    attachments = (
+        _message_with_snapshot_media(message).get("attachments")
+        if isinstance(_message_with_snapshot_media(message), dict)
+        else []
+    )
+    if not isinstance(attachments, list) or not attachments:
+        raise ValueError(f"Discord message {parsed['message_id']} has no attachments")
+
+    attachment_id = parsed.get("attachment_id")
+    if attachment_id:
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            if str(attachment.get("id") or "") == attachment_id:
+                return attachment
+        raise ValueError(
+            f"Discord message {parsed['message_id']} has no attachment with id {attachment_id}"
+        )
+
+    attachment_name = parsed.get("attachment_name")
+    if attachment_name:
+        matches = [
+            attachment
+            for attachment in attachments
+            if isinstance(attachment, dict)
+            and str(attachment.get("filename") or "") == attachment_name
+        ]
+        if not matches:
+            raise ValueError(
+                f"Discord message {parsed['message_id']} has no attachment named {attachment_name}"
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"Discord message {parsed['message_id']} has multiple attachments named {attachment_name}; use ?attachment-id=..."
+            )
+        return matches[0]
+
+    raise ValueError(f"Discord attachment target is missing a selector: {parsed}")
+
+
+def resolve_discord_attachment_target(
+    target: str,
+    parsed: dict[str, str],
+    *,
+    settings: DiscordSettings,
+    settings_key: tuple[Any, ...],
+    use_cache: bool,
+    cache_ttl: timedelta | None,
+    refresh_cache: bool,
+    plugin_overrides: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    from contextualize.references.url import URLReference
+
+    if parsed.get("kind") != "attachment":
+        raise ValueError(f"Not a Discord attachment target: {target}")
+
+    guild_id = parsed["guild_id"]
+    channel_id = parsed["channel_id"]
+    message_id = parsed["message_id"]
+    message = _fetch_message(
+        channel_id,
+        message_id,
+        use_cache=use_cache,
+        cache_ttl=cache_ttl,
+        refresh_cache=refresh_cache,
+    )
+    attachment = _select_attachment_for_target(message, parsed)
+    attachment_url = str(attachment.get("url") or "")
+    if not attachment_url:
+        raise ValueError(
+            f"Discord attachment target {target} did not include a downloadable URL"
+        )
+
+    filename = str(attachment.get("filename") or "") or "attachment"
+    attachment_id = str(attachment.get("id") or "") or None
+    source_url = _build_message_url(guild_id, channel_id, message_id)
+    reference = URLReference(
+        attachment_url,
+        format="raw",
+        label="name",
+        filename_override=filename,
+        use_cache=use_cache,
+        cache_ttl=cache_ttl,
+        refresh_cache=refresh_cache,
+        plugin_overrides=plugin_overrides,
+    )
+    label = f"discord:{guild_id}/{channel_id}/{message_id}/attachment/{filename}"
+    timestamp = _message_datetime(message)
+    timestamp_iso = (
+        timestamp.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        if timestamp
+        else None
+    )
+    suffix = Path(filename).suffix or ".txt"
+    attachment_key = attachment_id or filename
+
+    return [
+        {
+            "source": target,
+            "label": label,
+            "content": reference.read(),
+            "metadata": {
+                "trace_path": target,
+                "provider": "discord",
+                "source_ref": "discord.com",
+                "source_path": f"{guild_id}/{channel_id}/{message_id}/attachment/{attachment_key}",
+                "context_subpath": f"discord/{guild_id}/{channel_id}/{message_id}/attachment-{attachment_key}{suffix}",
+                "source_created": timestamp_iso,
+                "source_modified": timestamp_iso,
+                "kind": "attachment",
+                "scope_id": message_id,
+                "settings_key": settings_key,
+                "channelId": channel_id,
+                "attachmentId": attachment_id,
+                "attachmentName": filename,
+                "sourceMessageUrl": source_url,
+                "attachmentUrl": attachment_url,
+            },
+        }
+    ]
