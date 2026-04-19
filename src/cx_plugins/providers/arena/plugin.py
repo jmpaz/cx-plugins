@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 PLUGIN_API_VERSION = "1"
 PLUGIN_NAME = "arena"
 PLUGIN_PRIORITY = 100
+DEFAULT_RICH_MEDIA_CHANNEL_MAX_BLOCKS = 10
 
 
 def normalize_manifest_config(
@@ -163,6 +165,39 @@ def _settings_key(settings: Any) -> tuple[Any, ...]:
     )
 
 
+def _has_explicit_rich_media_overrides(overrides: dict[str, Any] | None) -> bool:
+    if not overrides:
+        return False
+    return bool(
+        overrides.get("include_link_image_descriptions") is True
+        or overrides.get("include_pdf_content") is True
+        or overrides.get("include_media_descriptions") is True
+    )
+
+
+def _has_time_window(settings: Any) -> bool:
+    return bool(
+        settings.connected_after
+        or settings.connected_before
+        or settings.created_after
+        or settings.created_before
+    )
+
+
+def _apply_channel_safety_defaults(
+    settings: Any, overrides: dict[str, Any] | None
+) -> Any:
+    if (
+        settings.max_blocks_per_channel is not None
+        or _has_time_window(settings)
+        or not _has_explicit_rich_media_overrides(overrides)
+    ):
+        return settings
+    return replace(
+        settings, max_blocks_per_channel=DEFAULT_RICH_MEDIA_CHANNEL_MAX_BLOCKS
+    )
+
+
 def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
     from .arena import (
         ArenaReference,
@@ -176,7 +211,8 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
         warmup_arena_network_stack,
     )
 
-    settings = build_arena_settings(_arena_overrides(context))
+    arena_overrides = _arena_overrides(context)
+    settings = build_arena_settings(arena_overrides)
     settings_key = _settings_key(settings)
     use_cache = bool(context.get("use_cache", True))
     cache_ttl = context.get("cache_ttl")
@@ -184,6 +220,8 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
 
     out: list[dict[str, Any]] = []
     if is_arena_channel_url(target):
+        settings = _apply_channel_safety_defaults(settings, arena_overrides)
+        settings_key = _settings_key(settings)
         slug = extract_channel_slug(target)
         if not slug:
             return out
