@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
-from functools import lru_cache
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from contextualize.references.helpers import parse_timestamp_or_duration
 from contextualize.render.text import process_text
@@ -343,6 +344,71 @@ def _get_max_blocks_per_channel() -> int | None:
     return value
 
 
+@dataclass(frozen=True)
+class ArenaRecurseBlockLimit:
+    kind: Literal["count", "ratio"]
+    value: int | float
+
+    def cache_key(self) -> str:
+        if self.kind == "count":
+            return f"count:{self.value}"
+        return f"ratio:{self.value:g}"
+
+
+def parse_arena_recurse_blocks(raw: Any) -> ArenaRecurseBlockLimit | None:
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, ArenaRecurseBlockLimit):
+        return raw
+    if isinstance(raw, bool):
+        raise ValueError("Are.na recurse blocks must be a positive integer or ratio")
+    if isinstance(raw, int):
+        if raw <= 0:
+            raise ValueError("Are.na recurse blocks must be greater than 0")
+        return ArenaRecurseBlockLimit("count", raw)
+    if isinstance(raw, float):
+        if raw <= 0:
+            raise ValueError("Are.na recurse blocks ratio must be greater than 0")
+        if raw > 1:
+            raise ValueError("Are.na recurse blocks ratio must be <= 1")
+        return ArenaRecurseBlockLimit("ratio", raw)
+    if not isinstance(raw, str):
+        raise ValueError("Are.na recurse blocks must be a positive integer or ratio")
+
+    value = raw.strip()
+    if not value:
+        return None
+    if value.endswith("%"):
+        percent_raw = value[:-1].strip()
+        try:
+            percent = float(percent_raw)
+        except ValueError as exc:
+            raise ValueError("Are.na recurse blocks percent must be numeric") from exc
+        if percent <= 0 or percent > 100:
+            raise ValueError("Are.na recurse blocks percent must be > 0 and <= 100")
+        return ArenaRecurseBlockLimit("ratio", percent / 100)
+    if re.fullmatch(r"\d+", value):
+        count = int(value)
+        if count <= 0:
+            raise ValueError("Are.na recurse blocks must be greater than 0")
+        return ArenaRecurseBlockLimit("count", count)
+
+    try:
+        ratio = float(value)
+    except ValueError as exc:
+        raise ValueError(
+            "Are.na recurse blocks must be a positive integer, ratio, or percent"
+        ) from exc
+    if ratio <= 0 or ratio > 1:
+        raise ValueError("Are.na recurse blocks ratio must be > 0 and <= 1")
+    return ArenaRecurseBlockLimit("ratio", ratio)
+
+
+def _get_recurse_blocks() -> ArenaRecurseBlockLimit | None:
+    raw = (os.environ.get("ARENA_RECURSE_BLOCKS") or "").strip()
+    return parse_arena_recurse_blocks(raw)
+
+
 def _parse_iso_datetime(value: str) -> datetime | None:
     return parse_timestamp_or_duration(value)
 
@@ -411,6 +477,7 @@ class ArenaSettings:
     max_depth: int = 1
     sort_order: str = "desc"
     max_blocks_per_channel: int | None = None
+    recurse_blocks: ArenaRecurseBlockLimit | None = None
     include_descriptions: bool = True
     include_comments: bool = True
     include_link_image_descriptions: bool = False
@@ -429,6 +496,7 @@ def _arena_settings_from_env() -> ArenaSettings:
         max_depth=_get_max_depth(),
         sort_order=_get_sort_order(),
         max_blocks_per_channel=_get_max_blocks_per_channel(),
+        recurse_blocks=_get_recurse_blocks(),
         include_descriptions=_get_include_descriptions(),
         include_comments=_get_include_comments(),
         include_link_image_descriptions=_get_include_link_image_descriptions(),
@@ -472,6 +540,9 @@ def build_arena_settings(overrides: dict | None = None) -> ArenaSettings:
             max_blocks_per_channel = env.max_blocks_per_channel
         if max_blocks_per_channel is not None and max_blocks_per_channel <= 0:
             max_blocks_per_channel = env.max_blocks_per_channel
+    recurse_blocks = parse_arena_recurse_blocks(
+        overrides.get("recurse_blocks", env.recurse_blocks)
+    )
     include_descriptions = overrides.get(
         "include_descriptions", env.include_descriptions
     )
@@ -501,6 +572,7 @@ def build_arena_settings(overrides: dict | None = None) -> ArenaSettings:
         max_depth=max_depth,
         sort_order=sort_order,
         max_blocks_per_channel=max_blocks_per_channel,
+        recurse_blocks=recurse_blocks,
         include_descriptions=include_descriptions,
         include_comments=include_comments,
         include_link_image_descriptions=include_link_image_descriptions,
@@ -565,16 +637,54 @@ def _can_short_circuit_channel_paging(
     )
 
 
+def _channel_content_count(metadata: dict, fallback: int | None = None) -> int | None:
+    counts = metadata.get("counts")
+    if not isinstance(counts, dict):
+        return fallback
+    value = counts.get("contents")
+    if isinstance(value, bool):
+        return fallback
+    if isinstance(value, int) and value >= 0:
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return fallback
+
+
+def _resolve_recurse_block_count(
+    recurse_blocks: ArenaRecurseBlockLimit | None,
+    root_content_count: int | None,
+) -> int | None:
+    if recurse_blocks is None:
+        return None
+    if recurse_blocks.kind == "count":
+        return int(recurse_blocks.value)
+    if root_content_count is None:
+        raise ValueError(
+            "Are.na recurse blocks ratio requires a root channel content count"
+        )
+    return max(1, math.ceil(root_content_count * float(recurse_blocks.value)))
+
+
+def _stricter_limit(*limits: int | None) -> int | None:
+    values = [value for value in limits if value is not None]
+    if not values:
+        return None
+    return min(values)
+
+
 def _fetch_all_channel_contents(
     slug: str,
     *,
     max_depth: int | None = None,
     sort_order: str | None = None,
     max_blocks_per_channel: int | None = None,
+    recurse_blocks: ArenaRecurseBlockLimit | None = None,
     _time_window_settings: ArenaSettings | None = None,
     _depth: int = 0,
     _visited: set[int] | None = None,
     _root_owner_id: int | None = None,
+    _root_content_count: int | None = None,
     _recurse_users: set[str] | None = ...,
 ) -> tuple[dict, list[dict]]:
     if max_depth is None:
@@ -596,6 +706,15 @@ def _fetch_all_channel_contents(
 
     if _root_owner_id is None:
         _root_owner_id = _owner_id(metadata)
+    if _depth == 0 and _root_content_count is None:
+        _root_content_count = _channel_content_count(metadata)
+
+    recurse_block_count = None
+    if _depth > 0:
+        recurse_block_count = _resolve_recurse_block_count(
+            recurse_blocks, _root_content_count
+        )
+    effective_max_blocks = _stricter_limit(max_blocks_per_channel, recurse_block_count)
 
     indent = "  " * (_depth + 1)
     total_count = (metadata.get("counts") or {}).get("contents") or "?"
@@ -610,7 +729,7 @@ def _fetch_all_channel_contents(
     has_time_window = _has_time_window(_time_window_settings)
     can_short_circuit = _can_short_circuit_channel_paging(
         sort_order=sort_order,
-        max_blocks_per_channel=max_blocks_per_channel,
+        max_blocks_per_channel=effective_max_blocks,
         has_time_window=has_time_window,
     )
 
@@ -618,15 +737,15 @@ def _fetch_all_channel_contents(
         all_contents.extend(first_page_contents)
         for page in range(2, total_pages + 1):
             if (
-                max_blocks_per_channel is not None
-                and len(all_contents) >= max_blocks_per_channel
+                effective_max_blocks is not None
+                and len(all_contents) >= effective_max_blocks
             ):
                 break
             _log(f"{indent}  page {page}/{total_pages}")
             page_data = _fetch_channel_page(slug, page)
             all_contents.extend(_channel_page_contents(page_data))
     elif can_short_circuit:
-        needed = max_blocks_per_channel or 0
+        needed = effective_max_blocks or 0
         newest_first: list[dict] = []
         for page in range(total_pages, 0, -1):
             if len(newest_first) >= needed:
@@ -651,6 +770,9 @@ def _fetch_all_channel_contents(
 
     all_contents = _sort_channel_contents(all_contents, sort_order)
 
+    if _depth == 0 and _root_content_count is None:
+        _root_content_count = len(all_contents)
+
     if has_time_window:
         all_contents = [
             item
@@ -662,8 +784,22 @@ def _fetch_all_channel_contents(
             )
         ]
 
-    if max_blocks_per_channel is not None:
-        all_contents = all_contents[:max_blocks_per_channel]
+    if has_time_window:
+        count_before_limit = len(all_contents)
+    else:
+        count_before_limit = _channel_content_count(
+            metadata, fallback=len(all_contents)
+        )
+    if effective_max_blocks is not None:
+        all_contents = all_contents[:effective_max_blocks]
+
+    if (
+        _depth > 0
+        and recurse_blocks is not None
+        and effective_max_blocks is not None
+        and count_before_limit > effective_max_blocks
+    ):
+        metadata["_contextualize_sampled_by_recurse_blocks"] = True
 
     if _depth < max_depth:
         expanded: list[dict] = []
@@ -683,14 +819,19 @@ def _fetch_all_channel_contents(
                         max_depth=max_depth,
                         sort_order=sort_order,
                         max_blocks_per_channel=max_blocks_per_channel,
+                        recurse_blocks=recurse_blocks,
                         _time_window_settings=_time_window_settings,
                         _depth=_depth + 1,
                         _visited=_visited,
                         _root_owner_id=_root_owner_id,
+                        _root_content_count=_root_content_count,
                         _recurse_users=_recurse_users,
                     )
                     item["_nested_metadata"] = nested_meta
                     item["_nested_contents"] = nested_contents
+                    item["_nested_sampled_by_recurse_blocks"] = bool(
+                        nested_meta.get("_contextualize_sampled_by_recurse_blocks")
+                    )
             expanded.append(item)
         all_contents = expanded
 
@@ -1428,6 +1569,14 @@ def _flatten_channel_blocks(
                 nested_slug_path = current_slug_path + (
                     (nested_slug,) if nested_slug else ()
                 )
+                if item.get("_nested_sampled_by_recurse_blocks"):
+                    block = dict(item)
+                    block.pop("_nested_metadata", None)
+                    block.pop("_nested_contents", None)
+                    block["_contextualize_keep_duplicate"] = True
+                    if current_slug_path:
+                        block["_channel_slug_path"] = list(current_slug_path)
+                    result.append((path, block))
                 result.extend(
                     _flatten_channel_blocks(
                         nested_contents,
@@ -1465,6 +1614,9 @@ def _dedupe_flat_blocks(flat: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
     seen: set[str] = set()
     for path, block in flat:
         identity = _block_identity(block)
+        if block.get("_contextualize_keep_duplicate"):
+            deduped.append((path, block))
+            continue
         if identity is not None:
             if identity in seen:
                 continue
@@ -1556,7 +1708,18 @@ def _limit_flat_blocks(
     max_blocks = settings.max_blocks_per_channel
     if max_blocks is None:
         return flat
-    return flat[:max_blocks]
+    limited: list[tuple[str, dict]] = []
+    counted = 0
+    for item in flat:
+        _path, block = item
+        if block.get("_contextualize_keep_duplicate"):
+            limited.append(item)
+            continue
+        if counted >= max_blocks:
+            continue
+        limited.append(item)
+        counted += 1
+    return limited
 
 
 def resolve_channel(
@@ -1573,10 +1736,12 @@ def resolve_channel(
     recurse_users = settings.recurse_users
     sort_order = settings.sort_order
     max_blocks_per_channel = settings.max_blocks_per_channel
+    recurse_blocks = settings.recurse_blocks
     ru_key = ",".join(sorted(recurse_users)) if recurse_users else "all"
     mb_key = (
         str(max_blocks_per_channel) if max_blocks_per_channel is not None else "all"
     )
+    rb_key = recurse_blocks.cache_key() if recurse_blocks is not None else "none"
     ca_key = (
         settings.connected_after.isoformat() if settings.connected_after else "none"
     )
@@ -1586,7 +1751,7 @@ def resolve_channel(
     cra_key = settings.created_after.isoformat() if settings.created_after else "none"
     crb_key = settings.created_before.isoformat() if settings.created_before else "none"
     cache_key = (
-        f"v2:{slug}:d={max_depth}:u={ru_key}:s={sort_order}:m={mb_key}:"
+        f"v3:{slug}:d={max_depth}:u={ru_key}:s={sort_order}:m={mb_key}:rb={rb_key}:"
         f"ca={ca_key}:cb={cb_key}:cra={cra_key}:crb={crb_key}"
     )
 
@@ -1610,6 +1775,7 @@ def resolve_channel(
         max_depth=max_depth,
         sort_order=sort_order,
         max_blocks_per_channel=max_blocks_per_channel,
+        recurse_blocks=recurse_blocks,
         _time_window_settings=settings,
         _recurse_users=recurse_users,
     )

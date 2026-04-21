@@ -36,6 +36,7 @@ def _arena_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
         "max_depth",
         "sort_order",
         "max_blocks_per_channel",
+        "recurse_blocks",
         "connected_after",
         "connected_before",
         "created_after",
@@ -75,6 +76,8 @@ def _arena_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
 
     if "max-blocks-per-channel" in raw:
         result["max_blocks_per_channel"] = raw.get("max-blocks-per-channel")
+    if "recurse-blocks" in raw:
+        result["recurse_blocks"] = raw.get("recurse-blocks")
 
     for config_key, result_key in (
         ("connected-after", "connected_after"),
@@ -170,6 +173,17 @@ def register_cli_options(command_name: str, command: click.Command) -> None:
             type=int,
             default=None,
             help="Limit blocks fetched from each Are.na channel before nested recursion.",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-recurse-blocks"],
+            default=None,
+            help=(
+                "Limit blocks fetched from recursed Are.na channels. "
+                "Accepts a positive integer, decimal ratio like 0.05, or percent like 5%."
+            ),
         ),
     )
     _append_option(
@@ -305,6 +319,9 @@ def collect_cli_overrides(
         params.get("arena_max_blocks_per_channel"),
         positive_int=True,
     )
+    recurse_blocks = params.get("arena_recurse_blocks")
+    if isinstance(recurse_blocks, str) and recurse_blocks.strip():
+        raw_mapping["recurse-blocks"] = recurse_blocks.strip()
 
     block_sort = params.get("arena_block_sort")
     if isinstance(block_sort, str) and block_sort.strip():
@@ -376,6 +393,11 @@ def _settings_key(settings: Any) -> tuple[Any, ...]:
         settings.max_depth,
         settings.sort_order,
         settings.max_blocks_per_channel,
+        (
+            settings.recurse_blocks.cache_key()
+            if settings.recurse_blocks is not None
+            else None
+        ),
         settings.include_descriptions,
         settings.include_comments,
         settings.include_link_image_descriptions,
@@ -409,6 +431,7 @@ def _apply_channel_safety_defaults(
 ) -> Any:
     if (
         settings.max_blocks_per_channel is not None
+        or settings.recurse_blocks is not None
         or _has_time_window(settings)
         or not _has_explicit_rich_media_overrides(overrides)
     ):
