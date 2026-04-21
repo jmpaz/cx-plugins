@@ -3,10 +3,21 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
+import click
+
 PLUGIN_API_VERSION = "1"
 PLUGIN_NAME = "arena"
 PLUGIN_PRIORITY = 100
 DEFAULT_RICH_MEDIA_CHANNEL_MAX_BLOCKS = 10
+_ARENA_SORT_CHOICES = (
+    "asc",
+    "desc",
+    "date-asc",
+    "date-desc",
+    "random",
+    "position-asc",
+    "position-desc",
+)
 
 
 def normalize_manifest_config(
@@ -117,6 +128,215 @@ def _arena_overrides(context: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         raise ValueError("arena overrides must be a mapping")
     return _arena_runtime_overrides(value)
+
+
+def _option_already_registered(command: click.Command, *, name: str) -> bool:
+    return any(getattr(param, "name", None) == name for param in command.params)
+
+
+def _append_option(command: click.Command, option: click.Option) -> None:
+    if _option_already_registered(command, name=option.name):
+        return
+    command.params.append(option)
+
+
+def register_cli_options(command_name: str, command: click.Command) -> None:
+    if command_name not in {"cat", "hydrate"}:
+        return
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-recurse-depth"],
+            type=int,
+            default=None,
+            help="Maximum nested Are.na channel recursion depth. 0 disables recursion.",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-recurse-user", "--arena-recurse-users"],
+            multiple=True,
+            help=(
+                "Only recurse into nested channels owned by this Are.na slug. "
+                "Repeatable or comma-separated; use 'all' by itself to recurse into every owner's channels."
+            ),
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-max-blocks-per-channel"],
+            type=int,
+            default=None,
+            help="Limit blocks fetched from each Are.na channel before nested recursion.",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-block-sort"],
+            type=click.Choice(_ARENA_SORT_CHOICES, case_sensitive=False),
+            default=None,
+            help="Order Are.na channel blocks before limiting and recursion.",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-connected-after"],
+            default=None,
+            help="Keep channel blocks connected at or after this timestamp or duration.",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-connected-before"],
+            default=None,
+            help="Keep channel blocks connected at or before this timestamp or duration.",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-created-after"],
+            default=None,
+            help="Keep channel blocks created at or after this timestamp or duration.",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-created-before"],
+            default=None,
+            help="Keep channel blocks created at or before this timestamp or duration.",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-block-descriptions/--no-arena-block-descriptions"],
+            default=None,
+            help="Include or omit Are.na block descriptions.",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-block-comments/--no-arena-block-comments"],
+            default=None,
+            help="Include or omit Are.na block comments.",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-link-image-descriptions/--no-arena-link-image-descriptions"],
+            default=None,
+            help="Describe images attached to Are.na link blocks.",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-pdf-content/--no-arena-pdf-content"],
+            default=None,
+            help="Extract or skip PDF attachment content in Are.na blocks.",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-media-descriptions/--no-arena-media-descriptions"],
+            default=None,
+            help="Describe or skip Are.na image, video, and audio block media.",
+        ),
+    )
+
+
+def _collect_recurse_users(values: tuple[str, ...]) -> str | list[str] | None:
+    users = [
+        user.strip().lower()
+        for value in values
+        for user in value.split(",")
+        if user.strip()
+    ]
+    if not users:
+        return None
+    if "all" in users:
+        if len(users) > 1:
+            raise ValueError("--arena-recurse-user all cannot be combined with slugs")
+        return "all"
+    return users
+
+
+def _add_optional_value(
+    mapping: dict[str, Any], key: str, value: Any, *, positive_int: bool = False
+) -> None:
+    if value is None:
+        return
+    if positive_int and int(value) <= 0:
+        raise ValueError(f"--arena-{key} must be greater than 0")
+    mapping[key] = value
+
+
+def collect_cli_overrides(
+    command_name: str,
+    params: dict[str, Any],
+) -> dict[str, Any] | None:
+    if command_name not in {"cat", "hydrate"}:
+        return None
+
+    raw_mapping: dict[str, Any] = {}
+    recurse_depth = params.get("arena_recurse_depth")
+    if recurse_depth is not None:
+        if int(recurse_depth) < 0:
+            raise ValueError("--arena-recurse-depth must be zero or greater")
+        raw_mapping["recurse-depth"] = int(recurse_depth)
+
+    recurse_users = _collect_recurse_users(params.get("arena_recurse_user") or ())
+    if recurse_users is not None:
+        raw_mapping["recurse-users"] = recurse_users
+
+    _add_optional_value(
+        raw_mapping,
+        "max-blocks-per-channel",
+        params.get("arena_max_blocks_per_channel"),
+        positive_int=True,
+    )
+
+    block_sort = params.get("arena_block_sort")
+    if isinstance(block_sort, str) and block_sort.strip():
+        raw_mapping["block-sort"] = block_sort.strip().lower()
+
+    for param_key, config_key in (
+        ("arena_connected_after", "connected-after"),
+        ("arena_connected_before", "connected-before"),
+        ("arena_created_after", "created-after"),
+        ("arena_created_before", "created-before"),
+    ):
+        value = params.get(param_key)
+        if isinstance(value, str) and value.strip():
+            raw_mapping[config_key] = value.strip()
+
+    block: dict[str, Any] = {}
+    for param_key, config_key in (
+        ("arena_block_descriptions", "description"),
+        ("arena_block_comments", "comments"),
+        ("arena_link_image_descriptions", "link-image-desc"),
+        ("arena_pdf_content", "pdf-content"),
+        ("arena_media_descriptions", "media-desc"),
+    ):
+        value = params.get(param_key)
+        if value is not None:
+            block[config_key] = bool(value)
+    if block:
+        raw_mapping["block"] = block
+
+    if not raw_mapping:
+        return None
+    return normalize_manifest_config(raw_mapping)
 
 
 def can_resolve(target: str, context: dict[str, Any]) -> bool:
