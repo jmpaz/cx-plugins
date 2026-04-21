@@ -250,15 +250,11 @@ def _transcribe_audio_in_chunks(
         )
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
-            raise TranscriptionProviderError(
-                f"ffmpeg audio chunking failed: {detail}"
-            )
+            raise TranscriptionProviderError(f"ffmpeg audio chunking failed: {detail}")
 
         chunk_paths = sorted(Path(tmpdir).glob("chunk_*.wav"))
         if not chunk_paths:
-            raise TranscriptionProviderError(
-                "ffmpeg audio chunking produced no chunks"
-            )
+            raise TranscriptionProviderError("ffmpeg audio chunking produced no chunks")
 
         parts: list[str] = []
         for chunk_path in chunk_paths:

@@ -67,9 +67,7 @@ def parse_skill_target(target: str) -> SkillTarget | None:
     return None
 
 
-def find_named_skill(
-    name: str, extra_paths: list[Path] | None = None
-) -> Path | None:
+def find_named_skill(name: str, extra_paths: list[Path] | None = None) -> Path | None:
     search = list(DEFAULT_SEARCH_PATHS)
     if extra_paths:
         search = list(extra_paths) + search
@@ -132,7 +130,10 @@ def _collect_subfiles(skill_dir: Path) -> list[Path]:
             continue
         if item.name == SKILL_FILENAME and item.parent == skill_dir:
             continue
-        if any(part.startswith(".") or part in _SKIP_DIRS for part in item.relative_to(skill_dir).parts):
+        if any(
+            part.startswith(".") or part in _SKIP_DIRS
+            for part in item.relative_to(skill_dir).parts
+        ):
             continue
         result.append(item)
     return result
@@ -144,7 +145,9 @@ def _build_tree(skill_dir: Path, subfiles: list[Path]) -> str:
     all_paths = [skill_dir / SKILL_FILENAME] + subfiles
     for i, path in enumerate(all_paths):
         rel = path.relative_to(skill_dir)
-        prefix = "\u2514\u2500\u2500 " if i == len(all_paths) - 1 else "\u251c\u2500\u2500 "
+        prefix = (
+            "\u2514\u2500\u2500 " if i == len(all_paths) - 1 else "\u251c\u2500\u2500 "
+        )
         size = path.stat().st_size
         if size < 1024:
             size_str = f"{size}B"
