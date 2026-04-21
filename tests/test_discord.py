@@ -177,7 +177,9 @@ def test_normalize_message_passes_skip_controls_without_settings_scope(
         )
         return []
 
-    monkeypatch.setattr(discord, "_normalize_attachment_nodes", _normalize_attachment_nodes)
+    monkeypatch.setattr(
+        discord, "_normalize_attachment_nodes", _normalize_attachment_nodes
+    )
 
     normalized = discord._normalize_message(  # noqa: SLF001
         {

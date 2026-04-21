@@ -181,9 +181,7 @@ def _transcribe_mistral(request: TranscriptionRequest) -> TranscriptionResult:
 
 def _mistral_cache_identity(request: TranscriptionRequest) -> dict[str, object]:
     prompt_hash = hashlib.sha256(request.prompt.encode("utf-8")).hexdigest()
-    bias_hash = hashlib.sha256(
-        ",".join(request.bias_terms).encode("utf-8")
-    ).hexdigest()
+    bias_hash = hashlib.sha256(",".join(request.bias_terms).encode("utf-8")).hexdigest()
     return {
         "provider": "mistral",
         "endpoint": _mistral_endpoint(),

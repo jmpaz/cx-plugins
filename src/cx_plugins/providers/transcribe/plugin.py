@@ -255,9 +255,7 @@ def _parse_priority_items(values: Sequence[str]) -> dict[str, int]:
         if not item:
             continue
         if "=" not in item:
-            raise ValueError(
-                "--transcribe-priority expects NAME=INTEGER entries"
-            )
+            raise ValueError("--transcribe-priority expects NAME=INTEGER entries")
         name, priority_raw = item.split("=", 1)
         normalized_name = _normalize_provider_name(name, allow_auto=False)
         if normalized_name is None:
@@ -265,9 +263,7 @@ def _parse_priority_items(values: Sequence[str]) -> dict[str, int]:
         try:
             priority = int(priority_raw)
         except ValueError as exc:
-            raise ValueError(
-                "--transcribe-priority values must be integers"
-            ) from exc
+            raise ValueError("--transcribe-priority values must be integers") from exc
         priorities[normalized_name] = priority
     return priorities
 

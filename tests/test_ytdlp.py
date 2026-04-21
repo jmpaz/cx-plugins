@@ -251,7 +251,9 @@ def test_extract_audio_uses_cached_media_bytes(tmp_path: Path, monkeypatch) -> N
 
     monkeypatch.setattr(
         "contextualize.cache.youtube.get_cached_media_bytes",
-        lambda identity: b"cached-audio" if identity == "audio:youtube:abc123" else None,
+        lambda identity: (
+            b"cached-audio" if identity == "audio:youtube:abc123" else None
+        ),
     )
     monkeypatch.setattr(
         "contextualize.runtime.get_refresh_audio",
