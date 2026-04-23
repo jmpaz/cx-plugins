@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from contextualize.auth.common import load_dotenv_optional
 from contextualize.plugins.api import (
@@ -33,6 +34,12 @@ def _requests_post(*args: object, **kwargs: object):
     import requests
 
     return requests.post(*args, **kwargs)
+
+
+def _requests_delete(*args: object, **kwargs: object):
+    import requests
+
+    return requests.delete(*args, **kwargs)
 
 
 def build_openai_provider() -> TranscriptionProvider:
@@ -72,6 +79,33 @@ def _openai_model() -> str:
         if value:
             return value
     return "whisper-1"
+
+
+def _openai_auth_headers() -> dict[str, str]:
+    load_dotenv_optional()
+    headers: dict[str, str] = {}
+    api_key = (os.environ.get("WHISPER_API_KEY") or "").strip()
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _openai_model_endpoint(model: str) -> str | None:
+    endpoint = _openai_endpoint()
+    split = urlsplit(endpoint)
+    path = split.path.rstrip("/")
+    for suffix in ("/audio/transcriptions", "/audio/translations"):
+        if path.endswith(suffix):
+            base_path = path[: -len(suffix)]
+            model_path = quote(model.strip().lstrip("/"), safe="/:@._-")
+            return urlunsplit(
+                split._replace(
+                    path=f"{base_path}/models/{model_path}",
+                    query="",
+                    fragment="",
+                )
+            )
+    return None
 
 
 def _chunk_seconds_cache_component() -> str:
@@ -131,7 +165,7 @@ def _transcribe_openai(request: TranscriptionRequest) -> TranscriptionResult:
     content_type = request.content_type or _guess_audio_content_type(request.filename)
     merged_prompt = _merge_prompt(request.prompt)
     try:
-        text = _transcribe_openai_once(
+        text = _transcribe_openai_once_with_model_repair(
             request.data,
             filename=request.filename,
             content_type=content_type,
@@ -150,6 +184,43 @@ def _transcribe_openai(request: TranscriptionRequest) -> TranscriptionResult:
     return TranscriptionResult(text=text, model=_openai_model(), provider="openai")
 
 
+def _transcribe_openai_once_with_model_repair(
+    data: bytes,
+    *,
+    filename: str,
+    content_type: str,
+    timeout: float,
+    prompt: str,
+) -> str:
+    try:
+        return _transcribe_openai_once(
+            data,
+            filename=filename,
+            content_type=content_type,
+            timeout=timeout,
+            prompt=prompt,
+        )
+    except TranscriptionProviderError as exc:
+        if not _should_recreate_model_after_error(exc):
+            raise
+        model = _openai_model()
+        try:
+            _recreate_openai_model(model, timeout=timeout)
+        except TranscriptionProviderError as refresh_exc:
+            raise TranscriptionProviderError(
+                "OpenAI-compatible transcription hit a stale local model cache "
+                f"for {model!r}, but automatic model refresh failed: {refresh_exc}",
+                retryable=False,
+            ) from refresh_exc
+        return _transcribe_openai_once(
+            data,
+            filename=filename,
+            content_type=content_type,
+            timeout=timeout,
+            prompt=prompt,
+        )
+
+
 def _transcribe_openai_once(
     data: bytes,
     *,
@@ -160,10 +231,7 @@ def _transcribe_openai_once(
 ) -> str:
     load_dotenv_optional()
     endpoint = _openai_endpoint()
-    headers: dict[str, str] = {}
-    api_key = (os.environ.get("WHISPER_API_KEY") or "").strip()
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    headers = _openai_auth_headers()
 
     form_data: dict[str, str] = {
         "model": _openai_model(),
@@ -202,6 +270,48 @@ def _transcribe_openai_once(
             "OpenAI-compatible transcription returned no transcription text"
         )
     return text
+
+
+def _should_recreate_model_after_error(exc: TranscriptionProviderError) -> bool:
+    if exc.status_code != 500:
+        return False
+    normalized = str(exc).lower()
+    return "valid model card" in normalized and "delete /v1/models" in normalized
+
+
+def _recreate_openai_model(model: str, *, timeout: float) -> None:
+    model_endpoint = _openai_model_endpoint(model)
+    if model_endpoint is None:
+        raise TranscriptionProviderError(
+            "could not derive a /models endpoint from WHISPER_URL or WHISPER_API_BASE"
+        )
+
+    headers = _openai_auth_headers()
+    delete_response = _requests_delete(
+        model_endpoint,
+        headers=headers,
+        timeout=max(10.0, min(timeout, 60.0)),
+    )
+    if delete_response.status_code >= 400 and delete_response.status_code != 404:
+        raise TranscriptionProviderError(
+            "model delete failed: "
+            f"{delete_response.status_code} {delete_response.text}",
+            retryable=delete_response.status_code >= 500,
+            status_code=delete_response.status_code,
+        )
+
+    create_response = _requests_post(
+        model_endpoint,
+        headers=headers,
+        timeout=max(timeout, 60.0),
+    )
+    if create_response.status_code >= 400:
+        raise TranscriptionProviderError(
+            "model download failed: "
+            f"{create_response.status_code} {create_response.text}",
+            retryable=create_response.status_code >= 500,
+            status_code=create_response.status_code,
+        )
 
 
 def _should_retry_chunked_transcription(exc: TranscriptionProviderError) -> bool:
@@ -258,7 +368,7 @@ def _transcribe_audio_in_chunks(
 
         parts: list[str] = []
         for chunk_path in chunk_paths:
-            text = _transcribe_openai_once(
+            text = _transcribe_openai_once_with_model_repair(
                 chunk_path.read_bytes(),
                 filename=chunk_path.name,
                 content_type="audio/wav",
