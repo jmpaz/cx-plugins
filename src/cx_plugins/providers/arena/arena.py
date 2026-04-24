@@ -967,6 +967,18 @@ def _extract_markdown_like_text(raw: object) -> str:
     return ""
 
 
+def _format_metadata_timestamp(raw: object) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    return _format_comment_timestamp(raw.strip())
+
+
+def _format_channel_description(description: str) -> str:
+    if "\n" in description:
+        return f"Description:\n{description}"
+    return f"Description: {description}"
+
+
 def _format_comment_timestamp(iso_timestamp: str) -> str:
     if not iso_timestamp:
         return ""
@@ -1525,14 +1537,41 @@ def _render_channel_stub(item: dict) -> str:
     ch_owner = (item.get("owner") or {}).get("name") or ""
     ch_slug = item.get("slug") or ""
     ch_counts = item.get("counts") or {}
-    ch_blocks = ch_counts.get("contents") or "?"
+    ch_blocks = ch_counts.get("contents")
+    if ch_blocks is None or ch_blocks == "":
+        ch_blocks = "?"
+    description = _extract_markdown_like_text(item.get("description") or "").strip()
+    created_at = _format_metadata_timestamp(item.get("created_at"))
+    updated_at = _format_metadata_timestamp(item.get("updated_at"))
     parts = [f"[Channel: {ch_title}]"]
     if ch_owner:
         parts.append(f"Owner: {ch_owner}")
     parts.append(f"Blocks: {ch_blocks}")
+    if created_at:
+        parts.append(f"Started: {created_at}")
+    if updated_at:
+        parts.append(f"Modified: {updated_at}")
     if ch_slug:
         parts.append(f"https://www.are.na/channel/{ch_slug}")
+    if description:
+        parts.append(_format_channel_description(description))
     return "\n".join(parts)
+
+
+def _is_missing_metadata_value(value: object) -> bool:
+    return value is None or value == "" or value == {} or value == []
+
+
+def _merge_channel_metadata(item: dict, metadata: object) -> dict:
+    block = dict(item)
+    if not isinstance(metadata, dict):
+        return block
+    for key, value in metadata.items():
+        if key.startswith("_nested_"):
+            continue
+        if _is_missing_metadata_value(block.get(key)):
+            block[key] = value
+    return block
 
 
 def _block_label(block: dict, channel_slug: str, channel_path: str = "") -> str:
@@ -1570,7 +1609,7 @@ def _flatten_channel_blocks(
                     (nested_slug,) if nested_slug else ()
                 )
                 if item.get("_nested_sampled_by_recurse_blocks"):
-                    block = dict(item)
+                    block = _merge_channel_metadata(item, nested_meta)
                     block.pop("_nested_metadata", None)
                     block.pop("_nested_contents", None)
                     block["_contextualize_keep_duplicate"] = True

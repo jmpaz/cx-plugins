@@ -476,6 +476,49 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
             refresh_cache=refresh_cache,
             settings=settings,
         )
+        channel_block = dict(channel_meta) if isinstance(channel_meta, dict) else {}
+        channel_block.setdefault("type", "Channel")
+        channel_block.setdefault("base_type", "Channel")
+        channel_block.setdefault("slug", slug)
+        channel_ref = ArenaReference(
+            target,
+            block=channel_block,
+            format="raw",
+            inject=False,
+            include_descriptions=settings.include_descriptions,
+            include_comments=settings.include_comments,
+            include_link_image_descriptions=settings.include_link_image_descriptions,
+            include_pdf_content=settings.include_pdf_content,
+            include_media_descriptions=settings.include_media_descriptions,
+        )
+        channel_id = channel_block.get("id")
+        channel_dedupe = None
+        if channel_id is not None:
+            channel_dedupe = {
+                "mode": "canonical_symlink",
+                "key": f"arena-channel:{channel_id}:{settings_key}",
+                "rank": -1,
+            }
+        out.append(
+            {
+                "source": target,
+                "label": channel_ref.get_label(),
+                "content": channel_ref.read(),
+                "metadata": {
+                    "trace_path": channel_ref.trace_path,
+                    "provider": PLUGIN_NAME,
+                    "source_ref": "are.na",
+                    "source_path": slug,
+                    "context_subpath": f"{slug}/_channel.md",
+                    "source_created": channel_block.get("created_at"),
+                    "source_modified": channel_block.get("updated_at"),
+                    "dir_created": channel_block.get("created_at"),
+                    "dir_modified": channel_block.get("updated_at"),
+                    "settings_key": settings_key,
+                    "hydrate_dedupe": channel_dedupe,
+                },
+            }
+        )
         for channel_path, block in flat_blocks:
             block_type = block.get("type", "")
             is_channel = block_type == "Channel" or block.get("base_type") == "Channel"
