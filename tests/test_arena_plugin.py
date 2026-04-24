@@ -4,6 +4,7 @@ import click
 import pytest
 
 from cx_plugins.providers.arena import arena
+from cx_plugins.providers.arena import plugin as arena_plugin
 from cx_plugins.providers.arena.arena import (
     ArenaSettings,
     parse_arena_recurse_blocks,
@@ -194,8 +195,17 @@ def test_parse_arena_recurse_blocks_rejects_invalid_values(raw) -> None:
         parse_arena_recurse_blocks(raw)
 
 
-def _channel(slug: str, id_: int, title: str, count: int) -> dict:
-    return {
+def _channel(
+    slug: str,
+    id_: int,
+    title: str,
+    count: int,
+    *,
+    description: object | None = None,
+    created_at: str | None = None,
+    updated_at: str | None = None,
+) -> dict:
+    channel = {
         "id": id_,
         "slug": slug,
         "title": title,
@@ -204,6 +214,13 @@ def _channel(slug: str, id_: int, title: str, count: int) -> dict:
         "counts": {"contents": count},
         "owner": {"id": 1, "slug": "owner", "name": "Owner"},
     }
+    if description is not None:
+        channel["description"] = description
+    if created_at is not None:
+        channel["created_at"] = created_at
+    if updated_at is not None:
+        channel["updated_at"] = updated_at
+    return channel
 
 
 def _text_block(id_: int) -> dict:
@@ -216,15 +233,90 @@ def _text_block(id_: int) -> dict:
     }
 
 
+def test_resolve_channel_includes_root_channel_metadata(monkeypatch) -> None:
+    channel = _channel(
+        "root",
+        1,
+        "Root",
+        0,
+        description={"markdown": "A channel about roots."},
+        created_at="2025-01-02T03:04:05Z",
+        updated_at="2025-02-03T04:05:06Z",
+    )
+
+    monkeypatch.setattr(arena, "_fetch_channel", lambda slug: channel)
+    monkeypatch.setattr(
+        arena,
+        "_fetch_channel_page",
+        lambda slug, page, per=100: {"contents": [], "meta": {"total_pages": 1}},
+    )
+
+    docs = arena_plugin.resolve(
+        "https://www.are.na/owner/root",
+        {"use_cache": False},
+    )
+
+    assert len(docs) == 1
+    assert docs[0]["content"] == "\n".join(
+        [
+            "[Channel: Root]",
+            "Owner: Owner",
+            "Blocks: 0",
+            "Started: 2025-01-02T03:04Z",
+            "Modified: 2025-02-03T04:05Z",
+            "https://www.are.na/channel/root",
+            "Description: A channel about roots.",
+        ]
+    )
+    assert docs[0]["metadata"]["context_subpath"] == "root/_channel.md"
+    assert docs[0]["metadata"]["source_created"] == "2025-01-02T03:04:05Z"
+    assert docs[0]["metadata"]["source_modified"] == "2025-02-03T04:05:06Z"
+
+
+def test_resolve_channel_multiline_description_has_no_spacer_line(monkeypatch) -> None:
+    channel = _channel(
+        "root",
+        1,
+        "Root",
+        0,
+        description={"markdown": "First paragraph.\n\nSecond paragraph."},
+    )
+
+    monkeypatch.setattr(arena, "_fetch_channel", lambda slug: channel)
+    monkeypatch.setattr(
+        arena,
+        "_fetch_channel_page",
+        lambda slug, page, per=100: {"contents": [], "meta": {"total_pages": 1}},
+    )
+
+    docs = arena_plugin.resolve(
+        "https://www.are.na/owner/root",
+        {"use_cache": False},
+    )
+
+    assert "Description:\nFirst paragraph." in docs[0]["content"]
+    assert "Description:\n\nFirst paragraph." not in docs[0]["content"]
+
+
 def test_recurse_blocks_ratio_caps_nested_channels_and_keeps_stub(monkeypatch) -> None:
     child_blocks = [_text_block(i) for i in range(1000, 1100)]
+    child_summary = _channel("child", 2, "Child", 100)
+    child_metadata = _channel(
+        "child",
+        2,
+        "Child",
+        100,
+        description={"markdown": "Nested channel metadata."},
+        created_at="2025-03-04T05:06:07Z",
+        updated_at="2025-04-05T06:07:08Z",
+    )
 
     monkeypatch.setattr(
         arena,
         "_fetch_channel",
         lambda slug: {
             "root": _channel("root", 1, "Root", 1000),
-            "child": _channel("child", 2, "Child", 100),
+            "child": child_metadata,
         }[slug],
     )
     monkeypatch.setattr(
@@ -232,7 +324,7 @@ def test_recurse_blocks_ratio_caps_nested_channels_and_keeps_stub(monkeypatch) -
         "_fetch_channel_page",
         lambda slug, page, per=100: {
             "root": {
-                "contents": [_channel("child", 2, "Child", 100)],
+                "contents": [child_summary],
                 "meta": {"total_pages": 1},
             },
             "child": {
@@ -256,6 +348,9 @@ def test_recurse_blocks_ratio_caps_nested_channels_and_keeps_stub(monkeypatch) -
     assert len(flat) == 51
     assert flat[0][1]["type"] == "Channel"
     assert flat[0][1]["slug"] == "child"
+    assert flat[0][1]["description"] == {"markdown": "Nested channel metadata."}
+    assert flat[0][1]["created_at"] == "2025-03-04T05:06:07Z"
+    assert flat[0][1]["updated_at"] == "2025-04-05T06:07:08Z"
     assert [block["id"] for _, block in flat[1:]] == list(range(1000, 1050))
 
 
