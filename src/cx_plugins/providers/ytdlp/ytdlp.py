@@ -33,18 +33,29 @@ def _ytdlp_extractors() -> tuple[Any, ...]:
 
 
 @lru_cache(maxsize=512)
-def looks_like_ytdlp_url(url: str) -> bool:
+def matching_ytdlp_extractors(url: str) -> tuple[str, ...]:
     if not is_url_target(url):
-        return False
+        return ()
+    names: list[str] = []
     for extractor in _ytdlp_extractors():
-        if getattr(extractor, "IE_NAME", "") == "generic":
+        name = getattr(extractor, "IE_NAME", "")
+        if name == "generic":
             continue
         try:
             if extractor.suitable(url):
-                return True
+                names.append(name)
         except Exception:
             continue
-    return False
+    return tuple(names)
+
+
+def requires_ytdlp_probe_for_claim(url: str) -> bool:
+    return "Substack" in matching_ytdlp_extractors(url)
+
+
+@lru_cache(maxsize=512)
+def looks_like_ytdlp_url(url: str) -> bool:
+    return bool(matching_ytdlp_extractors(url))
 
 
 def _log(message: str) -> None:

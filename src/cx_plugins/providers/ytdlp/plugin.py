@@ -21,17 +21,29 @@ def normalize_manifest_config(
 
 
 def can_resolve(target: str, context: dict[str, Any]) -> bool:
-    from .ytdlp import looks_like_ytdlp_url
+    from .ytdlp import (
+        looks_like_ytdlp_url,
+        probe_ytdlp_metadata,
+        requires_ytdlp_probe_for_claim,
+    )
 
-    return looks_like_ytdlp_url(target)
+    if not looks_like_ytdlp_url(target):
+        return False
+    if requires_ytdlp_probe_for_claim(target):
+        return probe_ytdlp_metadata(target, timeout_seconds=5) is not None
+    return True
 
 
 def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | None:
-    from .ytdlp import looks_like_ytdlp_url, probe_ytdlp_metadata
+    from .ytdlp import (
+        looks_like_ytdlp_url,
+        probe_ytdlp_metadata,
+        requires_ytdlp_probe_for_claim,
+    )
 
     metadata = probe_ytdlp_metadata(target, timeout_seconds=5)
     if metadata is None:
-        if not looks_like_ytdlp_url(target):
+        if not looks_like_ytdlp_url(target) or requires_ytdlp_probe_for_claim(target):
             return None
         return {
             "provider": PLUGIN_NAME,

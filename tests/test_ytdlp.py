@@ -33,10 +33,47 @@ def test_can_resolve_uses_extractor_matching_without_probe(monkeypatch) -> None:
         "_ytdlp_extractors",
         lambda: (_MatchExtractor(), _GenericExtractor()),
     )
+    ytdlp.matching_ytdlp_extractors.cache_clear()
     ytdlp.looks_like_ytdlp_url.cache_clear()
 
     assert ytdlp_plugin.can_resolve("https://example.com/ok", {}) is True
     assert ytdlp_plugin.can_resolve("https://example.com/nope", {}) is False
+
+
+def test_can_resolve_probes_substack_before_claiming(monkeypatch) -> None:
+    class _SubstackExtractor:
+        IE_NAME = "Substack"
+
+        @staticmethod
+        def suitable(url: str) -> bool:
+            return url == "https://regroup.substack.com/p/on-fluid-objects-static-self"
+
+    monkeypatch.setattr(ytdlp, "_ytdlp_extractors", lambda: (_SubstackExtractor(),))
+    ytdlp.matching_ytdlp_extractors.cache_clear()
+    ytdlp.looks_like_ytdlp_url.cache_clear()
+    monkeypatch.setattr(ytdlp, "probe_ytdlp_metadata", lambda *_args, **_kwargs: None)
+
+    assert (
+        ytdlp_plugin.can_resolve(
+            "https://regroup.substack.com/p/on-fluid-objects-static-self",
+            {},
+        )
+        is False
+    )
+
+    monkeypatch.setattr(
+        ytdlp,
+        "probe_ytdlp_metadata",
+        lambda *_args, **_kwargs: {"duration": 120},
+    )
+
+    assert (
+        ytdlp_plugin.can_resolve(
+            "https://regroup.substack.com/p/on-fluid-objects-static-self",
+            {},
+        )
+        is True
+    )
 
 
 def test_classify_target_uses_probe_metadata(monkeypatch) -> None:
@@ -68,6 +105,20 @@ def test_classify_target_uses_probe_metadata(monkeypatch) -> None:
     classified = ytdlp_plugin.classify_target("https://example.com/none", {})
     assert classified is not None
     assert classified["kind"] == "video"
+
+
+def test_classify_target_skips_probe_required_url_without_metadata(monkeypatch) -> None:
+    monkeypatch.setattr(ytdlp, "looks_like_ytdlp_url", lambda _url: True)
+    monkeypatch.setattr(ytdlp, "requires_ytdlp_probe_for_claim", lambda _url: True)
+    monkeypatch.setattr(ytdlp, "probe_ytdlp_metadata", lambda *_args, **_kwargs: None)
+
+    assert (
+        ytdlp_plugin.classify_target(
+            "https://regroup.substack.com/p/on-fluid-objects-static-self",
+            {},
+        )
+        is None
+    )
 
 
 def test_resolve_uses_generalized_reference_metadata(monkeypatch) -> None:
