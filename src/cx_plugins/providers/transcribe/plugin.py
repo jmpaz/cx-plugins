@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import re
 from typing import Any
 
 import click
@@ -91,6 +92,19 @@ def _coerce_priorities(raw: Any) -> dict[str, int]:
     return priorities
 
 
+def _coerce_language(raw: Any) -> str | None:
+    if raw in (None, ""):
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("language must be a string")
+    language = raw.strip().lower()
+    if language in {"", "auto"}:
+        return None
+    if not re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})?", language):
+        raise ValueError("language must be a BCP-47 or ISO language code")
+    return language
+
+
 def _coerce_diarize(raw: Any) -> bool:
     if isinstance(raw, bool):
         return raw
@@ -127,6 +141,10 @@ def normalize_manifest_config(
     provider = _normalize_provider_name(raw_config.get("provider"))
     if provider:
         normalized["provider"] = provider
+
+    language = _coerce_language(raw_config.get("language"))
+    if language:
+        normalized["language"] = language
 
     priorities = _coerce_priorities(raw_config.get("priorities"))
     if priorities:
@@ -192,6 +210,14 @@ def register_cli_options(command_name: str, command: click.Command) -> None:
             ["--transcribe-priority"],
             multiple=True,
             help="Override provider priority with NAME=INTEGER (repeatable).",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--transcribe-language"],
+            default=None,
+            help="Set the spoken language code for transcription, e.g. es or en.",
         ),
     )
     _append_option(
@@ -275,6 +301,7 @@ def collect_cli_overrides(
     if command_name not in {"cat", "hydrate"}:
         return None
     provider = _normalize_provider_name(params.get("transcribe_provider"))
+    language = _coerce_language(params.get("transcribe_language"))
     priorities = _parse_priority_items(params.get("transcribe_priority") or ())
     prompt_parts = [
         item.strip()
@@ -294,6 +321,8 @@ def collect_cli_overrides(
     raw_mapping: dict[str, Any] = {}
     if provider:
         raw_mapping["provider"] = provider
+    if language:
+        raw_mapping["language"] = language
     if priorities:
         raw_mapping["priorities"] = priorities
     if prompt_parts:

@@ -123,10 +123,11 @@ def _transcribe_mistral(request: TranscriptionRequest) -> TranscriptionResult:
             "Mistral transcription requires MISTRAL_API_KEY"
         )
 
-    data = {
-        "model": _mistral_model(),
-        "timestamp_granularities[]": "segment",
-    }
+    data = {"model": _mistral_model()}
+    if request.language:
+        data["language"] = request.language
+    else:
+        data["timestamp_granularities[]"] = "segment"
     if request.diarize:
         data["diarize"] = "true"
     if request.bias_terms:
@@ -186,6 +187,7 @@ def _mistral_cache_identity(request: TranscriptionRequest) -> dict[str, object]:
         "provider": "mistral",
         "endpoint": _mistral_endpoint(),
         "model": _mistral_model(),
+        "language": request.language,
         "prompt_hash": prompt_hash,
         "bias_hash": bias_hash,
         "diarize": request.diarize,

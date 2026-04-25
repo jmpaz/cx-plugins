@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from contextualize.plugins.api import TranscriptionProviderError, TranscriptionRequest
+from contextualize.plugins.api import (
+    TranscriptionProviderError,
+    TranscriptionRequest,
+)
 from cx_plugins.providers.transcribe import openai
 
 
@@ -67,6 +70,7 @@ def test_openai_provider_refreshes_stale_speaches_model(
             filename="clip.mp3",
             content_type="audio/mpeg",
             timeout=30,
+            language="en",
             prompt="",
             bias_terms=(),
             diarize=False,
@@ -104,6 +108,7 @@ def test_openai_provider_keeps_regular_500s_on_chunk_fallback_path(
                 filename="clip.mp3",
                 content_type="audio/mpeg",
                 timeout=30,
+                language="en",
                 prompt="",
                 bias_terms=(),
                 diarize=False,
@@ -143,9 +148,77 @@ def test_openai_provider_reports_failed_model_refresh_without_chunking(
                 filename="clip.mp3",
                 content_type="audio/mpeg",
                 timeout=30,
+                language="en",
                 prompt="",
                 bias_terms=(),
                 diarize=False,
                 speaker_count=None,
             )
         )
+
+
+def test_openai_provider_sends_language(
+    openai_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _post(url: str, **kwargs: object) -> _Response:
+        captured["data"] = kwargs.get("data")
+        return _Response(200, payload={"text": "transcribed"})
+
+    monkeypatch.setattr(openai, "_requests_post", _post)
+
+    result = openai.build_openai_provider().transcribe(
+        TranscriptionRequest(
+            data=b"audio",
+            filename="clip.mp3",
+            content_type="audio/mpeg",
+            timeout=30,
+            language="es",
+            prompt="",
+            bias_terms=(),
+            diarize=False,
+            speaker_count=None,
+        )
+    )
+
+    assert result.text == "transcribed"
+    assert captured["data"] == {
+        "model": "CohereLabs/cohere-transcribe-03-2026",
+        "response_format": "verbose_json",
+        "language": "es",
+    }
+
+
+def test_openai_provider_omits_language_when_unspecified(
+    openai_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _post(url: str, **kwargs: object) -> _Response:
+        captured["data"] = kwargs.get("data")
+        return _Response(200, payload={"text": "transcribed"})
+
+    monkeypatch.setattr(openai, "_requests_post", _post)
+
+    result = openai.build_openai_provider().transcribe(
+        TranscriptionRequest(
+            data=b"audio",
+            filename="clip.mp3",
+            content_type="audio/mpeg",
+            timeout=30,
+            language=None,
+            prompt="",
+            bias_terms=(),
+            diarize=False,
+            speaker_count=None,
+        )
+    )
+
+    assert result.text == "transcribed"
+    assert captured["data"] == {
+        "model": "CohereLabs/cohere-transcribe-03-2026",
+        "response_format": "verbose_json",
+    }

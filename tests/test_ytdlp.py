@@ -13,6 +13,28 @@ def test_ytdlp_priority_is_below_specialized_providers() -> None:
     assert ytdlp_plugin.PLUGIN_PRIORITY < atproto_plugin.PLUGIN_PRIORITY
 
 
+def test_render_cache_identity_varies_by_transcription_overrides() -> None:
+    base = "youtube:abc123"
+
+    es_identity = ytdlp._render_cache_identity(
+        base,
+        {"transcribe": {"language": "es"}},
+    )
+    en_identity = ytdlp._render_cache_identity(
+        base,
+        {"transcribe": {"language": "en"}},
+    )
+
+    assert ytdlp._render_cache_identity(base, None) == base
+    assert es_identity != base
+    assert en_identity != base
+    assert es_identity != en_identity
+    assert (
+        ytdlp._render_cache_identity(base, {"transcribe": {"language": "es"}})
+        == es_identity
+    )
+
+
 def test_can_resolve_uses_extractor_matching_without_probe(monkeypatch) -> None:
     class _MatchExtractor:
         IE_NAME = "youtube"

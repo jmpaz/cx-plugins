@@ -11,6 +11,7 @@ def test_normalize_manifest_config_supports_provider_aliases() -> None:
     normalized = normalize_manifest_config(
         {
             "provider": "whisper",
+            "language": "ES",
             "priorities": {"mistral": 300},
             "prompt": ["names", "places"],
             "prompt_files": ["notes.yaml"],
@@ -23,6 +24,7 @@ def test_normalize_manifest_config_supports_provider_aliases() -> None:
 
     assert normalized == {
         "provider": "openai",
+        "language": "es",
         "priorities": {"mistral": 300},
         "prompt_parts": ["names", "places"],
         "prompt_files": ["notes.yaml"],
@@ -38,6 +40,7 @@ def test_collect_cli_overrides_builds_transcribe_mapping() -> None:
         "cat",
         {
             "transcribe_provider": "mistral",
+            "transcribe_language": "es",
             "transcribe_priority": ("openai=10", "mistral=500"),
             "transcribe_prompt": ("names",),
             "transcribe_prompt_file": ("notes.yaml",),
@@ -50,6 +53,7 @@ def test_collect_cli_overrides_builds_transcribe_mapping() -> None:
 
     assert overrides == {
         "provider": "mistral",
+        "language": "es",
         "priorities": {"openai": 10, "mistral": 500},
         "prompt_parts": ["names"],
         "prompt_files": ["notes.yaml"],
