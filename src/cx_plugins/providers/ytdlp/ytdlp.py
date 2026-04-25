@@ -262,6 +262,21 @@ def _build_identity(url: str, metadata: dict[str, Any]) -> _YtDlpIdentity:
     )
 
 
+def _render_cache_identity(
+    base_identity: str, plugin_overrides: dict[str, Any] | None
+) -> str:
+    transcribe_overrides = None
+    if isinstance(plugin_overrides, dict):
+        value = plugin_overrides.get("transcribe")
+        if isinstance(value, dict):
+            transcribe_overrides = dict(value)
+    if not transcribe_overrides:
+        return base_identity
+    payload = json.dumps(transcribe_overrides, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return f"{base_identity}:transcribe:{digest}"
+
+
 def _source_ref(url: str, metadata: dict[str, Any], extractor: str | None) -> str:
     webpage_url = _clean_identity_part(
         metadata.get("webpage_url")
@@ -488,12 +503,16 @@ class YtDlpReference:
 
         whisper_available = True
         identity = self._get_identity()
+        render_cache_identity = _render_cache_identity(
+            identity.cache_identity,
+            self.plugin_overrides,
+        )
 
         if self.use_cache and not self.refresh_cache:
             from contextualize.cache.youtube import get_cached_transcript
 
             cached = get_cached_transcript(
-                identity.cache_identity,
+                render_cache_identity,
                 self.cache_ttl,
                 whisper_available=whisper_available,
             )
@@ -534,7 +553,7 @@ class YtDlpReference:
             from contextualize.cache.youtube import store_transcript
 
             store_transcript(
-                identity.cache_identity,
+                render_cache_identity,
                 text,
                 source=source,
             )

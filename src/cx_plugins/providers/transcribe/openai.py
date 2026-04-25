@@ -170,6 +170,7 @@ def _transcribe_openai(request: TranscriptionRequest) -> TranscriptionResult:
             filename=request.filename,
             content_type=content_type,
             timeout=request.timeout,
+            language=request.language,
             prompt=merged_prompt,
         )
     except TranscriptionProviderError as exc:
@@ -179,6 +180,7 @@ def _transcribe_openai(request: TranscriptionRequest) -> TranscriptionResult:
             request.data,
             filename=request.filename,
             timeout=request.timeout,
+            language=request.language,
             prompt=merged_prompt,
         )
     return TranscriptionResult(text=text, model=_openai_model(), provider="openai")
@@ -190,6 +192,7 @@ def _transcribe_openai_once_with_model_repair(
     filename: str,
     content_type: str,
     timeout: float,
+    language: str | None,
     prompt: str,
 ) -> str:
     try:
@@ -198,6 +201,7 @@ def _transcribe_openai_once_with_model_repair(
             filename=filename,
             content_type=content_type,
             timeout=timeout,
+            language=language,
             prompt=prompt,
         )
     except TranscriptionProviderError as exc:
@@ -217,6 +221,7 @@ def _transcribe_openai_once_with_model_repair(
             filename=filename,
             content_type=content_type,
             timeout=timeout,
+            language=language,
             prompt=prompt,
         )
 
@@ -227,6 +232,7 @@ def _transcribe_openai_once(
     filename: str,
     content_type: str,
     timeout: float,
+    language: str | None,
     prompt: str,
 ) -> str:
     load_dotenv_optional()
@@ -237,6 +243,8 @@ def _transcribe_openai_once(
         "model": _openai_model(),
         "response_format": "verbose_json",
     }
+    if language:
+        form_data["language"] = language
     if prompt:
         form_data["prompt"] = prompt
 
@@ -325,6 +333,7 @@ def _transcribe_audio_in_chunks(
     *,
     filename: str,
     timeout: float,
+    language: str | None,
     prompt: str,
 ) -> str:
     chunk_seconds = _get_chunk_seconds()
@@ -373,6 +382,7 @@ def _transcribe_audio_in_chunks(
                 filename=chunk_path.name,
                 content_type="audio/wav",
                 timeout=timeout,
+                language=language,
                 prompt=prompt,
             ).strip()
             if text:
@@ -404,6 +414,7 @@ def _openai_cache_identity(request: TranscriptionRequest) -> dict[str, object]:
         "endpoint": _openai_endpoint(),
         "model": _openai_model(),
         "chunk_seconds": _chunk_seconds_cache_component(),
+        "language": request.language,
         "prompt_hash": prompt_hash,
         "diarize": request.diarize,
         "speaker_count": request.speaker_count,
