@@ -504,7 +504,10 @@ def _owner_targets(target: str) -> list[tuple[str, str]]:
 
 
 def _owner_not_found(exc: ValueError, kind: str, slug: str) -> bool:
-    return f"Are.na resource not found: /{kind}s/{slug}/contents" in str(exc)
+    message = str(exc)
+    return message.endswith(
+        f"Are.na resource not found: /{kind}s/{slug}"
+    ) or message.endswith(f"Are.na resource not found: /{kind}s/{slug}/contents")
 
 
 def _fetch_owner_channels_for_target(
@@ -542,12 +545,107 @@ def _fetch_owner_channels_for_target(
     return None
 
 
+def _fetch_owner_data_for_target(
+    owners: list[tuple[str, str]],
+    *,
+    use_cache: bool,
+    cache_ttl: Any,
+    refresh_cache: bool,
+    settings: Any,
+) -> tuple[str, str, dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]] | None:
+    from .arena import fetch_owner_channels, fetch_owner_profile, fetch_user_groups
+
+    last_missing: ValueError | None = None
+    for kind, slug in owners:
+        try:
+            profile = fetch_owner_profile(
+                kind,
+                slug,
+                use_cache=use_cache,
+                cache_ttl=cache_ttl,
+                refresh_cache=refresh_cache,
+            )
+            user_groups = (
+                fetch_user_groups(
+                    slug,
+                    use_cache=use_cache,
+                    cache_ttl=cache_ttl,
+                    refresh_cache=refresh_cache,
+                )
+                if kind == "user"
+                else []
+            )
+            channels = fetch_owner_channels(
+                kind,
+                slug,
+                use_cache=use_cache,
+                cache_ttl=cache_ttl,
+                refresh_cache=refresh_cache,
+                settings=settings,
+            )
+            return kind, slug, profile, user_groups, channels
+        except ValueError as exc:
+            if len(owners) > 1 and _owner_not_found(exc, kind, slug):
+                last_missing = exc
+                continue
+            raise
+    if last_missing is not None:
+        raise last_missing
+    return None
+
+
 def _owner_context_prefix(kind: str, slug: str) -> str:
     return f"{kind}s/{slug}"
 
 
 def _channel_target(slug: str) -> str:
     return f"https://www.are.na/channel/{slug}"
+
+
+def _owner_profile_document(
+    *,
+    target: str,
+    kind: str,
+    slug: str,
+    profile: dict[str, Any],
+    user_groups: list[dict[str, Any]],
+    settings_key: tuple[Any, ...],
+) -> dict[str, Any]:
+    from .arena import render_owner_profile
+
+    profile_id = profile.get("id")
+    profile_slug = profile.get("slug") if isinstance(profile.get("slug"), str) else slug
+    profile_name = profile.get("name") or profile_slug
+    context_prefix = _owner_context_prefix(kind, slug)
+    dedupe = None
+    if profile_id is not None:
+        dedupe = {
+            "mode": "canonical_symlink",
+            "key": f"arena-{kind}:{profile_id}:{settings_key}",
+            "rank": -2,
+        }
+    return {
+        "source": target,
+        "label": profile_name,
+        "content": render_owner_profile(
+            kind,
+            profile,
+            user_groups=user_groups if kind == "user" else None,
+        ),
+        "metadata": {
+            "trace_path": f"{context_prefix}/{profile_id or profile_slug}",
+            "provider": PLUGIN_NAME,
+            "source_ref": "are.na",
+            "source_path": context_prefix,
+            "context_subpath": f"{context_prefix}/_{kind}.md",
+            "source_created": profile.get("created_at"),
+            "source_modified": profile.get("updated_at"),
+            "dir_created": profile.get("created_at"),
+            "dir_modified": profile.get("updated_at"),
+            "settings_key": settings_key,
+            "hydrate_dedupe": dedupe,
+        },
+    }
 
 
 def _channel_documents(
@@ -755,16 +853,26 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
         settings = _apply_channel_safety_defaults(settings, arena_overrides)
         settings_key = _settings_key(settings)
         warmup_arena_network_stack()
-        owner_channels = _fetch_owner_channels_for_target(
+        owner_data = _fetch_owner_data_for_target(
             owners,
             use_cache=use_cache,
             cache_ttl=cache_ttl,
             refresh_cache=refresh_cache,
             settings=settings,
         )
-        if owner_channels is None:
+        if owner_data is None:
             return out
-        kind, owner_slug, channels = owner_channels
+        kind, owner_slug, profile, user_groups, channels = owner_data
+        out.append(
+            _owner_profile_document(
+                target=target,
+                kind=kind,
+                slug=owner_slug,
+                profile=profile,
+                user_groups=user_groups,
+                settings_key=settings_key,
+            )
+        )
         context_prefix = _owner_context_prefix(kind, owner_slug)
         for channel in channels:
             channel_slug = channel.get("slug")

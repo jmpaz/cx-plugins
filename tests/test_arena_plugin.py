@@ -269,6 +269,33 @@ def _text_block(id_: int) -> dict:
     }
 
 
+def _user_profile(slug: str = "alice", name: str = "Alice") -> dict:
+    return {
+        "id": 20,
+        "type": "User",
+        "name": name,
+        "slug": slug,
+        "bio": {"markdown": "Building a garden."},
+        "created_at": "2024-01-02T03:04:05Z",
+        "updated_at": "2024-02-03T04:05:06Z",
+        "counts": {"channels": 2, "followers": 3, "following": 4},
+    }
+
+
+def _group_profile(slug: str = "studio", name: str = "Studio") -> dict:
+    return {
+        "id": 30,
+        "type": "Group",
+        "name": name,
+        "slug": slug,
+        "bio": {"markdown": "Shared workbench."},
+        "created_at": "2025-01-02T03:04:05Z",
+        "updated_at": "2025-02-03T04:05:06Z",
+        "user": {"id": 40, "type": "User", "name": "Owner", "slug": "owner"},
+        "counts": {"channels": 5, "users": 6},
+    }
+
+
 def test_resolve_channel_includes_root_channel_metadata(monkeypatch) -> None:
     channel = _channel(
         "root",
@@ -367,6 +394,106 @@ def test_list_targets_expands_user_channels_and_applies_exclusions(monkeypatch) 
     ]
 
 
+def test_resolve_user_emits_profile_doc_with_groups(monkeypatch) -> None:
+    monkeypatch.setattr(
+        arena,
+        "fetch_owner_profile",
+        lambda kind, slug, **_kwargs: _user_profile(slug, "Alice"),
+    )
+    monkeypatch.setattr(
+        arena,
+        "fetch_user_groups",
+        lambda slug, **_kwargs: [
+            {
+                **_group_profile("studio", "Studio"),
+                "counts": {"channels": 5, "users": 6},
+            }
+        ],
+    )
+    monkeypatch.setattr(arena, "fetch_owner_channels", lambda kind, slug, **_kwargs: [])
+
+    docs = arena_plugin.resolve("arena:user:alice", {"use_cache": False})
+
+    assert len(docs) == 1
+    assert docs[0]["metadata"]["context_subpath"] == "users/alice/_user.md"
+    assert docs[0]["content"] == "\n".join(
+        [
+            "[User: Alice]",
+            "Joined: 2024-01-02T03:04Z",
+            "Modified: 2024-02-03T04:05Z",
+            "Channels: 2",
+            "Followers: 3",
+            "Following: 4",
+            "https://www.are.na/alice",
+            "Info: Building a garden.",
+            "Groups:",
+            "- Studio (@studio), Owner: Owner (@owner), Channels: 5, Members: 6",
+        ]
+    )
+
+
+def test_resolve_group_emits_profile_doc_with_owner_and_counts(monkeypatch) -> None:
+    monkeypatch.setattr(
+        arena,
+        "fetch_owner_profile",
+        lambda kind, slug, **_kwargs: _group_profile(slug, "Studio"),
+    )
+    monkeypatch.setattr(arena, "fetch_owner_channels", lambda kind, slug, **_kwargs: [])
+
+    docs = arena_plugin.resolve("arena:group:studio", {"use_cache": False})
+
+    assert len(docs) == 1
+    assert docs[0]["metadata"]["context_subpath"] == "groups/studio/_group.md"
+    assert docs[0]["content"] == "\n".join(
+        [
+            "[Group: Studio]",
+            "Owner: Owner (@owner)",
+            "Channels: 5",
+            "Members: 6",
+            "Created: 2025-01-02T03:04Z",
+            "Modified: 2025-02-03T04:05Z",
+            "https://www.are.na/studio",
+            "Info: Shared workbench.",
+        ]
+    )
+
+
+def test_resolve_owner_profile_remains_when_channels_are_excluded(monkeypatch) -> None:
+    monkeypatch.setattr(
+        arena,
+        "_fetch_owner_profile",
+        lambda kind, slug: _user_profile(slug, "Alice"),
+    )
+    monkeypatch.setattr(
+        arena,
+        "_fetch_user_groups_page",
+        lambda slug, page, *, per=100, sort="name_asc": {
+            "data": [],
+            "meta": {"total_pages": 1},
+        },
+    )
+    monkeypatch.setattr(
+        arena,
+        "_fetch_owner_channel_page",
+        lambda kind, slug, page, *, per=100, sort="created_at_asc": {
+            "data": [_channel("skip", 10, "Skip", 0)],
+            "meta": {"total_pages": 1},
+        },
+    )
+
+    docs = arena_plugin.resolve(
+        "arena:user:alice",
+        {
+            "use_cache": False,
+            "overrides": {"arena": {"exclude-channels": ["skip"]}},
+        },
+    )
+
+    assert [doc["metadata"]["context_subpath"] for doc in docs] == [
+        "users/alice/_user.md"
+    ]
+
+
 def test_list_targets_bare_profile_url_falls_back_to_group(monkeypatch) -> None:
     calls: list[str] = []
 
@@ -421,15 +548,19 @@ def test_explicit_user_target_does_not_fallback_to_group(monkeypatch) -> None:
 def test_resolve_bare_profile_url_uses_group_prefix_after_fallback(monkeypatch) -> None:
     calls: list[str] = []
 
-    def _fetch_owner_channels(kind, slug, **_kwargs):
+    def _fetch_owner_profile(kind, slug, **_kwargs):
         calls.append(kind)
         assert slug == "media-working-group"
         if kind == "user":
-            raise ValueError(
-                "Are.na resource not found: /users/media-working-group/contents"
-            )
+            raise ValueError("Are.na resource not found: /users/media-working-group")
+        return _group_profile(slug, "Media Working Group")
+
+    def _fetch_owner_channels(kind, slug, **_kwargs):
+        assert slug == "media-working-group"
+        assert kind == "group"
         return [_channel("root", 1, "Root", 1)]
 
+    monkeypatch.setattr(arena, "fetch_owner_profile", _fetch_owner_profile)
     monkeypatch.setattr(arena, "fetch_owner_channels", _fetch_owner_channels)
     monkeypatch.setattr(
         arena,
@@ -447,11 +578,18 @@ def test_resolve_bare_profile_url_uses_group_prefix_after_fallback(monkeypatch) 
 
     assert calls == ["user", "group"]
     paths = [doc["metadata"]["context_subpath"] for doc in docs]
-    assert paths[0] == "groups/media-working-group/root/_channel.md"
-    assert all(path.startswith("groups/media-working-group/root/") for path in paths)
+    assert paths[0] == "groups/media-working-group/_group.md"
+    assert paths[1] == "groups/media-working-group/root/_channel.md"
+    assert all(path.startswith("groups/media-working-group/") for path in paths)
 
 
 def test_resolve_user_prefixes_each_channel_under_owner_path(monkeypatch) -> None:
+    monkeypatch.setattr(
+        arena,
+        "fetch_owner_profile",
+        lambda kind, slug, **_kwargs: _user_profile(slug, "Alice"),
+    )
+    monkeypatch.setattr(arena, "fetch_user_groups", lambda slug, **_kwargs: [])
     monkeypatch.setattr(
         arena,
         "fetch_owner_channels",
@@ -469,8 +607,9 @@ def test_resolve_user_prefixes_each_channel_under_owner_path(monkeypatch) -> Non
     docs = arena_plugin.resolve("arena:user:alice", {"use_cache": False})
 
     paths = [doc["metadata"]["context_subpath"] for doc in docs]
-    assert paths[0] == "users/alice/root/_channel.md"
-    assert all(path.startswith("users/alice/root/") for path in paths)
+    assert paths[0] == "users/alice/_user.md"
+    assert paths[1] == "users/alice/root/_channel.md"
+    assert all(path.startswith("users/alice/") for path in paths)
 
 
 def test_excluded_nested_channel_prunes_branch_without_excluding_repeated_blocks(
