@@ -7,6 +7,7 @@ from cx_plugins.providers.arena import arena
 from cx_plugins.providers.arena import plugin as arena_plugin
 from cx_plugins.providers.arena.arena import (
     ArenaSettings,
+    parse_arena_channel_exclusions,
     parse_arena_recurse_blocks,
     resolve_channel,
 )
@@ -67,9 +68,9 @@ def test_apply_channel_safety_defaults_ignores_implicit_media_default() -> None:
 
 
 def test_register_cli_options_exposes_arena_controls() -> None:
-    command = click.Command("cat")
+    command = click.Command("payload")
 
-    register_cli_options("cat", command)
+    register_cli_options("payload", command)
 
     option_names = {
         opt for param in command.params for opt in getattr(param, "opts", ())
@@ -81,6 +82,7 @@ def test_register_cli_options_exposes_arena_controls() -> None:
     assert "--arena-link-image-descriptions" in option_names
     assert "--arena-media-descriptions" in option_names
     assert "--arena-connected-after" in option_names
+    assert "--arena-exclude-channel" in option_names
 
 
 def test_collect_cli_overrides_builds_arena_mapping() -> None:
@@ -101,6 +103,10 @@ def test_collect_cli_overrides_builds_arena_mapping() -> None:
             "arena_link_image_descriptions": True,
             "arena_pdf_content": True,
             "arena_media_descriptions": False,
+            "arena_exclude_channel": (
+                "skip-one,123",
+                "https://www.are.na/channel/skip-two",
+            ),
         },
     )
 
@@ -118,6 +124,11 @@ def test_collect_cli_overrides_builds_arena_mapping() -> None:
             "pdf-content": True,
             "media-desc": False,
         },
+        "exclude-channels": [
+            "skip-one",
+            "123",
+            "https://www.are.na/channel/skip-two",
+        ],
     }
 
 
@@ -139,6 +150,7 @@ def test_collect_cli_overrides_accepts_arena_recurse_all() -> None:
             "arena_link_image_descriptions": None,
             "arena_pdf_content": None,
             "arena_media_descriptions": None,
+            "arena_exclude_channel": (),
         },
     )
 
@@ -164,6 +176,7 @@ def test_collect_cli_overrides_rejects_mixed_recurse_all() -> None:
                 "arena_link_image_descriptions": None,
                 "arena_pdf_content": None,
                 "arena_media_descriptions": None,
+                "arena_exclude_channel": (),
             },
         )
     except ValueError as exc:
@@ -193,6 +206,29 @@ def test_parse_arena_recurse_blocks_accepts_counts_and_ratios(raw, expected) -> 
 def test_parse_arena_recurse_blocks_rejects_invalid_values(raw) -> None:
     with pytest.raises(ValueError):
         parse_arena_recurse_blocks(raw)
+
+
+def test_arena_user_and_group_targets_are_recognized() -> None:
+    assert arena.is_arena_user_target("arena:user:alice")
+    assert arena.is_arena_user_target("https://www.are.na/alice")
+    assert arena.is_arena_group_target("arena:group:studio")
+    assert arena.is_arena_group_target("https://www.are.na/groups/studio")
+    assert not arena.is_arena_user_target("https://www.are.na/channel/root")
+
+
+def test_parse_arena_channel_exclusions_accepts_ids_slugs_and_urls() -> None:
+    exclusions = parse_arena_channel_exclusions(
+        ["123", "Root", "https://www.are.na/channel/skip-me"]
+    )
+
+    assert exclusions.ids == frozenset({123})
+    assert exclusions.slugs == frozenset({"root", "skip-me"})
+
+
+def test_parse_arena_channel_exclusions_accepts_existing_value() -> None:
+    exclusions = parse_arena_channel_exclusions(["skip-me"])
+
+    assert parse_arena_channel_exclusions(exclusions) is exclusions
 
 
 def _channel(
@@ -296,6 +332,187 @@ def test_resolve_channel_multiline_description_has_no_spacer_line(monkeypatch) -
 
     assert "Description:\nFirst paragraph." in docs[0]["content"]
     assert "Description:\n\nFirst paragraph." not in docs[0]["content"]
+
+
+def test_list_targets_expands_user_channels_and_applies_exclusions(monkeypatch) -> None:
+    def _fetch_owner_channel_page(kind, slug, page, *, per=100, sort="created_at_asc"):
+        assert kind == "user"
+        assert slug == "alice"
+        assert sort == "created_at_asc"
+        return {
+            "data": [
+                _channel("keep", 10, "Keep", 0),
+                _channel("skip", 11, "Skip", 0),
+            ],
+            "meta": {"total_pages": 1},
+        }
+
+    monkeypatch.setattr(arena, "_fetch_owner_channel_page", _fetch_owner_channel_page)
+
+    items = arena_plugin.list_targets(
+        "arena:user:alice",
+        {
+            "use_cache": False,
+            "overrides": {"arena": {"exclude-channels": ["skip"]}},
+        },
+    )
+
+    assert items == [
+        {
+            "target": "https://www.are.na/channel/keep",
+            "label": "Keep",
+            "kind": "channel",
+            "metadata": {"owner_kind": "user", "owner_slug": "alice"},
+        }
+    ]
+
+
+def test_list_targets_bare_profile_url_falls_back_to_group(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def _fetch_owner_channel_page(kind, slug, page, *, per=100, sort="created_at_asc"):
+        calls.append(kind)
+        assert slug == "media-working-group"
+        if kind == "user":
+            raise ValueError(
+                "Are.na resource not found: /users/media-working-group/contents"
+            )
+        return {
+            "data": [_channel("root", 10, "Root", 0)],
+            "meta": {"total_pages": 1},
+        }
+
+    monkeypatch.setattr(arena, "_fetch_owner_channel_page", _fetch_owner_channel_page)
+
+    items = arena_plugin.list_targets(
+        "https://www.are.na/media-working-group",
+        {"use_cache": False},
+    )
+
+    assert calls == ["user", "group"]
+    assert items == [
+        {
+            "target": "https://www.are.na/channel/root",
+            "label": "Root",
+            "kind": "channel",
+            "metadata": {
+                "owner_kind": "group",
+                "owner_slug": "media-working-group",
+            },
+        }
+    ]
+
+
+def test_explicit_user_target_does_not_fallback_to_group(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def _fetch_owner_channel_page(kind, slug, page, *, per=100, sort="created_at_asc"):
+        calls.append(kind)
+        raise ValueError("Are.na resource not found: /users/alice/contents")
+
+    monkeypatch.setattr(arena, "_fetch_owner_channel_page", _fetch_owner_channel_page)
+
+    with pytest.raises(ValueError, match="/users/alice/contents"):
+        arena_plugin.list_targets("arena:user:alice", {"use_cache": False})
+
+    assert calls == ["user"]
+
+
+def test_resolve_bare_profile_url_uses_group_prefix_after_fallback(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def _fetch_owner_channels(kind, slug, **_kwargs):
+        calls.append(kind)
+        assert slug == "media-working-group"
+        if kind == "user":
+            raise ValueError(
+                "Are.na resource not found: /users/media-working-group/contents"
+            )
+        return [_channel("root", 1, "Root", 1)]
+
+    monkeypatch.setattr(arena, "fetch_owner_channels", _fetch_owner_channels)
+    monkeypatch.setattr(
+        arena,
+        "resolve_channel",
+        lambda slug, **_kwargs: (
+            _channel(slug, 1, "Root", 1),
+            [(slug, _text_block(100))],
+        ),
+    )
+
+    docs = arena_plugin.resolve(
+        "https://www.are.na/media-working-group",
+        {"use_cache": False},
+    )
+
+    assert calls == ["user", "group"]
+    paths = [doc["metadata"]["context_subpath"] for doc in docs]
+    assert paths[0] == "groups/media-working-group/root/_channel.md"
+    assert all(path.startswith("groups/media-working-group/root/") for path in paths)
+
+
+def test_resolve_user_prefixes_each_channel_under_owner_path(monkeypatch) -> None:
+    monkeypatch.setattr(
+        arena,
+        "fetch_owner_channels",
+        lambda kind, slug, **_kwargs: [_channel("root", 1, "Root", 1)],
+    )
+    monkeypatch.setattr(
+        arena,
+        "resolve_channel",
+        lambda slug, **_kwargs: (
+            _channel(slug, 1, "Root", 1),
+            [(slug, _text_block(100))],
+        ),
+    )
+
+    docs = arena_plugin.resolve("arena:user:alice", {"use_cache": False})
+
+    paths = [doc["metadata"]["context_subpath"] for doc in docs]
+    assert paths[0] == "users/alice/root/_channel.md"
+    assert all(path.startswith("users/alice/root/") for path in paths)
+
+
+def test_excluded_nested_channel_prunes_branch_without_excluding_repeated_blocks(
+    monkeypatch,
+) -> None:
+    root_block = _text_block(7)
+    child_block = _text_block(7)
+
+    monkeypatch.setattr(
+        arena,
+        "_fetch_channel",
+        lambda slug: {
+            "root": _channel("root", 1, "Root", 2),
+            "skip": _channel("skip", 2, "Skip", 1),
+        }[slug],
+    )
+
+    def _fetch_channel_page(slug, page, per=100):
+        if slug == "skip":
+            raise AssertionError("excluded channel should not be fetched")
+        return {
+            "root": {
+                "contents": [_channel("skip", 2, "Skip", 1), root_block],
+                "meta": {"total_pages": 1},
+            },
+            "skip": {"contents": [child_block], "meta": {"total_pages": 1}},
+        }[slug]
+
+    monkeypatch.setattr(arena, "_fetch_channel_page", _fetch_channel_page)
+
+    _metadata, flat = resolve_channel(
+        "root",
+        use_cache=False,
+        settings=ArenaSettings(
+            max_depth=1,
+            sort_order="asc",
+            recurse_users=None,
+            exclude_channels=parse_arena_channel_exclusions(["skip"]),
+        ),
+    )
+
+    assert [block["id"] for _, block in flat] == [7]
 
 
 def test_recurse_blocks_ratio_caps_nested_channels_and_keeps_stub(monkeypatch) -> None:

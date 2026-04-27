@@ -47,6 +47,7 @@ def _arena_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
         "include_link_image_descriptions",
         "include_pdf_content",
         "include_media_descriptions",
+        "exclude_channels",
     ):
         if key in raw:
             result[key] = raw[key]
@@ -78,6 +79,8 @@ def _arena_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
         result["max_blocks_per_channel"] = raw.get("max-blocks-per-channel")
     if "recurse-blocks" in raw:
         result["recurse_blocks"] = raw.get("recurse-blocks")
+    if "exclude-channels" in raw:
+        result["exclude_channels"] = raw.get("exclude-channels")
 
     for config_key, result_key in (
         ("connected-after", "connected_after"),
@@ -144,7 +147,7 @@ def _append_option(command: click.Command, option: click.Option) -> None:
 
 
 def register_cli_options(command_name: str, command: click.Command) -> None:
-    if command_name not in {"cat", "hydrate"}:
+    if command_name not in {"cat", "hydrate", "payload"}:
         return
     _append_option(
         command,
@@ -267,6 +270,14 @@ def register_cli_options(command_name: str, command: click.Command) -> None:
             help="Describe or skip Are.na image, video, and audio block media.",
         ),
     )
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-exclude-channel"],
+            multiple=True,
+            help="Skip an Are.na channel by slug, id, or URL. Repeatable or comma-separated.",
+        ),
+    )
 
 
 def _collect_recurse_users(values: tuple[str, ...]) -> str | list[str] | None:
@@ -299,7 +310,7 @@ def collect_cli_overrides(
     command_name: str,
     params: dict[str, Any],
 ) -> dict[str, Any] | None:
-    if command_name not in {"cat", "hydrate"}:
+    if command_name not in {"cat", "hydrate", "payload"}:
         return None
 
     raw_mapping: dict[str, Any] = {}
@@ -351,6 +362,15 @@ def collect_cli_overrides(
     if block:
         raw_mapping["block"] = block
 
+    exclude_channels = [
+        channel.strip()
+        for value in params.get("arena_exclude_channel") or ()
+        for channel in value.split(",")
+        if channel.strip()
+    ]
+    if exclude_channels:
+        raw_mapping["exclude-channels"] = exclude_channels
+
     if not raw_mapping:
         return None
     return normalize_manifest_config(raw_mapping)
@@ -363,7 +383,12 @@ def can_resolve(target: str, context: dict[str, Any]) -> bool:
 
 
 def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | None:
-    from .arena import is_arena_block_url, is_arena_channel_url
+    from .arena import (
+        is_arena_block_url,
+        is_arena_channel_url,
+        is_arena_group_target,
+        is_arena_user_target,
+    )
 
     if is_arena_channel_url(target):
         return {
@@ -378,6 +403,20 @@ def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | No
             "kind": "block",
             "is_external": True,
             "group_key": "block",
+        }
+    if is_arena_user_target(target):
+        return {
+            "provider": PLUGIN_NAME,
+            "kind": "user",
+            "is_external": True,
+            "group_key": "user",
+        }
+    if is_arena_group_target(target):
+        return {
+            "provider": PLUGIN_NAME,
+            "kind": "group",
+            "is_external": True,
+            "group_key": "group",
         }
     return None
 
@@ -404,6 +443,7 @@ def _settings_key(settings: Any) -> tuple[Any, ...]:
         settings.include_pdf_content,
         settings.include_media_descriptions,
         recurse_key,
+        settings.exclude_channels.cache_key(),
     )
 
 
@@ -441,6 +481,255 @@ def _apply_channel_safety_defaults(
     )
 
 
+def _join_context_path(prefix: str | None, path: str) -> str:
+    if not prefix:
+        return path
+    return f"{prefix.strip('/')}/{path.lstrip('/')}"
+
+
+def _owner_targets(target: str) -> list[tuple[str, str]]:
+    from .arena import extract_group_slug, extract_profile_slug, extract_user_slug
+
+    profile_slug = extract_profile_slug(target)
+    if profile_slug is not None:
+        return [("user", profile_slug), ("group", profile_slug)]
+
+    user_slug = extract_user_slug(target)
+    if user_slug is not None:
+        return [("user", user_slug)]
+    group_slug = extract_group_slug(target)
+    if group_slug is not None:
+        return [("group", group_slug)]
+    return []
+
+
+def _owner_not_found(exc: ValueError, kind: str, slug: str) -> bool:
+    return f"Are.na resource not found: /{kind}s/{slug}/contents" in str(exc)
+
+
+def _fetch_owner_channels_for_target(
+    owners: list[tuple[str, str]],
+    *,
+    use_cache: bool,
+    cache_ttl: Any,
+    refresh_cache: bool,
+    settings: Any,
+) -> tuple[str, str, list[dict[str, Any]]] | None:
+    from .arena import fetch_owner_channels
+
+    last_missing: ValueError | None = None
+    for kind, slug in owners:
+        try:
+            return (
+                kind,
+                slug,
+                fetch_owner_channels(
+                    kind,
+                    slug,
+                    use_cache=use_cache,
+                    cache_ttl=cache_ttl,
+                    refresh_cache=refresh_cache,
+                    settings=settings,
+                ),
+            )
+        except ValueError as exc:
+            if len(owners) > 1 and _owner_not_found(exc, kind, slug):
+                last_missing = exc
+                continue
+            raise
+    if last_missing is not None:
+        raise last_missing
+    return None
+
+
+def _owner_context_prefix(kind: str, slug: str) -> str:
+    return f"{kind}s/{slug}"
+
+
+def _channel_target(slug: str) -> str:
+    return f"https://www.are.na/channel/{slug}"
+
+
+def _channel_documents(
+    *,
+    target: str,
+    slug: str,
+    settings: Any,
+    settings_key: tuple[Any, ...],
+    use_cache: bool,
+    cache_ttl: Any,
+    refresh_cache: bool,
+    context_prefix: str | None = None,
+) -> list[dict[str, Any]]:
+    from .arena import ArenaReference, resolve_channel, warmup_arena_network_stack
+
+    warmup_arena_network_stack()
+    channel_meta, flat_blocks = resolve_channel(
+        slug,
+        use_cache=use_cache,
+        cache_ttl=cache_ttl,
+        refresh_cache=refresh_cache,
+        settings=settings,
+    )
+    channel_block = dict(channel_meta) if isinstance(channel_meta, dict) else {}
+    channel_block.setdefault("type", "Channel")
+    channel_block.setdefault("base_type", "Channel")
+    channel_block.setdefault("slug", slug)
+    channel_ref = ArenaReference(
+        target,
+        block=channel_block,
+        format="raw",
+        inject=False,
+        include_descriptions=settings.include_descriptions,
+        include_comments=settings.include_comments,
+        include_link_image_descriptions=settings.include_link_image_descriptions,
+        include_pdf_content=settings.include_pdf_content,
+        include_media_descriptions=settings.include_media_descriptions,
+    )
+    channel_id = channel_block.get("id")
+    channel_dedupe = None
+    if channel_id is not None:
+        channel_dedupe = {
+            "mode": "canonical_symlink",
+            "key": f"arena-channel:{channel_id}:{settings_key}",
+            "rank": -1,
+        }
+    out: list[dict[str, Any]] = [
+        {
+            "source": target,
+            "label": channel_ref.get_label(),
+            "content": channel_ref.read(),
+            "metadata": {
+                "trace_path": channel_ref.trace_path,
+                "provider": PLUGIN_NAME,
+                "source_ref": "are.na",
+                "source_path": _join_context_path(context_prefix, slug),
+                "context_subpath": _join_context_path(
+                    context_prefix, f"{slug}/_channel.md"
+                ),
+                "source_created": channel_block.get("created_at"),
+                "source_modified": channel_block.get("updated_at"),
+                "dir_created": channel_block.get("created_at"),
+                "dir_modified": channel_block.get("updated_at"),
+                "settings_key": settings_key,
+                "hydrate_dedupe": channel_dedupe,
+            },
+        }
+    ]
+    for channel_path, block in flat_blocks:
+        block_type = block.get("type", "")
+        is_channel = block_type == "Channel" or block.get("base_type") == "Channel"
+        block_id = block.get("id")
+        ref = ArenaReference(
+            target,
+            block=block,
+            channel_path=channel_path,
+            format="raw",
+            inject=False,
+            include_descriptions=settings.include_descriptions,
+            include_comments=settings.include_comments,
+            include_link_image_descriptions=settings.include_link_image_descriptions,
+            include_pdf_content=settings.include_pdf_content,
+            include_media_descriptions=settings.include_media_descriptions,
+        )
+        ref_label = ref.get_label()
+        label = ref_label or str(block_id or "block")
+        channel_parts = [part for part in channel_path.split("/") if part]
+        if channel_parts and channel_parts[0] == slug:
+            channel_parts = channel_parts[1:]
+        channel_subdir = "/".join(channel_parts)
+        context_subpath = (
+            f"{slug}/{channel_subdir}/{label}.md"
+            if channel_subdir
+            else f"{slug}/{label}.md"
+        )
+        source_path = f"{slug}/{label}"
+        dedupe = None
+        if is_channel and block_id is not None:
+            dedupe = {
+                "mode": "canonical_symlink",
+                "key": f"arena-channel:{block_id}:{settings_key}",
+                "rank": len(channel_parts),
+            }
+        elif block_id is not None:
+            dedupe = {
+                "mode": "canonical_symlink",
+                "key": f"arena-block:{block_id}:{settings_key}",
+                "rank": len(channel_parts),
+            }
+        out.append(
+            {
+                "source": target,
+                "label": ref_label,
+                "content": ref.read(),
+                "metadata": {
+                    "trace_path": ref.trace_path,
+                    "provider": PLUGIN_NAME,
+                    "source_ref": "are.na",
+                    "source_path": _join_context_path(context_prefix, source_path),
+                    "context_subpath": _join_context_path(
+                        context_prefix, context_subpath
+                    ),
+                    "source_created": block.get("connected_at")
+                    or block.get("created_at"),
+                    "source_modified": block.get("updated_at"),
+                    "dir_created": channel_meta.get("created_at")
+                    if isinstance(channel_meta, dict)
+                    else None,
+                    "dir_modified": channel_meta.get("updated_at")
+                    if isinstance(channel_meta, dict)
+                    else None,
+                    "settings_key": settings_key,
+                    "hydrate_dedupe": dedupe,
+                },
+            }
+        )
+    return out
+
+
+def list_targets(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+    from .arena import (
+        build_arena_settings,
+        is_arena_block_url,
+        is_arena_channel_url,
+        warmup_arena_network_stack,
+    )
+
+    if is_arena_channel_url(target):
+        return [{"target": target, "kind": "channel"}]
+    if is_arena_block_url(target):
+        return [{"target": target, "kind": "block"}]
+
+    owners = _owner_targets(target)
+    if not owners:
+        return []
+    settings = build_arena_settings(_arena_overrides(context))
+    use_cache = bool(context.get("use_cache", True))
+    cache_ttl = context.get("cache_ttl")
+    refresh_cache = bool(context.get("refresh_cache", False))
+    warmup_arena_network_stack()
+    owner_channels = _fetch_owner_channels_for_target(
+        owners,
+        use_cache=use_cache,
+        cache_ttl=cache_ttl,
+        refresh_cache=refresh_cache,
+        settings=settings,
+    )
+    if owner_channels is None:
+        return []
+    kind, slug, channels = owner_channels
+    return [
+        {
+            "target": _channel_target(channel_slug),
+            "label": channel.get("title") or channel_slug,
+            "kind": "channel",
+            "metadata": {"owner_kind": kind, "owner_slug": slug},
+        }
+        for channel in channels
+        if isinstance((channel_slug := channel.get("slug")), str) and channel_slug
+    ]
+
+
 def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
     from .arena import (
         ArenaReference,
@@ -450,7 +739,6 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
         extract_channel_slug,
         is_arena_block_url,
         is_arena_channel_url,
-        resolve_channel,
         warmup_arena_network_stack,
     )
 
@@ -462,131 +750,55 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
     refresh_cache = bool(context.get("refresh_cache", False))
 
     out: list[dict[str, Any]] = []
+    owners = _owner_targets(target)
+    if owners:
+        settings = _apply_channel_safety_defaults(settings, arena_overrides)
+        settings_key = _settings_key(settings)
+        warmup_arena_network_stack()
+        owner_channels = _fetch_owner_channels_for_target(
+            owners,
+            use_cache=use_cache,
+            cache_ttl=cache_ttl,
+            refresh_cache=refresh_cache,
+            settings=settings,
+        )
+        if owner_channels is None:
+            return out
+        kind, owner_slug, channels = owner_channels
+        context_prefix = _owner_context_prefix(kind, owner_slug)
+        for channel in channels:
+            channel_slug = channel.get("slug")
+            if not isinstance(channel_slug, str) or not channel_slug:
+                continue
+            out.extend(
+                _channel_documents(
+                    target=target,
+                    slug=channel_slug,
+                    settings=settings,
+                    settings_key=settings_key,
+                    use_cache=use_cache,
+                    cache_ttl=cache_ttl,
+                    refresh_cache=refresh_cache,
+                    context_prefix=context_prefix,
+                )
+            )
+        return out
+
     if is_arena_channel_url(target):
         settings = _apply_channel_safety_defaults(settings, arena_overrides)
         settings_key = _settings_key(settings)
         slug = extract_channel_slug(target)
         if not slug:
             return out
-        warmup_arena_network_stack()
-        channel_meta, flat_blocks = resolve_channel(
-            slug,
+        return _channel_documents(
+            target=target,
+            slug=slug,
+            settings=settings,
+            settings_key=settings_key,
             use_cache=use_cache,
             cache_ttl=cache_ttl,
             refresh_cache=refresh_cache,
-            settings=settings,
         )
-        channel_block = dict(channel_meta) if isinstance(channel_meta, dict) else {}
-        channel_block.setdefault("type", "Channel")
-        channel_block.setdefault("base_type", "Channel")
-        channel_block.setdefault("slug", slug)
-        channel_ref = ArenaReference(
-            target,
-            block=channel_block,
-            format="raw",
-            inject=False,
-            include_descriptions=settings.include_descriptions,
-            include_comments=settings.include_comments,
-            include_link_image_descriptions=settings.include_link_image_descriptions,
-            include_pdf_content=settings.include_pdf_content,
-            include_media_descriptions=settings.include_media_descriptions,
-        )
-        channel_id = channel_block.get("id")
-        channel_dedupe = None
-        if channel_id is not None:
-            channel_dedupe = {
-                "mode": "canonical_symlink",
-                "key": f"arena-channel:{channel_id}:{settings_key}",
-                "rank": -1,
-            }
-        out.append(
-            {
-                "source": target,
-                "label": channel_ref.get_label(),
-                "content": channel_ref.read(),
-                "metadata": {
-                    "trace_path": channel_ref.trace_path,
-                    "provider": PLUGIN_NAME,
-                    "source_ref": "are.na",
-                    "source_path": slug,
-                    "context_subpath": f"{slug}/_channel.md",
-                    "source_created": channel_block.get("created_at"),
-                    "source_modified": channel_block.get("updated_at"),
-                    "dir_created": channel_block.get("created_at"),
-                    "dir_modified": channel_block.get("updated_at"),
-                    "settings_key": settings_key,
-                    "hydrate_dedupe": channel_dedupe,
-                },
-            }
-        )
-        for channel_path, block in flat_blocks:
-            block_type = block.get("type", "")
-            is_channel = block_type == "Channel" or block.get("base_type") == "Channel"
-            block_id = block.get("id")
-            label = ref_label = ""
-            ref = ArenaReference(
-                target,
-                block=block,
-                channel_path=channel_path,
-                format="raw",
-                inject=False,
-                include_descriptions=settings.include_descriptions,
-                include_comments=settings.include_comments,
-                include_link_image_descriptions=settings.include_link_image_descriptions,
-                include_pdf_content=settings.include_pdf_content,
-                include_media_descriptions=settings.include_media_descriptions,
-            )
-            ref_label = ref.get_label()
-            label = ref_label or str(block_id or "block")
-            channel_parts = [part for part in channel_path.split("/") if part]
-            if channel_parts and channel_parts[0] == slug:
-                channel_parts = channel_parts[1:]
-            channel_subdir = "/".join(channel_parts)
-            context_subpath = (
-                f"{slug}/{channel_subdir}/{label}.md"
-                if channel_subdir
-                else f"{slug}/{label}.md"
-            )
-            source_path = f"{slug}/{label}"
-            dedupe = None
-            if is_channel and block_id is not None:
-                dedupe = {
-                    "mode": "canonical_symlink",
-                    "key": f"arena-channel:{block_id}:{settings_key}",
-                    "rank": len(channel_parts),
-                }
-            elif block_id is not None:
-                dedupe = {
-                    "mode": "canonical_symlink",
-                    "key": f"arena-block:{block_id}:{settings_key}",
-                    "rank": len(channel_parts),
-                }
-            out.append(
-                {
-                    "source": target,
-                    "label": ref_label,
-                    "content": ref.read(),
-                    "metadata": {
-                        "trace_path": ref.trace_path,
-                        "provider": PLUGIN_NAME,
-                        "source_ref": "are.na",
-                        "source_path": source_path,
-                        "context_subpath": context_subpath,
-                        "source_created": block.get("connected_at")
-                        or block.get("created_at"),
-                        "source_modified": block.get("updated_at"),
-                        "dir_created": channel_meta.get("created_at")
-                        if isinstance(channel_meta, dict)
-                        else None,
-                        "dir_modified": channel_meta.get("updated_at")
-                        if isinstance(channel_meta, dict)
-                        else None,
-                        "settings_key": settings_key,
-                        "hydrate_dedupe": dedupe,
-                    },
-                }
-            )
-        return out
 
     if is_arena_block_url(target):
         block_id = extract_block_id(target)
