@@ -325,6 +325,16 @@ def _owner_contents_path(kind: Literal["user", "group"], slug: str) -> str:
     return f"/groups/{slug}/contents"
 
 
+def _owner_profile_path(kind: Literal["user", "group"], slug: str) -> str:
+    if kind == "user":
+        return f"/users/{slug}"
+    return f"/groups/{slug}"
+
+
+def _fetch_owner_profile(kind: Literal["user", "group"], slug: str) -> dict:
+    return _api_get(_owner_profile_path(kind, slug))
+
+
 def _fetch_owner_channel_page(
     kind: Literal["user", "group"],
     slug: str,
@@ -336,6 +346,19 @@ def _fetch_owner_channel_page(
     return _api_get(
         _owner_contents_path(kind, slug),
         {"page": page, "per": per, "type": "Channel", "sort": sort},
+    )
+
+
+def _fetch_user_groups_page(
+    slug: str,
+    page: int,
+    *,
+    per: int = 100,
+    sort: str = "name_asc",
+) -> dict:
+    return _api_get(
+        f"/users/{slug}/groups",
+        {"page": page, "per": per, "sort": sort},
     )
 
 
@@ -788,6 +811,79 @@ def _dedupe_channels(channels: list[dict]) -> list[dict]:
     return deduped
 
 
+def fetch_owner_profile(
+    kind: Literal["user", "group"],
+    slug: str,
+    *,
+    use_cache: bool = True,
+    cache_ttl: timedelta | None = None,
+    refresh_cache: bool = False,
+) -> dict:
+    cache_key = f"v1:owner-profile:{kind}:{slug}:auth={_auth_cache_partition()}"
+    if use_cache and not refresh_cache:
+        from contextualize.cache.arena import get_cached_channel
+
+        cached = get_cached_channel(cache_key, cache_ttl)
+        if cached is not None:
+            payload = json.loads(cached)
+            if isinstance(payload, dict):
+                return payload
+
+    profile = _fetch_owner_profile(kind, slug)
+
+    if use_cache:
+        from contextualize.cache.arena import store_channel
+
+        store_channel(
+            cache_key,
+            json.dumps(profile, ensure_ascii=False),
+            block_count=1,
+        )
+    return profile
+
+
+def fetch_user_groups(
+    slug: str,
+    *,
+    use_cache: bool = True,
+    cache_ttl: timedelta | None = None,
+    refresh_cache: bool = False,
+    sort: str = "name_asc",
+) -> list[dict]:
+    cache_key = f"v1:user-groups:{slug}:sort={sort}:auth={_auth_cache_partition()}"
+    if use_cache and not refresh_cache:
+        from contextualize.cache.arena import get_cached_channel
+
+        cached = get_cached_channel(cache_key, cache_ttl)
+        if cached is not None:
+            payload = json.loads(cached)
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)]
+
+    first_page = _fetch_user_groups_page(slug, 1, sort=sort)
+    groups = [
+        item for item in _channel_page_contents(first_page) if isinstance(item, dict)
+    ]
+    meta = first_page.get("meta", {})
+    total_pages = meta.get("total_pages", 1)
+    for page in range(2, total_pages + 1):
+        _log(f"  fetching user groups: {slug} page {page}/{total_pages}")
+        page_data = _fetch_user_groups_page(slug, page, sort=sort)
+        groups.extend(
+            item for item in _channel_page_contents(page_data) if isinstance(item, dict)
+        )
+
+    if use_cache:
+        from contextualize.cache.arena import store_channel
+
+        store_channel(
+            cache_key,
+            json.dumps(groups, ensure_ascii=False),
+            block_count=len(groups),
+        )
+    return groups
+
+
 def fetch_owner_channels(
     kind: Literal["user", "group"],
     slug: str,
@@ -1215,6 +1311,12 @@ def _format_channel_description(description: str) -> str:
     if "\n" in description:
         return f"Description:\n{description}"
     return f"Description: {description}"
+
+
+def _format_info_section(info: str) -> str:
+    if "\n" in info:
+        return f"Info:\n{info}"
+    return f"Info: {info}"
 
 
 def _format_comment_timestamp(iso_timestamp: str) -> str:
@@ -1793,6 +1895,84 @@ def _render_channel_stub(item: dict) -> str:
         parts.append(f"https://www.are.na/channel/{ch_slug}")
     if description:
         parts.append(_format_channel_description(description))
+    return "\n".join(parts)
+
+
+def _entity_display(entity: dict) -> str:
+    name = entity.get("name") or entity.get("username") or entity.get("slug")
+    if not isinstance(name, str) or not name.strip():
+        name = "Unknown"
+    slug = entity.get("slug")
+    if isinstance(slug, str) and slug.strip():
+        return f"{name.strip()} (@{slug.strip()})"
+    return name.strip()
+
+
+def _append_count_line(parts: list[str], label: str, counts: dict, key: str) -> None:
+    value = counts.get(key)
+    if value is not None and value != "":
+        parts.append(f"{label}: {value}")
+
+
+def _group_summary_line(group: dict) -> str:
+    parts = [_entity_display(group)]
+    owner = group.get("user") or group.get("owner")
+    if isinstance(owner, dict) and owner:
+        parts.append(f"Owner: {_entity_display(owner)}")
+    counts = group.get("counts") or {}
+    if isinstance(counts, dict):
+        channels = counts.get("channels")
+        users = counts.get("users")
+        if channels is not None and channels != "":
+            parts.append(f"Channels: {channels}")
+        if users is not None and users != "":
+            parts.append(f"Members: {users}")
+    return "- " + ", ".join(parts)
+
+
+def render_owner_profile(
+    kind: Literal["user", "group"],
+    profile: dict,
+    *,
+    user_groups: list[dict] | None = None,
+) -> str:
+    name = profile.get("name") or profile.get("slug") or "Untitled"
+    slug = profile.get("slug") or ""
+    bio = _extract_markdown_like_text(profile.get("bio") or "").strip()
+    created_at = _format_metadata_timestamp(profile.get("created_at"))
+    updated_at = _format_metadata_timestamp(profile.get("updated_at"))
+    counts = profile.get("counts") or {}
+    if not isinstance(counts, dict):
+        counts = {}
+
+    if kind == "user":
+        parts = [f"[User: {name}]"]
+        if created_at:
+            parts.append(f"Joined: {created_at}")
+        if updated_at:
+            parts.append(f"Modified: {updated_at}")
+        _append_count_line(parts, "Channels", counts, "channels")
+        _append_count_line(parts, "Followers", counts, "followers")
+        _append_count_line(parts, "Following", counts, "following")
+    else:
+        parts = [f"[Group: {name}]"]
+        owner = profile.get("user") or profile.get("owner")
+        if isinstance(owner, dict) and owner:
+            parts.append(f"Owner: {_entity_display(owner)}")
+        _append_count_line(parts, "Channels", counts, "channels")
+        _append_count_line(parts, "Members", counts, "users")
+        if created_at:
+            parts.append(f"Created: {created_at}")
+        if updated_at:
+            parts.append(f"Modified: {updated_at}")
+
+    if isinstance(slug, str) and slug.strip():
+        parts.append(f"https://www.are.na/{slug.strip()}")
+    if bio:
+        parts.append(_format_info_section(bio))
+    if kind == "user" and user_groups:
+        parts.append("Groups:")
+        parts.extend(_group_summary_line(group) for group in user_groups)
     return "\n".join(parts)
 
 
