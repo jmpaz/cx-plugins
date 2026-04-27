@@ -5,6 +5,7 @@ import math
 import os
 import re
 import sys
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -21,6 +22,12 @@ _ARENA_CHANNEL_RE = re.compile(
     r"|(?P<user>[^/?#]+)/(?P<slug2>[^/?#]+))$"
 )
 _ARENA_BLOCK_RE = re.compile(r"^https?://(?:www\.)?are\.na/block/(?P<id>\d+)$")
+_ARENA_USER_TARGET_RE = re.compile(r"^arena:user:(?P<slug>[^/?#]+)$")
+_ARENA_GROUP_TARGET_RE = re.compile(r"^arena:group:(?P<slug>[^/?#]+)$")
+_ARENA_PROFILE_URL_RE = re.compile(r"^https?://(?:www\.)?are\.na/(?P<slug>[^/?#]+)$")
+_ARENA_GROUP_URL_RE = re.compile(
+    r"^https?://(?:www\.)?are\.na/groups?/(?P<slug>[^/?#]+)$"
+)
 
 _API_BASE = "https://api.are.na/v3"
 
@@ -51,12 +58,23 @@ _RESERVED_PATHS = frozenset(
         "block",
         "channel",
         "api",
+        "developer",
+        "developers",
+        "group",
+        "groups",
+        "user",
+        "users",
     }
 )
 
 
 def is_arena_url(url: str) -> bool:
-    return is_arena_channel_url(url) or is_arena_block_url(url)
+    return (
+        is_arena_channel_url(url)
+        or is_arena_block_url(url)
+        or is_arena_user_target(url)
+        or is_arena_group_target(url)
+    )
 
 
 def is_arena_channel_url(url: str) -> bool:
@@ -71,6 +89,14 @@ def is_arena_channel_url(url: str) -> bool:
 
 def is_arena_block_url(url: str) -> bool:
     return bool(_ARENA_BLOCK_RE.match(url))
+
+
+def is_arena_user_target(target: str) -> bool:
+    return extract_user_slug(target) is not None
+
+
+def is_arena_group_target(target: str) -> bool:
+    return extract_group_slug(target) is not None
 
 
 @lru_cache(maxsize=1)
@@ -98,6 +124,36 @@ def extract_block_id(url: str) -> int | None:
     if not match:
         return None
     return int(match.group("id"))
+
+
+def extract_user_slug(target: str) -> str | None:
+    match = _ARENA_USER_TARGET_RE.match(target)
+    if match:
+        return match.group("slug")
+    return extract_profile_slug(target)
+
+
+def extract_group_slug(target: str) -> str | None:
+    match = _ARENA_GROUP_TARGET_RE.match(target)
+    if match:
+        return match.group("slug")
+    match = _ARENA_GROUP_URL_RE.match(target)
+    if not match:
+        return None
+    slug = match.group("slug")
+    if slug.lower() in _RESERVED_PATHS:
+        return None
+    return slug
+
+
+def extract_profile_slug(target: str) -> str | None:
+    match = _ARENA_PROFILE_URL_RE.match(target)
+    if not match:
+        return None
+    slug = match.group("slug")
+    if slug.lower() in _RESERVED_PATHS:
+        return None
+    return slug
 
 
 def _load_dotenv() -> None:
@@ -129,6 +185,14 @@ def _resolve_arena_access_token() -> str | None:
     if cached:
         return cached
     return None
+
+
+def _auth_cache_partition() -> str:
+    token = _resolve_arena_access_token()
+    if not token:
+        return "guest"
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    return f"auth:{digest}"
 
 
 def _api_timeout_seconds() -> float:
@@ -253,6 +317,26 @@ def _fetch_channel(slug: str) -> dict:
 
 def _fetch_channel_page(slug: str, page: int, per: int = 100) -> dict:
     return _api_get(f"/channels/{slug}/contents", {"page": page, "per": per})
+
+
+def _owner_contents_path(kind: Literal["user", "group"], slug: str) -> str:
+    if kind == "user":
+        return f"/users/{slug}/contents"
+    return f"/groups/{slug}/contents"
+
+
+def _fetch_owner_channel_page(
+    kind: Literal["user", "group"],
+    slug: str,
+    page: int,
+    *,
+    per: int = 100,
+    sort: str = "created_at_asc",
+) -> dict:
+    return _api_get(
+        _owner_contents_path(kind, slug),
+        {"page": page, "per": per, "type": "Channel", "sort": sort},
+    )
 
 
 def _get_max_depth() -> int:
@@ -409,6 +493,71 @@ def _get_recurse_blocks() -> ArenaRecurseBlockLimit | None:
     return parse_arena_recurse_blocks(raw)
 
 
+@dataclass(frozen=True)
+class ArenaChannelExclusions:
+    ids: frozenset[int] = field(default_factory=frozenset)
+    slugs: frozenset[str] = field(default_factory=frozenset)
+
+    def matches(self, channel: dict) -> bool:
+        channel_id = channel.get("id")
+        if isinstance(channel_id, int) and channel_id in self.ids:
+            return True
+        slug = channel.get("slug")
+        return isinstance(slug, str) and slug.lower() in self.slugs
+
+    def cache_key(self) -> str:
+        ids = ",".join(str(value) for value in sorted(self.ids))
+        slugs = ",".join(sorted(self.slugs))
+        return f"ids={ids}:slugs={slugs}"
+
+
+def _split_channel_selector_values(raw: str) -> list[str]:
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _channel_selector_from_value(value: object) -> tuple[int | None, str | None]:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value, None
+    if not isinstance(value, str):
+        raise ValueError("Are.na excluded channels must be strings or integers")
+    text = value.strip()
+    if not text:
+        return None, None
+    if text.isdigit():
+        return int(text), None
+    slug = extract_channel_slug(text)
+    if slug is not None:
+        return None, slug.lower()
+    return None, text.lower()
+
+
+def parse_arena_channel_exclusions(raw: Any) -> ArenaChannelExclusions:
+    ids: set[int] = set()
+    slugs: set[str] = set()
+    if isinstance(raw, ArenaChannelExclusions):
+        return raw
+    if raw is None or raw == "":
+        return ArenaChannelExclusions()
+    if isinstance(raw, str):
+        values: list[object] = _split_channel_selector_values(raw)
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        values = list(raw)
+    else:
+        values = [raw]
+
+    for value in values:
+        channel_id, slug = _channel_selector_from_value(value)
+        if channel_id is not None:
+            ids.add(channel_id)
+        if slug is not None:
+            slugs.add(slug)
+    return ArenaChannelExclusions(frozenset(ids), frozenset(slugs))
+
+
+def _get_exclude_channels() -> ArenaChannelExclusions:
+    return parse_arena_channel_exclusions(os.environ.get("ARENA_EXCLUDE_CHANNELS"))
+
+
 def _parse_iso_datetime(value: str) -> datetime | None:
     return parse_timestamp_or_duration(value)
 
@@ -484,6 +633,9 @@ class ArenaSettings:
     include_pdf_content: bool = False
     include_media_descriptions: bool = True
     recurse_users: set[str] | None = field(default_factory=lambda: {"self"})
+    exclude_channels: ArenaChannelExclusions = field(
+        default_factory=ArenaChannelExclusions
+    )
     connected_after: datetime | None = None
     connected_before: datetime | None = None
     created_after: datetime | None = None
@@ -503,6 +655,7 @@ def _arena_settings_from_env() -> ArenaSettings:
         include_pdf_content=_get_include_pdf_content(),
         include_media_descriptions=_get_include_media_descriptions(),
         recurse_users=_get_recurse_users(),
+        exclude_channels=_get_exclude_channels(),
         connected_after=_get_window_bound("ARENA_CONNECTED_AFTER"),
         connected_before=_get_window_bound("ARENA_CONNECTED_BEFORE"),
         created_after=_get_window_bound("ARENA_CREATED_AFTER"),
@@ -555,6 +708,9 @@ def build_arena_settings(overrides: dict | None = None) -> ArenaSettings:
         "include_media_descriptions", env.include_media_descriptions
     )
     recurse_users = overrides.get("recurse_users", env.recurse_users)
+    exclude_channels = parse_arena_channel_exclusions(
+        overrides.get("exclude_channels", env.exclude_channels)
+    )
     connected_after = _normalize_optional_datetime_override(
         overrides.get("connected_after", env.connected_after)
     )
@@ -579,6 +735,7 @@ def build_arena_settings(overrides: dict | None = None) -> ArenaSettings:
         include_pdf_content=include_pdf_content,
         include_media_descriptions=include_media_descriptions,
         recurse_users=recurse_users,
+        exclude_channels=exclude_channels,
         connected_after=connected_after,
         connected_before=connected_before,
         created_after=created_after,
@@ -612,6 +769,77 @@ def _should_recurse(
 
 def _channel_page_contents(page_data: dict) -> list[dict]:
     return list(page_data.get("data", page_data.get("contents", [])))
+
+
+def _is_channel_item(item: dict) -> bool:
+    return item.get("base_type") == "Channel" or item.get("type") == "Channel"
+
+
+def _dedupe_channels(channels: list[dict]) -> list[dict]:
+    deduped: list[dict] = []
+    seen: set[str] = set()
+    for channel in channels:
+        identity = _block_identity(channel)
+        if identity is not None:
+            if identity in seen:
+                continue
+            seen.add(identity)
+        deduped.append(channel)
+    return deduped
+
+
+def fetch_owner_channels(
+    kind: Literal["user", "group"],
+    slug: str,
+    *,
+    use_cache: bool = True,
+    cache_ttl: timedelta | None = None,
+    refresh_cache: bool = False,
+    settings: ArenaSettings | None = None,
+    sort: str = "created_at_asc",
+) -> list[dict]:
+    if settings is None:
+        settings = _arena_settings_from_env()
+    cache_key = (
+        f"v1:owner-channels:{kind}:{slug}:sort={sort}:"
+        f"auth={_auth_cache_partition()}:exclude={settings.exclude_channels.cache_key()}"
+    )
+    if use_cache and not refresh_cache:
+        from contextualize.cache.arena import get_cached_channel
+
+        cached = get_cached_channel(cache_key, cache_ttl)
+        if cached is not None:
+            payload = json.loads(cached)
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)]
+
+    first_page = _fetch_owner_channel_page(kind, slug, 1, sort=sort)
+    channels = [
+        item
+        for item in _channel_page_contents(first_page)
+        if _is_channel_item(item) and not settings.exclude_channels.matches(item)
+    ]
+    meta = first_page.get("meta", {})
+    total_pages = meta.get("total_pages", 1)
+    for page in range(2, total_pages + 1):
+        _log(f"  fetching {kind} channels: {slug} page {page}/{total_pages}")
+        page_data = _fetch_owner_channel_page(kind, slug, page, sort=sort)
+        channels.extend(
+            item
+            for item in _channel_page_contents(page_data)
+            if _is_channel_item(item) and not settings.exclude_channels.matches(item)
+        )
+    channels = _dedupe_channels(channels)
+
+    if use_cache:
+        from contextualize.cache.arena import store_channel
+
+        store_channel(
+            cache_key,
+            json.dumps(channels, ensure_ascii=False),
+            block_count=len(channels),
+        )
+    return channels
 
 
 def _has_time_window(settings: ArenaSettings | None) -> bool:
@@ -800,6 +1028,16 @@ def _fetch_all_channel_contents(
         and count_before_limit > effective_max_blocks
     ):
         metadata["_contextualize_sampled_by_recurse_blocks"] = True
+
+    if _time_window_settings is not None:
+        all_contents = [
+            item
+            for item in all_contents
+            if not (
+                _is_channel_item(item)
+                and _time_window_settings.exclude_channels.matches(item)
+            )
+        ]
 
     if _depth < max_depth:
         expanded: list[dict] = []
@@ -1781,6 +2019,8 @@ def resolve_channel(
         str(max_blocks_per_channel) if max_blocks_per_channel is not None else "all"
     )
     rb_key = recurse_blocks.cache_key() if recurse_blocks is not None else "none"
+    auth_key = _auth_cache_partition()
+    exclude_key = settings.exclude_channels.cache_key()
     ca_key = (
         settings.connected_after.isoformat() if settings.connected_after else "none"
     )
@@ -1791,7 +2031,8 @@ def resolve_channel(
     crb_key = settings.created_before.isoformat() if settings.created_before else "none"
     cache_key = (
         f"v3:{slug}:d={max_depth}:u={ru_key}:s={sort_order}:m={mb_key}:rb={rb_key}:"
-        f"ca={ca_key}:cb={cb_key}:cra={cra_key}:crb={crb_key}"
+        f"ca={ca_key}:cb={cb_key}:cra={cra_key}:crb={crb_key}:"
+        f"auth={auth_key}:exclude={exclude_key}"
     )
 
     if use_cache and not refresh_cache:
