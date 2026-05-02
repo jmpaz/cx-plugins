@@ -302,7 +302,7 @@ def test_get_transcript_passes_transcription_cache_flags(
     transcript, source = ytdlp.YtDlpReference._get_transcript(ref, 0)
 
     assert transcript == "transcript"
-    assert source == "whisper"
+    assert source == "transcription"
     assert captured == {
         "path": audio_path,
         "use_cache": False,

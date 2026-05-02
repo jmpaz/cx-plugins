@@ -55,36 +55,35 @@ def build_openai_provider() -> TranscriptionProvider:
 def _is_openai_available() -> bool:
     load_dotenv_optional()
     return bool(
-        (os.environ.get("WHISPER_API_BASE") or "").strip()
-        or (os.environ.get("WHISPER_URL") or "").strip()
-        or (os.environ.get("WHISPER_API_KEY") or "").strip()
+        (os.environ.get("OPENAI_TRANSCRIPTION_API_BASE") or "").strip()
+        or (os.environ.get("OPENAI_TRANSCRIPTION_URL") or "").strip()
+        or (os.environ.get("OPENAI_TRANSCRIPTION_API_KEY") or "").strip()
     )
 
 
 def _openai_endpoint() -> str:
     load_dotenv_optional()
-    direct = (os.environ.get("WHISPER_URL") or "").strip()
+    direct = (os.environ.get("OPENAI_TRANSCRIPTION_URL") or "").strip()
     if direct:
         return direct
-    api_base = (os.environ.get("WHISPER_API_BASE") or "").strip()
+    api_base = (os.environ.get("OPENAI_TRANSCRIPTION_API_BASE") or "").strip()
     if not api_base:
         return "https://api.openai.com/v1/audio/transcriptions"
     return f"{api_base.rstrip('/')}/audio/transcriptions"
 
 
-def _openai_model() -> str:
+def _openai_model(request: TranscriptionRequest | None = None) -> str | None:
+    if request is not None and request.model:
+        return request.model
     load_dotenv_optional()
-    for env_name in ("WHISPER_MODEL", "WHISPER_MODEL_SHORT"):
-        value = (os.environ.get(env_name) or "").strip()
-        if value:
-            return value
-    return "whisper-1"
+    value = (os.environ.get("OPENAI_TRANSCRIPTION_MODEL") or "").strip()
+    return value or None
 
 
 def _openai_auth_headers() -> dict[str, str]:
     load_dotenv_optional()
     headers: dict[str, str] = {}
-    api_key = (os.environ.get("WHISPER_API_KEY") or "").strip()
+    api_key = (os.environ.get("OPENAI_TRANSCRIPTION_API_KEY") or "").strip()
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     return headers
@@ -110,7 +109,7 @@ def _openai_model_endpoint(model: str) -> str | None:
 
 def _chunk_seconds_cache_component() -> str:
     load_dotenv_optional()
-    value = (os.environ.get("WHISPER_CHUNK_SECONDS") or "").strip()
+    value = (os.environ.get("OPENAI_TRANSCRIPTION_CHUNK_SECONDS") or "").strip()
     return value or "25"
 
 
@@ -151,7 +150,7 @@ def _extract_transcription_text(payload: object) -> str:
 
 def _merge_prompt(request_prompt: str) -> str:
     load_dotenv_optional()
-    env_prompt = (os.environ.get("WHISPER_PROMPT") or "").strip()
+    env_prompt = (os.environ.get("OPENAI_TRANSCRIPTION_PROMPT") or "").strip()
     parts = [part for part in (env_prompt, request_prompt.strip()) if part]
     return "\n\n".join(parts)
 
@@ -159,10 +158,12 @@ def _merge_prompt(request_prompt: str) -> str:
 def _transcribe_openai(request: TranscriptionRequest) -> TranscriptionResult:
     if not _is_openai_available():
         raise TranscriptionProviderUnavailableError(
-            "OpenAI-compatible transcription requires WHISPER_API_BASE, WHISPER_URL, or WHISPER_API_KEY"
+            "OpenAI-compatible transcription requires OPENAI_TRANSCRIPTION_API_BASE, "
+            "OPENAI_TRANSCRIPTION_URL, or OPENAI_TRANSCRIPTION_API_KEY"
         )
 
     content_type = request.content_type or _guess_audio_content_type(request.filename)
+    model = _openai_model(request)
     merged_prompt = _merge_prompt(request.prompt)
     try:
         text = _transcribe_openai_once_with_model_repair(
@@ -170,6 +171,7 @@ def _transcribe_openai(request: TranscriptionRequest) -> TranscriptionResult:
             filename=request.filename,
             content_type=content_type,
             timeout=request.timeout,
+            model=model,
             language=request.language,
             prompt=merged_prompt,
         )
@@ -180,10 +182,15 @@ def _transcribe_openai(request: TranscriptionRequest) -> TranscriptionResult:
             request.data,
             filename=request.filename,
             timeout=request.timeout,
+            model=model,
             language=request.language,
             prompt=merged_prompt,
         )
-    return TranscriptionResult(text=text, model=_openai_model(), provider="openai")
+    return TranscriptionResult(
+        text=text,
+        model=model or "server-default",
+        provider="openai",
+    )
 
 
 def _transcribe_openai_once_with_model_repair(
@@ -192,6 +199,7 @@ def _transcribe_openai_once_with_model_repair(
     filename: str,
     content_type: str,
     timeout: float,
+    model: str | None,
     language: str | None,
     prompt: str,
 ) -> str:
@@ -201,13 +209,15 @@ def _transcribe_openai_once_with_model_repair(
             filename=filename,
             content_type=content_type,
             timeout=timeout,
+            model=model,
             language=language,
             prompt=prompt,
         )
     except TranscriptionProviderError as exc:
         if not _should_recreate_model_after_error(exc):
             raise
-        model = _openai_model()
+        if model is None:
+            raise
         try:
             _recreate_openai_model(model, timeout=timeout)
         except TranscriptionProviderError as refresh_exc:
@@ -221,6 +231,7 @@ def _transcribe_openai_once_with_model_repair(
             filename=filename,
             content_type=content_type,
             timeout=timeout,
+            model=model,
             language=language,
             prompt=prompt,
         )
@@ -232,6 +243,7 @@ def _transcribe_openai_once(
     filename: str,
     content_type: str,
     timeout: float,
+    model: str | None,
     language: str | None,
     prompt: str,
 ) -> str:
@@ -239,10 +251,9 @@ def _transcribe_openai_once(
     endpoint = _openai_endpoint()
     headers = _openai_auth_headers()
 
-    form_data: dict[str, str] = {
-        "model": _openai_model(),
-        "response_format": "verbose_json",
-    }
+    form_data: dict[str, str] = {"response_format": "verbose_json"}
+    if model:
+        form_data["model"] = model
     if language:
         form_data["language"] = language
     if prompt:
@@ -291,7 +302,8 @@ def _recreate_openai_model(model: str, *, timeout: float) -> None:
     model_endpoint = _openai_model_endpoint(model)
     if model_endpoint is None:
         raise TranscriptionProviderError(
-            "could not derive a /models endpoint from WHISPER_URL or WHISPER_API_BASE"
+            "could not derive a /models endpoint from OPENAI_TRANSCRIPTION_URL or "
+            "OPENAI_TRANSCRIPTION_API_BASE"
         )
 
     headers = _openai_auth_headers()
@@ -333,6 +345,7 @@ def _transcribe_audio_in_chunks(
     *,
     filename: str,
     timeout: float,
+    model: str | None,
     language: str | None,
     prompt: str,
 ) -> str:
@@ -382,6 +395,7 @@ def _transcribe_audio_in_chunks(
                 filename=chunk_path.name,
                 content_type="audio/wav",
                 timeout=timeout,
+                model=model,
                 language=language,
                 prompt=prompt,
             ).strip()
@@ -391,16 +405,18 @@ def _transcribe_audio_in_chunks(
 
 
 def _get_chunk_seconds() -> int:
-    raw = os.environ.get("WHISPER_CHUNK_SECONDS", "25")
+    raw = os.environ.get("OPENAI_TRANSCRIPTION_CHUNK_SECONDS", "25")
     try:
         value = int(raw)
     except ValueError:
         raise TranscriptionProviderError(
-            f"Invalid WHISPER_CHUNK_SECONDS value: {raw!r}. Expected a positive integer."
+            f"Invalid OPENAI_TRANSCRIPTION_CHUNK_SECONDS value: {raw!r}. "
+            "Expected a positive integer."
         ) from None
     if value <= 0:
         raise TranscriptionProviderError(
-            f"Invalid WHISPER_CHUNK_SECONDS value: {raw!r}. Expected a positive integer."
+            f"Invalid OPENAI_TRANSCRIPTION_CHUNK_SECONDS value: {raw!r}. "
+            "Expected a positive integer."
         )
     return value
 
@@ -412,7 +428,7 @@ def _openai_cache_identity(request: TranscriptionRequest) -> dict[str, object]:
     return {
         "provider": "openai",
         "endpoint": _openai_endpoint(),
-        "model": _openai_model(),
+        "model": _openai_model(request),
         "chunk_seconds": _chunk_seconds_cache_component(),
         "language": request.language,
         "prompt_hash": prompt_hash,

@@ -462,7 +462,7 @@ class YtDlpReference:
                 refresh_cache=self.refresh_cache,
                 plugin_overrides=self.plugin_overrides,
             )
-            return transcript, "whisper"
+            return transcript, "transcription"
         finally:
             if audio_path and audio_path.exists():
                 shutil.rmtree(audio_path.parent, ignore_errors=True)

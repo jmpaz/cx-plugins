@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from cx_plugins.providers.transcribe.plugin import (
     collect_cli_overrides,
     get_transcription_providers,
@@ -7,10 +9,11 @@ from cx_plugins.providers.transcribe.plugin import (
 )
 
 
-def test_normalize_manifest_config_supports_provider_aliases() -> None:
+def test_normalize_manifest_config_supports_transcription_model() -> None:
     normalized = normalize_manifest_config(
         {
-            "provider": "whisper",
+            "provider": "openai",
+            "model": "cohere",
             "language": "ES",
             "priorities": {"mistral": 300},
             "prompt": ["names", "places"],
@@ -24,6 +27,7 @@ def test_normalize_manifest_config_supports_provider_aliases() -> None:
 
     assert normalized == {
         "provider": "openai",
+        "model": "cohere",
         "language": "es",
         "priorities": {"mistral": 300},
         "prompt_parts": ["names", "places"],
@@ -35,11 +39,17 @@ def test_normalize_manifest_config_supports_provider_aliases() -> None:
     }
 
 
+def test_normalize_manifest_config_rejects_whisper_provider() -> None:
+    with pytest.raises(ValueError, match="unsupported transcription provider"):
+        normalize_manifest_config({"provider": "whisper"})
+
+
 def test_collect_cli_overrides_builds_transcribe_mapping() -> None:
     overrides = collect_cli_overrides(
         "cat",
         {
             "transcribe_provider": "mistral",
+            "transcribe_model": "cohere",
             "transcribe_language": "es",
             "transcribe_priority": ("openai=10", "mistral=500"),
             "transcribe_prompt": ("names",),
@@ -53,6 +63,7 @@ def test_collect_cli_overrides_builds_transcribe_mapping() -> None:
 
     assert overrides == {
         "provider": "mistral",
+        "model": "cohere",
         "language": "es",
         "priorities": {"openai": 10, "mistral": 500},
         "prompt_parts": ["names"],

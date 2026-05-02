@@ -18,7 +18,6 @@ _PROVIDER_ALIASES = {
     "auto": "auto",
     "mistral": "mistral",
     "openai": "openai",
-    "whisper": "openai",
 }
 
 
@@ -37,6 +36,15 @@ def _normalize_provider_name(raw: Any, *, allow_auto: bool = True) -> str | None
     if normalized == "auto" and not allow_auto:
         return None
     return normalized
+
+
+def _coerce_model(raw: Any) -> str | None:
+    if raw in (None, ""):
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("model must be a string")
+    model = raw.strip()
+    return model or None
 
 
 def _coerce_prompt_parts(raw: Any) -> list[str]:
@@ -138,9 +146,18 @@ def normalize_manifest_config(
         raise ValueError("transcribe config must be a mapping")
 
     normalized: dict[str, Any] = {}
-    provider = _normalize_provider_name(raw_config.get("provider"))
+    raw_provider = raw_config.get("provider")
+    if isinstance(raw_provider, str) and not raw_provider.strip():
+        raw_provider = None
+    provider = _normalize_provider_name(raw_provider)
+    if raw_provider not in (None, "") and provider is None:
+        raise ValueError(f"unsupported transcription provider {raw_provider!r}")
     if provider:
         normalized["provider"] = provider
+
+    model = _coerce_model(raw_config.get("model"))
+    if model:
+        normalized["model"] = model
 
     language = _coerce_language(raw_config.get("language"))
     if language:
@@ -199,9 +216,17 @@ def register_cli_options(command_name: str, command: click.Command) -> None:
         command,
         click.Option(
             ["--transcribe-provider"],
-            type=click.Choice(["auto", "openai", "whisper", "mistral"]),
+            type=click.Choice(["auto", "openai", "mistral"]),
             default="auto",
             help="Choose the transcription provider for audio/video inputs.",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--transcribe-model"],
+            default=None,
+            help="Set the transcription model; omit to use the provider or server default.",
         ),
     )
     _append_option(
@@ -301,6 +326,7 @@ def collect_cli_overrides(
     if command_name not in {"cat", "hydrate"}:
         return None
     provider = _normalize_provider_name(params.get("transcribe_provider"))
+    model = _coerce_model(params.get("transcribe_model"))
     language = _coerce_language(params.get("transcribe_language"))
     priorities = _parse_priority_items(params.get("transcribe_priority") or ())
     prompt_parts = [
@@ -321,6 +347,8 @@ def collect_cli_overrides(
     raw_mapping: dict[str, Any] = {}
     if provider:
         raw_mapping["provider"] = provider
+    if model:
+        raw_mapping["model"] = model
     if language:
         raw_mapping["language"] = language
     if priorities:

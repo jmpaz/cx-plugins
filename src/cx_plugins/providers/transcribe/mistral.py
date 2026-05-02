@@ -43,7 +43,9 @@ def _mistral_endpoint() -> str:
     return value or "https://api.mistral.ai/v1/audio/transcriptions"
 
 
-def _mistral_model() -> str:
+def _mistral_model(request: TranscriptionRequest | None = None) -> str:
+    if request is not None and request.model:
+        return request.model
     load_dotenv_optional()
     value = (os.environ.get("MISTRAL_MODEL") or "").strip()
     return value or "voxtral-mini-latest"
@@ -123,7 +125,8 @@ def _transcribe_mistral(request: TranscriptionRequest) -> TranscriptionResult:
             "Mistral transcription requires MISTRAL_API_KEY"
         )
 
-    data = {"model": _mistral_model()}
+    model = _mistral_model(request)
+    data = {"model": model}
     if request.language:
         data["language"] = request.language
     else:
@@ -169,7 +172,7 @@ def _transcribe_mistral(request: TranscriptionRequest) -> TranscriptionResult:
         if diarized:
             return TranscriptionResult(
                 text=diarized,
-                model=_mistral_model(),
+                model=model,
                 provider="mistral",
             )
 
@@ -177,7 +180,7 @@ def _transcribe_mistral(request: TranscriptionRequest) -> TranscriptionResult:
     text = "\n\n".join(segments) if segments else ""
     if not text:
         raise TranscriptionProviderError("Mistral transcription returned no text")
-    return TranscriptionResult(text=text, model=_mistral_model(), provider="mistral")
+    return TranscriptionResult(text=text, model=model, provider="mistral")
 
 
 def _mistral_cache_identity(request: TranscriptionRequest) -> dict[str, object]:
@@ -186,7 +189,7 @@ def _mistral_cache_identity(request: TranscriptionRequest) -> dict[str, object]:
     return {
         "provider": "mistral",
         "endpoint": _mistral_endpoint(),
-        "model": _mistral_model(),
+        "model": _mistral_model(request),
         "language": request.language,
         "prompt_hash": prompt_hash,
         "bias_hash": bias_hash,
