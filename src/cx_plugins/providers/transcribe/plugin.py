@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 import click
+from click.shell_completion import CompletionItem
 
 from .gate import build_pyannote_gate
 from .mistral import build_mistral_provider
@@ -209,6 +210,30 @@ def _append_option(command: click.Command, option: click.Option) -> None:
     command.params.append(option)
 
 
+def _complete_transcribe_model(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[CompletionItem]:
+    del ctx, param
+    from .openai import list_openai_model_options
+
+    return [
+        CompletionItem(model)
+        for model in list_openai_model_options(incomplete.strip())
+    ]
+
+
+class TranscribeModelOption(click.Option):
+    def make_metavar(self, ctx: click.Context) -> str:
+        from .openai import list_openai_model_options
+
+        models = list_openai_model_options()
+        if models:
+            return f"[{'|'.join(models)}]"
+        return super().make_metavar(ctx)
+
+
 def register_cli_options(command_name: str, command: click.Command) -> None:
     if command_name not in {"cat", "hydrate"}:
         return
@@ -223,9 +248,10 @@ def register_cli_options(command_name: str, command: click.Command) -> None:
     )
     _append_option(
         command,
-        click.Option(
+        TranscribeModelOption(
             ["--transcribe-model"],
             default=None,
+            shell_complete=_complete_transcribe_model,
             help="Set the transcription model; omit to use the provider or server default.",
         ),
     )

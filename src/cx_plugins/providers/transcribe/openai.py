@@ -42,6 +42,12 @@ def _requests_delete(*args: object, **kwargs: object):
     return requests.delete(*args, **kwargs)
 
 
+def _requests_get(*args: object, **kwargs: object):
+    import requests
+
+    return requests.get(*args, **kwargs)
+
+
 def build_openai_provider() -> TranscriptionProvider:
     return TranscriptionProvider(
         name="openai",
@@ -105,6 +111,61 @@ def _openai_model_endpoint(model: str) -> str | None:
                 )
             )
     return None
+
+
+def _openai_models_endpoint() -> str | None:
+    endpoint = _openai_endpoint()
+    split = urlsplit(endpoint)
+    path = split.path.rstrip("/")
+    for suffix in ("/audio/transcriptions", "/audio/translations"):
+        if path.endswith(suffix):
+            base_path = path[: -len(suffix)]
+            return urlunsplit(
+                split._replace(
+                    path=f"{base_path}/models",
+                    query="",
+                    fragment="",
+                )
+            )
+    return None
+
+
+def list_openai_model_options(incomplete: str = "") -> list[str]:
+    if not _is_openai_available():
+        return []
+    endpoint = _openai_models_endpoint()
+    if endpoint is None:
+        return []
+    try:
+        response = _requests_get(
+            endpoint,
+            headers=_openai_auth_headers(),
+            timeout=1.0,
+        )
+        if response.status_code >= 400:
+            return []
+        payload = response.json()
+    except Exception:
+        return []
+    options: set[str] = set()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        for key in ("id", "model_id"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                options.add(value.strip())
+        aliases = item.get("aliases")
+        if isinstance(aliases, list):
+            options.update(
+                value.strip()
+                for value in aliases
+                if isinstance(value, str) and value.strip()
+            )
+    return sorted(value for value in options if value.startswith(incomplete))
 
 
 def _chunk_seconds_cache_component() -> str:

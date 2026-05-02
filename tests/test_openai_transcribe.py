@@ -296,6 +296,42 @@ def test_openai_provider_sends_env_model_when_request_omits_model(
     }
 
 
+def test_openai_provider_lists_configured_server_models(
+    openai_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _get(url: str, **kwargs: object) -> _Response:
+        captured["url"] = url
+        return _Response(
+            200,
+            payload={
+                "object": "list",
+                "data": [
+                    {
+                        "id": "cohere",
+                        "model_id": "CohereLabs/cohere-transcribe-03-2026",
+                        "aliases": ["cohere-transcribe"],
+                    },
+                    {
+                        "id": "distilwhisper",
+                        "model_id": "distil-whisper/distil-large-v3",
+                        "aliases": ["distil-whisper/distil-large-v3"],
+                    },
+                ],
+            },
+        )
+
+    monkeypatch.setattr(openai, "_requests_get", _get)
+
+    assert openai.list_openai_model_options("distil") == [
+        "distil-whisper/distil-large-v3",
+        "distilwhisper",
+    ]
+    assert captured["url"] == "http://localhost:9001/v1/models"
+
+
 def test_openai_cache_identity_varies_by_model(openai_env: None) -> None:
     provider = openai.build_openai_provider()
     first = TranscriptionRequest(
