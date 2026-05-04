@@ -261,6 +261,128 @@ def test_openai_provider_sends_explicit_model(
     }
 
 
+def test_openai_provider_sends_diarization_context_and_hotwords(
+    openai_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _post(url: str, **kwargs: object) -> _Response:
+        captured["data"] = kwargs.get("data")
+        return _Response(200, payload={"text": "transcribed"})
+
+    monkeypatch.setattr(openai, "_requests_post", _post)
+
+    result = openai.build_openai_provider().transcribe(
+        TranscriptionRequest(
+            data=b"audio",
+            filename="clip.mp3",
+            content_type="audio/mpeg",
+            timeout=30,
+            language=None,
+            model="vibevoice",
+            prompt="domain context",
+            bias_terms=("xochitl", "niri"),
+            diarize=True,
+            speaker_count=2,
+            timestamp_granularities=("segment",),
+        )
+    )
+
+    assert result.text == "transcribed"
+    assert captured["data"] == [
+        ("response_format", "verbose_json"),
+        ("model", "vibevoice"),
+        ("prompt", "domain context"),
+        ("hotwords", "xochitl, niri"),
+        ("diarize", "true"),
+        ("speakers", "2"),
+        ("timestamp_granularities[]", "segment"),
+    ]
+
+
+def test_openai_provider_renders_speaker_segments_when_requested(
+    openai_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _post(url: str, **kwargs: object) -> _Response:
+        return _Response(
+            200,
+            payload={
+                "text": "plain text",
+                "segments": [
+                    {"start": 0.0, "end": 1.0, "speaker_id": 0, "text": "hello"},
+                    {"start": 1.0, "end": 2.0, "speaker_id": 1, "text": "there"},
+                ],
+                "words": [{"word": "hello", "start": 0.0, "end": 0.3}],
+            },
+        )
+
+    monkeypatch.setattr(openai, "_requests_post", _post)
+
+    result = openai.build_openai_provider().transcribe(
+        TranscriptionRequest(
+            data=b"audio",
+            filename="clip.mp3",
+            content_type="audio/mpeg",
+            timeout=30,
+            language=None,
+            model="vibevoice",
+            prompt="",
+            bias_terms=(),
+            diarize=True,
+            speaker_count=None,
+        )
+    )
+
+    assert result.text == "[Speaker 0] hello\n\n[Speaker 1] there"
+    assert result.metadata["speakers"] == ["Speaker 0", "Speaker 1"]
+    assert result.metadata["words"] == [{"word": "hello", "start": 0.0, "end": 0.3}]
+
+
+def test_openai_provider_keeps_plain_text_without_diarization(
+    openai_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _post(url: str, **kwargs: object) -> _Response:
+        return _Response(
+            200,
+            payload={
+                "text": "plain text",
+                "segments": [
+                    {"start": 0.0, "end": 1.0, "speaker_id": 0, "text": "hello"},
+                ],
+            },
+        )
+
+    monkeypatch.setattr(openai, "_requests_post", _post)
+
+    result = openai.build_openai_provider().transcribe(
+        TranscriptionRequest(
+            data=b"audio",
+            filename="clip.mp3",
+            content_type="audio/mpeg",
+            timeout=30,
+            language=None,
+            model="vibevoice",
+            prompt="",
+            bias_terms=(),
+            diarize=False,
+            speaker_count=None,
+        )
+    )
+
+    assert result.text == "plain text"
+    assert result.metadata["segments"] == [
+        {
+            "text": "hello",
+            "start": 0.0,
+            "end": 1.0,
+            "speaker": "Speaker 0",
+        }
+    ]
+
+
 def test_openai_provider_sends_env_model_when_request_omits_model(
     openai_env: None,
     monkeypatch: pytest.MonkeyPatch,

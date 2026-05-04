@@ -138,6 +138,29 @@ def _coerce_speakers(raw: Any) -> int | None:
     return value
 
 
+def _coerce_timestamp_granularities(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        values = [raw]
+    elif isinstance(raw, Sequence) and not isinstance(raw, (bytes, bytearray, str)):
+        values = list(raw)
+    else:
+        raise ValueError("timestamp_granularities must be a string or list of strings")
+    granularities: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError("timestamp_granularities entries must be strings")
+        normalized = value.strip().lower()
+        if not normalized:
+            continue
+        if normalized not in {"segment", "word"}:
+            raise ValueError("timestamp_granularities entries must be 'segment' or 'word'")
+        if normalized not in granularities:
+            granularities.append(normalized)
+    return granularities
+
+
 def normalize_manifest_config(
     raw_config: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
@@ -186,6 +209,12 @@ def normalize_manifest_config(
     speakers = _coerce_speakers(raw_config.get("speakers"))
     if speakers is not None:
         normalized["speakers"] = speakers
+
+    timestamp_granularities = _coerce_timestamp_granularities(
+        raw_config.get("timestamp_granularities")
+    )
+    if timestamp_granularities:
+        normalized["timestamp_granularities"] = timestamp_granularities
 
     if "auto_diarize" in raw_config:
         normalized["auto_diarize"] = _coerce_diarize(raw_config.get("auto_diarize"))

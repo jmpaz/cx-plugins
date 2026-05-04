@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import os
+from dataclasses import dataclass
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from contextualize.auth.common import load_dotenv_optional
@@ -28,6 +30,12 @@ _AUDIO_SUFFIX_TO_MIME: dict[str, str] = {
     ".flac": "audio/flac",
     ".aiff": "audio/aiff",
 }
+
+
+@dataclass(frozen=True)
+class _OpenAITranscription:
+    text: str
+    metadata: dict[str, Any]
 
 
 def _requests_post(*args: object, **kwargs: object):
@@ -184,29 +192,126 @@ def _guess_audio_content_type(filename: str) -> str:
     return "audio/mpeg"
 
 
-def _extract_transcription_text(payload: object) -> str:
-    if not isinstance(payload, dict):
+def _segment_text(segment: dict[str, object]) -> str:
+    text = segment.get("text") or segment.get("Content") or segment.get("content")
+    if not isinstance(text, str):
         return ""
+    return " ".join(text.split())
+
+
+def _segment_speaker(segment: dict[str, object]) -> str | None:
+    speaker = None
+    for key in ("speaker", "speaker_id", "Speaker", "Speaker ID"):
+        if key in segment and segment[key] not in (None, ""):
+            speaker = segment[key]
+            break
+    if speaker in (None, ""):
+        return None
+    label = str(speaker).strip()
+    if not label:
+        return None
+    if label.lower().startswith("speaker"):
+        return label
+    return f"Speaker {label}"
+
+
+def _extract_segments(payload: object) -> list[dict[str, object]]:
+    if not isinstance(payload, dict):
+        return []
 
     raw_segments = payload.get("segments")
-    if isinstance(raw_segments, list):
-        extracted: list[str] = []
-        for segment in raw_segments:
-            if not isinstance(segment, dict):
-                continue
-            text = segment.get("text")
-            if not isinstance(text, str):
-                continue
-            normalized = " ".join(text.split())
-            if normalized:
-                extracted.append(normalized)
-        if extracted:
-            return "\n\n".join(extracted)
+    if not isinstance(raw_segments, list):
+        return []
+
+    segments: list[dict[str, object]] = []
+    for segment in raw_segments:
+        if not isinstance(segment, dict):
+            continue
+        text = _segment_text(segment)
+        if not text:
+            continue
+        normalized: dict[str, object] = {"text": text}
+        for target, keys in {
+            "start": ("start", "Start", "start_time"),
+            "end": ("end", "End", "end_time"),
+        }.items():
+            for key in keys:
+                value = segment.get(key)
+                if isinstance(value, int | float):
+                    normalized[target] = float(value)
+                    break
+        speaker = _segment_speaker(segment)
+        if speaker:
+            normalized["speaker"] = speaker
+        segments.append(normalized)
+    return segments
+
+
+def _extract_words(payload: object) -> list[dict[str, object]]:
+    if not isinstance(payload, dict):
+        return []
+    raw_words = payload.get("words")
+    if not isinstance(raw_words, list):
+        return []
+    return [dict(word) for word in raw_words if isinstance(word, dict)]
+
+
+def _speaker_labeled_text(segments: list[dict[str, object]]) -> str:
+    groups: list[tuple[str, str]] = []
+    for segment in segments:
+        text = segment.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        speaker = segment.get("speaker")
+        if not isinstance(speaker, str) or not speaker.strip():
+            continue
+        if groups and groups[-1][0] == speaker:
+            groups[-1] = (speaker, f"{groups[-1][1]} {text.strip()}")
+        else:
+            groups.append((speaker, text.strip()))
+    return "\n\n".join(f"[{speaker}] {text}" for speaker, text in groups)
+
+
+def _extract_transcription(payload: object, *, diarize: bool) -> _OpenAITranscription:
+    if not isinstance(payload, dict):
+        return _OpenAITranscription(text="", metadata={})
+
+    segments = _extract_segments(payload)
+    words = _extract_words(payload)
+    metadata: dict[str, Any] = {}
+    if segments:
+        metadata["segments"] = segments
+        speakers = sorted(
+            {
+                speaker
+                for segment in segments
+                if isinstance((speaker := segment.get("speaker")), str)
+            }
+        )
+        if speakers:
+            metadata["speakers"] = speakers
+    if words:
+        metadata["words"] = words
+
+    if diarize and segments:
+        rendered = _speaker_labeled_text(segments)
+        if rendered:
+            return _OpenAITranscription(text=rendered, metadata=metadata)
 
     text = payload.get("text")
-    if isinstance(text, str):
-        return text.strip()
-    return ""
+    if isinstance(text, str) and text.strip():
+        return _OpenAITranscription(text=text.strip(), metadata=metadata)
+
+    if segments:
+        return _OpenAITranscription(
+            text="\n\n".join(str(segment["text"]) for segment in segments),
+            metadata=metadata,
+        )
+    return _OpenAITranscription(text="", metadata=metadata)
+
+
+def _extract_transcription_text(payload: object) -> str:
+    return _extract_transcription(payload, diarize=False).text
 
 
 def _merge_prompt(request_prompt: str) -> str:
@@ -227,7 +332,7 @@ def _transcribe_openai(request: TranscriptionRequest) -> TranscriptionResult:
     model = _openai_model(request)
     merged_prompt = _merge_prompt(request.prompt)
     try:
-        text = _transcribe_openai_once_with_model_repair(
+        transcription = _transcribe_openai_once_with_model_repair(
             request.data,
             filename=request.filename,
             content_type=content_type,
@@ -235,22 +340,31 @@ def _transcribe_openai(request: TranscriptionRequest) -> TranscriptionResult:
             model=model,
             language=request.language,
             prompt=merged_prompt,
+            hotwords=request.bias_terms,
+            diarize=request.diarize,
+            speaker_count=request.speaker_count,
+            timestamp_granularities=request.timestamp_granularities,
         )
     except TranscriptionProviderError as exc:
         if not _should_retry_chunked_transcription(exc):
             raise
-        text = _transcribe_audio_in_chunks(
+        transcription = _transcribe_audio_in_chunks(
             request.data,
             filename=request.filename,
             timeout=request.timeout,
             model=model,
             language=request.language,
             prompt=merged_prompt,
+            hotwords=request.bias_terms,
+            diarize=request.diarize,
+            speaker_count=request.speaker_count,
+            timestamp_granularities=request.timestamp_granularities,
         )
     return TranscriptionResult(
-        text=text,
+        text=transcription.text,
         model=model or "server-default",
         provider="openai",
+        metadata=transcription.metadata,
     )
 
 
@@ -263,7 +377,11 @@ def _transcribe_openai_once_with_model_repair(
     model: str | None,
     language: str | None,
     prompt: str,
-) -> str:
+    hotwords: tuple[str, ...],
+    diarize: bool,
+    speaker_count: int | None,
+    timestamp_granularities: tuple[str, ...],
+) -> _OpenAITranscription:
     try:
         return _transcribe_openai_once(
             data,
@@ -273,6 +391,10 @@ def _transcribe_openai_once_with_model_repair(
             model=model,
             language=language,
             prompt=prompt,
+            hotwords=hotwords,
+            diarize=diarize,
+            speaker_count=speaker_count,
+            timestamp_granularities=timestamp_granularities,
         )
     except TranscriptionProviderError as exc:
         if not _should_recreate_model_after_error(exc):
@@ -295,6 +417,10 @@ def _transcribe_openai_once_with_model_repair(
             model=model,
             language=language,
             prompt=prompt,
+            hotwords=hotwords,
+            diarize=diarize,
+            speaker_count=speaker_count,
+            timestamp_granularities=timestamp_granularities,
         )
 
 
@@ -307,7 +433,11 @@ def _transcribe_openai_once(
     model: str | None,
     language: str | None,
     prompt: str,
-) -> str:
+    hotwords: tuple[str, ...],
+    diarize: bool,
+    speaker_count: int | None,
+    timestamp_granularities: tuple[str, ...],
+) -> _OpenAITranscription:
     load_dotenv_optional()
     endpoint = _openai_endpoint()
     headers = _openai_auth_headers()
@@ -319,12 +449,27 @@ def _transcribe_openai_once(
         form_data["language"] = language
     if prompt:
         form_data["prompt"] = prompt
+    if hotwords:
+        form_data["hotwords"] = ", ".join(hotwords)
+    if diarize:
+        form_data["diarize"] = "true"
+    if speaker_count:
+        form_data["speakers"] = str(speaker_count)
+    request_data: object = form_data
+    if timestamp_granularities:
+        data_items = list(form_data.items())
+        data_items.extend(
+            ("timestamp_granularities[]", granularity)
+            for granularity in timestamp_granularities
+            if granularity
+        )
+        request_data = data_items
 
     response = _requests_post(
         endpoint,
         headers=headers,
         files={"file": (filename, data, content_type)},
-        data=form_data,
+        data=request_data,
         timeout=timeout,
     )
     if response.status_code in {401, 402, 403}:
@@ -344,12 +489,12 @@ def _transcribe_openai_once(
         raise TranscriptionProviderError(
             "OpenAI-compatible transcription response was not valid JSON"
         ) from exc
-    text = _extract_transcription_text(payload)
-    if not text:
+    transcription = _extract_transcription(payload, diarize=diarize)
+    if not transcription.text:
         raise TranscriptionProviderError(
             "OpenAI-compatible transcription returned no transcription text"
         )
-    return text
+    return transcription
 
 
 def _should_recreate_model_after_error(exc: TranscriptionProviderError) -> bool:
@@ -409,7 +554,11 @@ def _transcribe_audio_in_chunks(
     model: str | None,
     language: str | None,
     prompt: str,
-) -> str:
+    hotwords: tuple[str, ...],
+    diarize: bool,
+    speaker_count: int | None,
+    timestamp_granularities: tuple[str, ...],
+) -> _OpenAITranscription:
     chunk_seconds = _get_chunk_seconds()
     suffix = Path(filename).suffix.lower() or ".wav"
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -450,8 +599,9 @@ def _transcribe_audio_in_chunks(
             raise TranscriptionProviderError("ffmpeg audio chunking produced no chunks")
 
         parts: list[str] = []
+        chunks: list[dict[str, Any]] = []
         for chunk_path in chunk_paths:
-            text = _transcribe_openai_once_with_model_repair(
+            transcription = _transcribe_openai_once_with_model_repair(
                 chunk_path.read_bytes(),
                 filename=chunk_path.name,
                 content_type="audio/wav",
@@ -459,10 +609,19 @@ def _transcribe_audio_in_chunks(
                 model=model,
                 language=language,
                 prompt=prompt,
-            ).strip()
+                hotwords=hotwords,
+                diarize=diarize,
+                speaker_count=speaker_count,
+                timestamp_granularities=timestamp_granularities,
+            )
+            text = transcription.text.strip()
             if text:
                 parts.append(text)
-        return "\n\n".join(parts)
+                chunks.append(transcription.metadata)
+        return _OpenAITranscription(
+            text="\n\n".join(parts),
+            metadata={"chunks": chunks} if chunks else {},
+        )
 
 
 def _get_chunk_seconds() -> int:
@@ -486,6 +645,7 @@ def _openai_cache_identity(request: TranscriptionRequest) -> dict[str, object]:
     prompt_hash = hashlib.sha256(
         _merge_prompt(request.prompt).encode("utf-8")
     ).hexdigest()
+    bias_hash = hashlib.sha256(",".join(request.bias_terms).encode("utf-8")).hexdigest()
     return {
         "provider": "openai",
         "endpoint": _openai_endpoint(),
@@ -493,6 +653,8 @@ def _openai_cache_identity(request: TranscriptionRequest) -> dict[str, object]:
         "chunk_seconds": _chunk_seconds_cache_component(),
         "language": request.language,
         "prompt_hash": prompt_hash,
+        "bias_hash": bias_hash,
         "diarize": request.diarize,
         "speaker_count": request.speaker_count,
+        "timestamp_granularities": list(request.timestamp_granularities),
     }
