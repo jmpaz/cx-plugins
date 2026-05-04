@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
@@ -30,6 +31,9 @@ _AUDIO_SUFFIX_TO_MIME: dict[str, str] = {
     ".flac": "audio/flac",
     ".aiff": "audio/aiff",
 }
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_PARAGRAPH_TARGET_CHARS = 420
+_PARAGRAPH_MAX_CHARS = 620
 
 
 @dataclass(frozen=True)
@@ -215,6 +219,60 @@ def _segment_speaker(segment: dict[str, object]) -> str | None:
     return f"Speaker {label}"
 
 
+def _split_sentences(text: str) -> list[str]:
+    normalized = " ".join(text.split())
+    if not normalized:
+        return []
+    return [sentence for sentence in _SENTENCE_SPLIT_RE.split(normalized) if sentence]
+
+
+def _paragraphize_block(text: str) -> list[str]:
+    sentences = _split_sentences(text)
+    if len(sentences) <= 1:
+        normalized = " ".join(text.split())
+        return [normalized] if normalized else []
+
+    paragraphs: list[str] = []
+    current: list[str] = []
+    current_length = 0
+    for sentence in sentences:
+        sentence_length = len(sentence)
+        separator_length = 1 if current else 0
+        if current and current_length + separator_length + sentence_length > _PARAGRAPH_MAX_CHARS:
+            paragraphs.append(" ".join(current))
+            current = []
+            current_length = 0
+            separator_length = 0
+
+        current.append(sentence)
+        current_length += separator_length + sentence_length
+        if current_length >= _PARAGRAPH_TARGET_CHARS:
+            paragraphs.append(" ".join(current))
+            current = []
+            current_length = 0
+
+    if current:
+        paragraphs.append(" ".join(current))
+    return paragraphs
+
+
+def _paragraphize_text(text: str) -> str:
+    blocks = [block for block in re.split(r"\n\s*\n+", text.strip()) if block.strip()]
+    paragraphs: list[str] = []
+    for block in blocks:
+        paragraphs.extend(_paragraphize_block(block))
+    return "\n\n".join(paragraphs)
+
+
+def _segment_paragraphs(segments: list[dict[str, object]]) -> str:
+    paragraphs: list[str] = []
+    for segment in segments:
+        text = segment.get("text")
+        if isinstance(text, str) and text.strip():
+            paragraphs.extend(_paragraphize_block(text))
+    return "\n\n".join(paragraphs)
+
+
 def _extract_segments(payload: object) -> list[dict[str, object]]:
     if not isinstance(payload, dict):
         return []
@@ -298,13 +356,15 @@ def _extract_transcription(payload: object, *, diarize: bool) -> _OpenAITranscri
         if rendered:
             return _OpenAITranscription(text=rendered, metadata=metadata)
 
+    if segments:
+        rendered = _segment_paragraphs(segments)
+        if rendered:
+            return _OpenAITranscription(text=rendered, metadata=metadata)
+
     text = payload.get("text")
     if isinstance(text, str) and text.strip():
-        return _OpenAITranscription(text=text.strip(), metadata=metadata)
-
-    if segments:
         return _OpenAITranscription(
-            text="\n\n".join(str(segment["text"]) for segment in segments),
+            text=_paragraphize_text(text),
             metadata=metadata,
         )
     return _OpenAITranscription(text="", metadata=metadata)

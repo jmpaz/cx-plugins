@@ -340,7 +340,7 @@ def test_openai_provider_renders_speaker_segments_when_requested(
     assert result.metadata["words"] == [{"word": "hello", "start": 0.0, "end": 0.3}]
 
 
-def test_openai_provider_keeps_plain_text_without_diarization(
+def test_openai_provider_renders_segment_paragraphs_without_diarization(
     openai_env: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -348,9 +348,10 @@ def test_openai_provider_keeps_plain_text_without_diarization(
         return _Response(
             200,
             payload={
-                "text": "plain text",
+                "text": "flattened first sentence flattened second sentence",
                 "segments": [
-                    {"start": 0.0, "end": 1.0, "speaker_id": 0, "text": "hello"},
+                    {"start": 0.0, "end": 1.0, "text": "first sentence."},
+                    {"start": 1.0, "end": 2.0, "text": "second sentence."},
                 ],
             },
         )
@@ -372,15 +373,84 @@ def test_openai_provider_keeps_plain_text_without_diarization(
         )
     )
 
-    assert result.text == "plain text"
+    assert result.text == "first sentence.\n\nsecond sentence."
     assert result.metadata["segments"] == [
         {
-            "text": "hello",
+            "text": "first sentence.",
             "start": 0.0,
             "end": 1.0,
-            "speaker": "Speaker 0",
-        }
+        },
+        {
+            "text": "second sentence.",
+            "start": 1.0,
+            "end": 2.0,
+        },
     ]
+
+
+def test_openai_provider_paragraphizes_long_single_segment(
+    openai_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = "First " + " ".join(["alpha"] * 35) + "."
+    second = "Second " + " ".join(["beta"] * 45) + "."
+    third = "Third " + " ".join(["gamma"] * 35) + "."
+    segment_text = f"{first} {second} {third}"
+
+    def _post(url: str, **kwargs: object) -> _Response:
+        return _Response(
+            200,
+            payload={
+                "text": segment_text,
+                "segments": [{"start": 0.0, "end": 25.0, "text": segment_text}],
+            },
+        )
+
+    monkeypatch.setattr(openai, "_requests_post", _post)
+
+    result = openai.build_openai_provider().transcribe(
+        TranscriptionRequest(
+            data=b"audio",
+            filename="clip.mp3",
+            content_type="audio/mpeg",
+            timeout=30,
+            language=None,
+            model="cohere",
+            prompt="",
+            bias_terms=(),
+            diarize=False,
+            speaker_count=None,
+        )
+    )
+
+    assert result.text == f"{first} {second}\n\n{third}"
+
+
+def test_openai_provider_keeps_plain_text_without_segments(
+    openai_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _post(url: str, **kwargs: object) -> _Response:
+        return _Response(200, payload={"text": "plain text"})
+
+    monkeypatch.setattr(openai, "_requests_post", _post)
+
+    result = openai.build_openai_provider().transcribe(
+        TranscriptionRequest(
+            data=b"audio",
+            filename="clip.mp3",
+            content_type="audio/mpeg",
+            timeout=30,
+            language=None,
+            model="cohere",
+            prompt="",
+            bias_terms=(),
+            diarize=False,
+            speaker_count=None,
+        )
+    )
+
+    assert result.text == "plain text"
 
 
 def test_openai_provider_sends_env_model_when_request_omits_model(
