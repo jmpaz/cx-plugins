@@ -34,6 +34,7 @@ _AUDIO_SUFFIX_TO_MIME: dict[str, str] = {
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _PARAGRAPH_TARGET_CHARS = 420
 _PARAGRAPH_MAX_CHARS = 620
+_TRANSCRIPT_FORMAT_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -710,6 +711,7 @@ def _openai_cache_identity(request: TranscriptionRequest) -> dict[str, object]:
         "provider": "openai",
         "endpoint": _openai_endpoint(),
         "model": _openai_model(request),
+        "transcript_format_version": _TRANSCRIPT_FORMAT_VERSION,
         "chunk_seconds": _chunk_seconds_cache_component(),
         "language": request.language,
         "prompt_hash": prompt_hash,

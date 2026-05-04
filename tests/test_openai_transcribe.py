@@ -553,3 +553,25 @@ def test_openai_cache_identity_varies_by_model(openai_env: None) -> None:
 
     assert provider.cache_identity(first)["model"] == "distilwhisper"
     assert provider.cache_identity(second)["model"] == "cohere"
+
+
+def test_openai_cache_identity_includes_transcript_format_version(
+    openai_env: None,
+) -> None:
+    provider = openai.build_openai_provider()
+    identity = provider.cache_identity(
+        TranscriptionRequest(
+            data=b"audio",
+            filename="clip.mp3",
+            content_type="audio/mpeg",
+            timeout=30,
+            language=None,
+            model="cohere",
+            prompt="",
+            bias_terms=(),
+            diarize=False,
+            speaker_count=None,
+        )
+    )
+
+    assert identity["transcript_format_version"] == 2
