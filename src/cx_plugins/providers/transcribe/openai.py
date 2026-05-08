@@ -434,7 +434,7 @@ def _transcribe_openai_once_with_model_repair(
     *,
     filename: str,
     content_type: str,
-    timeout: float,
+    timeout: float | None,
     model: str | None,
     language: str | None,
     prompt: str,
@@ -490,7 +490,7 @@ def _transcribe_openai_once(
     *,
     filename: str,
     content_type: str,
-    timeout: float,
+    timeout: float | None,
     model: str | None,
     language: str | None,
     prompt: str,
@@ -565,7 +565,21 @@ def _should_recreate_model_after_error(exc: TranscriptionProviderError) -> bool:
     return "valid model card" in normalized and "delete /v1/models" in normalized
 
 
-def _recreate_openai_model(model: str, *, timeout: float) -> None:
+def _bounded_timeout(
+    timeout: float | None,
+    *,
+    minimum: float,
+    maximum: float | None = None,
+) -> float | None:
+    if timeout is None:
+        return None
+    value = max(minimum, timeout)
+    if maximum is not None:
+        value = min(value, maximum)
+    return value
+
+
+def _recreate_openai_model(model: str, *, timeout: float | None) -> None:
     model_endpoint = _openai_model_endpoint(model)
     if model_endpoint is None:
         raise TranscriptionProviderError(
@@ -577,7 +591,7 @@ def _recreate_openai_model(model: str, *, timeout: float) -> None:
     delete_response = _requests_delete(
         model_endpoint,
         headers=headers,
-        timeout=max(10.0, min(timeout, 60.0)),
+        timeout=_bounded_timeout(timeout, minimum=10.0, maximum=60.0),
     )
     if delete_response.status_code >= 400 and delete_response.status_code != 404:
         raise TranscriptionProviderError(
@@ -590,7 +604,7 @@ def _recreate_openai_model(model: str, *, timeout: float) -> None:
     create_response = _requests_post(
         model_endpoint,
         headers=headers,
-        timeout=max(timeout, 60.0),
+        timeout=_bounded_timeout(timeout, minimum=60.0),
     )
     if create_response.status_code >= 400:
         raise TranscriptionProviderError(
@@ -611,7 +625,7 @@ def _transcribe_audio_in_chunks(
     data: bytes,
     *,
     filename: str,
-    timeout: float,
+    timeout: float | None,
     model: str | None,
     language: str | None,
     prompt: str,
@@ -649,7 +663,7 @@ def _transcribe_audio_in_chunks(
             ],
             capture_output=True,
             text=True,
-            timeout=max(timeout, 120),
+            timeout=_bounded_timeout(timeout, minimum=120.0),
         )
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or "unknown error"

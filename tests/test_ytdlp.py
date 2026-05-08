@@ -333,7 +333,7 @@ def test_get_transcript_passes_transcription_cache_flags(
         *,
         use_cache: bool = True,
         refresh_cache: bool | None = None,
-        timeout: float = 600,
+        timeout: float | None = None,
         plugin_overrides=None,
     ) -> str:
         captured["path"] = path
@@ -357,7 +357,7 @@ def test_get_transcript_passes_transcription_cache_flags(
         "path": audio_path,
         "use_cache": False,
         "refresh_cache": True,
-        "timeout": 600,
+        "timeout": None,
         "plugin_overrides": {"transcribe": {"provider": "mistral"}},
     }
     assert not audio_dir.exists()

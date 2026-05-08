@@ -226,6 +226,36 @@ def test_openai_provider_omits_language_when_unspecified(
     }
 
 
+def test_openai_provider_passes_unbounded_timeout(
+    openai_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _post(url: str, **kwargs: object) -> _Response:
+        captured["timeout"] = kwargs.get("timeout")
+        return _Response(200, payload={"text": "transcribed"})
+
+    monkeypatch.setattr(openai, "_requests_post", _post)
+
+    result = openai.build_openai_provider().transcribe(
+        TranscriptionRequest(
+            data=b"audio",
+            filename="clip.mp3",
+            content_type="audio/mpeg",
+            timeout=None,
+            language=None,
+            prompt="",
+            bias_terms=(),
+            diarize=False,
+            speaker_count=None,
+        )
+    )
+
+    assert result.text == "transcribed"
+    assert captured["timeout"] is None
+
+
 def test_openai_provider_sends_explicit_model(
     openai_env: None,
     monkeypatch: pytest.MonkeyPatch,

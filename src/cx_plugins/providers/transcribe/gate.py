@@ -37,7 +37,7 @@ def _analyze_with_pyannote(
     data: bytes,
     filename: str,
     content_type: str | None,
-    timeout: float,
+    timeout: float | None,
     config: dict[str, Any],
 ) -> TranscriptionGateDecision:
     del content_type
@@ -66,7 +66,7 @@ def _analyze_with_pyannote(
                 **dict(os.environ),
                 "CONTEXTUALIZE_VERBOSE_GATE": "1",
             },
-            timeout=max(timeout, 120),
+            timeout=None if timeout is None else max(timeout, 120),
         )
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or "unknown error"
