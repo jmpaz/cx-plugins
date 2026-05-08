@@ -77,6 +77,30 @@ def test_collect_cli_overrides_builds_transcribe_mapping() -> None:
     }
 
 
+def test_collect_cli_overrides_omits_default_auto_provider() -> None:
+    overrides = collect_cli_overrides(
+        "cat",
+        {
+            "transcribe_provider": "auto",
+            "transcribe_model": None,
+            "transcribe_language": None,
+            "transcribe_priority": (),
+            "transcribe_prompt": (),
+            "transcribe_prompt_file": (),
+            "transcribe_diarize": True,
+            "transcribe_speakers": 2,
+            "transcribe_auto_diarize": False,
+            "transcribe_auto_diarize_provider": "mistral",
+        },
+    )
+
+    assert overrides == {
+        "diarize": True,
+        "speakers": 2,
+        "auto_diarize_provider": "mistral",
+    }
+
+
 def test_transcribe_model_completion_uses_openai_compatible_models(monkeypatch) -> None:
     from cx_plugins.providers.transcribe import openai
 

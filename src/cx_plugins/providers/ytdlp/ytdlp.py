@@ -279,6 +279,18 @@ def _build_identity(url: str, metadata: dict[str, Any]) -> _YtDlpIdentity:
     )
 
 
+def _transcription_routing_identity(
+    plugin_overrides: dict[str, Any] | None,
+) -> dict[str, Any]:
+    from contextualize.references.audio_transcription import _routing_cache_identity
+
+    return _routing_cache_identity(
+        filename="media.mp3",
+        content_type="audio/mpeg",
+        plugin_overrides=plugin_overrides,
+    )
+
+
 def _render_cache_identity(
     base_identity: str, plugin_overrides: dict[str, Any] | None
 ) -> str:
@@ -287,10 +299,12 @@ def _render_cache_identity(
         value = plugin_overrides.get("transcribe")
         if isinstance(value, dict):
             transcribe_overrides = dict(value)
-    if not transcribe_overrides:
-        return base_identity
-    payload = json.dumps(transcribe_overrides, sort_keys=True, separators=(",", ":"))
-    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    payload = {
+        "overrides": transcribe_overrides or {},
+        "routing": _transcription_routing_identity(plugin_overrides),
+    }
+    payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()[:16]
     return f"{base_identity}:transcribe:{digest}"
 
 

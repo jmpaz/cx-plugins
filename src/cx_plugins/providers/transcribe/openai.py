@@ -187,6 +187,16 @@ def _chunk_seconds_cache_component() -> str:
     return value or "25"
 
 
+def _chunk_fallback_enabled() -> bool:
+    load_dotenv_optional()
+    raw = (
+        os.environ.get("OPENAI_TRANSCRIPTION_CHUNK_FALLBACK")
+        or os.environ.get("OPENAI_TRANSCRIPTION_ENABLE_CHUNK_FALLBACK")
+        or ""
+    )
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _guess_audio_content_type(filename: str) -> str:
     suffix = Path(filename).suffix.lower()
     if suffix in _AUDIO_SUFFIX_TO_MIME:
@@ -616,6 +626,8 @@ def _recreate_openai_model(model: str, *, timeout: float | None) -> None:
 
 
 def _should_retry_chunked_transcription(exc: TranscriptionProviderError) -> bool:
+    if not _chunk_fallback_enabled():
+        return False
     if shutil.which("ffmpeg") is None:
         return False
     return bool(exc.status_code and exc.status_code >= 500)
@@ -726,6 +738,7 @@ def _openai_cache_identity(request: TranscriptionRequest) -> dict[str, object]:
         "endpoint": _openai_endpoint(),
         "model": _openai_model(request),
         "transcript_format_version": _TRANSCRIPT_FORMAT_VERSION,
+        "chunk_fallback": _chunk_fallback_enabled(),
         "chunk_seconds": _chunk_seconds_cache_component(),
         "language": request.language,
         "prompt_hash": prompt_hash,

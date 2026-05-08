@@ -400,7 +400,7 @@ def collect_cli_overrides(
     auto_diarize_provider = params.get("transcribe_auto_diarize_provider")
 
     raw_mapping: dict[str, Any] = {}
-    if provider:
+    if provider and provider != "auto":
         raw_mapping["provider"] = provider
     if model:
         raw_mapping["model"] = model

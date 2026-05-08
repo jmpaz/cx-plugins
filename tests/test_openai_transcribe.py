@@ -35,6 +35,8 @@ def openai_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("OPENAI_TRANSCRIPTION_API_BASE", raising=False)
     monkeypatch.delenv("OPENAI_TRANSCRIPTION_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_TRANSCRIPTION_MODEL", raising=False)
+    monkeypatch.delenv("OPENAI_TRANSCRIPTION_CHUNK_FALLBACK", raising=False)
+    monkeypatch.delenv("OPENAI_TRANSCRIPTION_ENABLE_CHUNK_FALLBACK", raising=False)
 
 
 def test_openai_provider_refreshes_stale_speaches_model(
@@ -118,6 +120,52 @@ def test_openai_provider_keeps_regular_500s_on_chunk_fallback_path(
                 speaker_count=None,
             )
         )
+
+
+def test_openai_provider_does_not_chunk_retry_500s_by_default(
+    openai_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _post(url: str, **kwargs: object) -> _Response:
+        return _Response(503, text="worker crashed")
+
+    def _run_ffmpeg(*args: object, **kwargs: object) -> object:
+        raise AssertionError("chunk fallback should be opt-in")
+
+    monkeypatch.setattr(openai, "_requests_post", _post)
+    monkeypatch.setattr(openai.shutil, "which", lambda _name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(openai.subprocess, "run", _run_ffmpeg)
+
+    with pytest.raises(TranscriptionProviderError, match="worker crashed"):
+        openai.build_openai_provider().transcribe(
+            TranscriptionRequest(
+                data=b"audio",
+                filename="clip.mp3",
+                content_type="audio/mpeg",
+                timeout=30,
+                language="en",
+                prompt="",
+                bias_terms=(),
+                diarize=False,
+                speaker_count=None,
+            )
+        )
+
+
+def test_openai_provider_can_opt_into_chunk_retry(
+    openai_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_TRANSCRIPTION_CHUNK_FALLBACK", "true")
+    monkeypatch.setattr(openai.shutil, "which", lambda _name: "/usr/bin/ffmpeg")
+
+    exc = TranscriptionProviderError(
+        "retryable failure",
+        retryable=True,
+        status_code=503,
+    )
+
+    assert openai._should_retry_chunked_transcription(exc)
 
 
 def test_openai_provider_reports_failed_model_refresh_without_chunking(
@@ -310,7 +358,7 @@ def test_openai_provider_sends_diarization_context_and_hotwords(
             content_type="audio/mpeg",
             timeout=30,
             language=None,
-            model="vibevoice",
+            model="cohere",
             prompt="domain context",
             bias_terms=("xochitl", "niri"),
             diarize=True,
@@ -322,7 +370,7 @@ def test_openai_provider_sends_diarization_context_and_hotwords(
     assert result.text == "transcribed"
     assert captured["data"] == [
         ("response_format", "verbose_json"),
-        ("model", "vibevoice"),
+        ("model", "cohere"),
         ("prompt", "domain context"),
         ("hotwords", "xochitl, niri"),
         ("diarize", "true"),
@@ -357,7 +405,7 @@ def test_openai_provider_renders_speaker_segments_when_requested(
             content_type="audio/mpeg",
             timeout=30,
             language=None,
-            model="vibevoice",
+            model="cohere",
             prompt="",
             bias_terms=(),
             diarize=True,
@@ -395,7 +443,7 @@ def test_openai_provider_renders_segment_paragraphs_without_diarization(
             content_type="audio/mpeg",
             timeout=30,
             language=None,
-            model="vibevoice",
+            model="cohere",
             prompt="",
             bias_terms=(),
             diarize=False,

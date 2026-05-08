@@ -14,8 +14,15 @@ def test_ytdlp_priority_is_below_specialized_providers() -> None:
     assert ytdlp_plugin.PLUGIN_PRIORITY < atproto_plugin.PLUGIN_PRIORITY
 
 
-def test_render_cache_identity_varies_by_transcription_overrides() -> None:
+def test_render_cache_identity_varies_by_transcription_overrides(
+    monkeypatch,
+) -> None:
     base = "youtube:abc123"
+    monkeypatch.setattr(
+        ytdlp,
+        "_transcription_routing_identity",
+        lambda _overrides: {"model": "cohere"},
+    )
 
     es_identity = ytdlp._render_cache_identity(
         base,
@@ -26,7 +33,7 @@ def test_render_cache_identity_varies_by_transcription_overrides() -> None:
         {"transcribe": {"language": "en"}},
     )
 
-    assert ytdlp._render_cache_identity(base, None) == base
+    assert ytdlp._render_cache_identity(base, None) != base
     assert es_identity != base
     assert en_identity != base
     assert es_identity != en_identity
@@ -34,6 +41,30 @@ def test_render_cache_identity_varies_by_transcription_overrides() -> None:
         ytdlp._render_cache_identity(base, {"transcribe": {"language": "es"}})
         == es_identity
     )
+
+
+def test_render_cache_identity_varies_by_effective_transcription_routing(
+    monkeypatch,
+) -> None:
+    base = "youtube:abc123"
+    routing = {"model": "cohere"}
+
+    def _routing_identity(_overrides):
+        return dict(routing)
+
+    monkeypatch.setattr(ytdlp, "_transcription_routing_identity", _routing_identity)
+
+    cohere_identity = ytdlp._render_cache_identity(
+        base,
+        {"transcribe": {"diarize": True, "speakers": 2}},
+    )
+    routing["model"] = "mistral"
+    mistral_identity = ytdlp._render_cache_identity(
+        base,
+        {"transcribe": {"diarize": True, "speakers": 2}},
+    )
+
+    assert cohere_identity != mistral_identity
 
 
 def test_can_resolve_uses_extractor_matching_without_probe(monkeypatch) -> None:
