@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -85,18 +86,35 @@ def _slugify(value: str, *, default: str) -> str:
     return slug or default
 
 
+def _yt_dlp_module_available() -> bool:
+    try:
+        import yt_dlp  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _yt_dlp_command() -> list[str]:
+    if _yt_dlp_module_available():
+        return [sys.executable, "-m", "yt_dlp"]
+    executable = shutil.which("yt-dlp")
+    if executable:
+        return [executable]
+    raise RuntimeError(
+        "yt-dlp processing requires the yt_dlp Python package or yt-dlp executable: "
+        "https://github.com/yt-dlp/yt-dlp"
+    )
+
+
 def _check_ytdlp() -> None:
-    if not shutil.which("yt-dlp"):
-        raise RuntimeError(
-            "yt-dlp processing requires yt-dlp: https://github.com/yt-dlp/yt-dlp"
-        )
+    _yt_dlp_command()
 
 
 def _run_ytdlp(
-    command: list[str], *, timeout_seconds: int
+    args: list[str], *, timeout_seconds: int
 ) -> subprocess.CompletedProcess:
     return subprocess.run(
-        command,
+        [*_yt_dlp_command(), *args],
         capture_output=True,
         text=True,
         timeout=timeout_seconds,
@@ -112,7 +130,6 @@ def probe_ytdlp_metadata(
         _check_ytdlp()
         result = _run_ytdlp(
             [
-                "yt-dlp",
                 "--dump-single-json",
                 "--no-download",
                 "--no-playlist",
@@ -366,7 +383,6 @@ class YtDlpReference:
 
         result = _run_ytdlp(
             [
-                "yt-dlp",
                 "--dump-single-json",
                 "--no-download",
                 "--no-playlist",
@@ -417,7 +433,6 @@ class YtDlpReference:
 
         result = _run_ytdlp(
             [
-                "yt-dlp",
                 "-x",
                 "--audio-format",
                 "mp3",

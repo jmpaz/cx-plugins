@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 from cx_plugins.providers.atproto import plugin as atproto_plugin
 from cx_plugins.providers.soundcloud import plugin as soundcloud_plugin
@@ -60,6 +61,55 @@ def test_can_resolve_uses_extractor_matching_without_probe(monkeypatch) -> None:
 
     assert ytdlp_plugin.can_resolve("https://example.com/ok", {}) is True
     assert ytdlp_plugin.can_resolve("https://example.com/nope", {}) is False
+
+
+def test_ytdlp_command_prefers_bundled_python_module(monkeypatch) -> None:
+    monkeypatch.setattr(ytdlp, "_yt_dlp_module_available", lambda: True)
+    monkeypatch.setattr(ytdlp.shutil, "which", lambda _name: "/usr/bin/yt-dlp")
+
+    assert ytdlp._yt_dlp_command() == [sys.executable, "-m", "yt_dlp"]
+
+
+def test_ytdlp_command_falls_back_to_path_executable(monkeypatch) -> None:
+    monkeypatch.setattr(ytdlp, "_yt_dlp_module_available", lambda: False)
+    monkeypatch.setattr(ytdlp.shutil, "which", lambda name: f"/bin/{name}")
+
+    assert ytdlp._yt_dlp_command() == ["/bin/yt-dlp"]
+
+
+def test_ytdlp_command_reports_missing_runtime(monkeypatch) -> None:
+    monkeypatch.setattr(ytdlp, "_yt_dlp_module_available", lambda: False)
+    monkeypatch.setattr(ytdlp.shutil, "which", lambda _name: None)
+
+    try:
+        ytdlp._yt_dlp_command()
+    except RuntimeError as exc:
+        assert "yt_dlp Python package or yt-dlp executable" in str(exc)
+    else:
+        raise AssertionError("expected missing yt-dlp runtime to raise")
+
+
+def test_run_ytdlp_uses_resolved_command(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(ytdlp, "_yt_dlp_command", lambda: ["python", "-m", "yt_dlp"])
+
+    def _run(command: list[str], **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+
+        class _Result:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        return _Result()
+
+    monkeypatch.setattr(ytdlp.subprocess, "run", _run)
+
+    ytdlp._run_ytdlp(["--version"], timeout_seconds=3)
+
+    assert captured["command"] == ["python", "-m", "yt_dlp", "--version"]
+    assert captured["kwargs"]["timeout"] == 3
 
 
 def test_can_resolve_probes_substack_before_claiming(monkeypatch) -> None:
