@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from contextualize.runtime import reset_verbose_logging, set_verbose_logging
 from contextualize.plugins.api import (
     TranscriptionProviderError,
     TranscriptionRequest,
@@ -274,7 +275,7 @@ def test_openai_provider_omits_language_when_unspecified(
     }
 
 
-def test_openai_provider_passes_unbounded_timeout(
+def test_openai_provider_uses_bounded_network_timeout_when_unbounded(
     openai_env: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -301,7 +302,41 @@ def test_openai_provider_passes_unbounded_timeout(
     )
 
     assert result.text == "transcribed"
-    assert captured["timeout"] is None
+    assert captured["timeout"] == (10.0, 1800.0)
+
+
+def test_openai_provider_verbose_logs_to_stderr(
+    openai_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def _post(url: str, **kwargs: object) -> _Response:
+        return _Response(200, payload={"text": "transcribed"})
+
+    monkeypatch.setattr(openai, "_requests_post", _post)
+    token = set_verbose_logging(True)
+    try:
+        result = openai.build_openai_provider().transcribe(
+            TranscriptionRequest(
+                data=b"audio",
+                filename="clip.mp3",
+                content_type="audio/mpeg",
+                timeout=30,
+                language=None,
+                prompt="",
+                bias_terms=(),
+                diarize=False,
+                speaker_count=None,
+            )
+        )
+    finally:
+        reset_verbose_logging(token)
+
+    captured = capsys.readouterr()
+    assert result.text == "transcribed"
+    assert captured.out == ""
+    assert "[openai-transcribe] request start" in captured.err
+    assert "[openai-transcribe] request finished" in captured.err
 
 
 def test_openai_provider_sends_explicit_model(

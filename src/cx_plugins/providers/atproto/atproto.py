@@ -1507,7 +1507,7 @@ def _describe_media(
         store_rendered,
     )
     from contextualize.render.markitdown import convert_path_to_markdown
-    from contextualize.references.audio_transcription import transcribe_audio_file
+    from contextualize.transcription import transcribe_audio_file
     from ..shared.media import download_cached_media_to_temp
 
     url = media.get("url")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 
 from contextualize.auth.common import load_dotenv_optional
 from contextualize.plugins.api import (
@@ -14,12 +15,30 @@ from contextualize.plugins.api import (
 )
 
 _MISTRAL_AUTH_CODES = {401, 402, 403}
+_UNBOUNDED_CONNECT_TIMEOUT_SECONDS = 10.0
+_UNBOUNDED_READ_TIMEOUT_SECONDS = 1800.0
 
 
 def _requests_post(*args: object, **kwargs: object):
     import requests
 
     return requests.post(*args, **kwargs)
+
+
+def _log(message: str) -> None:
+    try:
+        from contextualize.runtime import get_verbose_logging
+
+        if get_verbose_logging():
+            print(f"[mistral-transcribe] {message}", file=sys.stderr, flush=True)
+    except Exception:
+        return
+
+
+def _network_timeout(timeout: float | None) -> float | tuple[float, float]:
+    if timeout is not None:
+        return timeout
+    return (_UNBOUNDED_CONNECT_TIMEOUT_SECONDS, _UNBOUNDED_READ_TIMEOUT_SECONDS)
 
 
 def build_mistral_provider() -> TranscriptionProvider:
@@ -136,8 +155,14 @@ def _transcribe_mistral(request: TranscriptionRequest) -> TranscriptionResult:
     if request.bias_terms:
         data["context_bias"] = ", ".join(request.bias_terms)
 
+    endpoint = _mistral_endpoint()
+    _log(
+        "request start "
+        f"endpoint={endpoint} model={model} filename={request.filename} "
+        f"diarize={request.diarize}"
+    )
     response = _requests_post(
-        _mistral_endpoint(),
+        endpoint,
         headers={"Authorization": f"Bearer {api_key}"},
         files={
             "file": (
@@ -147,7 +172,11 @@ def _transcribe_mistral(request: TranscriptionRequest) -> TranscriptionResult:
             )
         },
         data=data,
-        timeout=request.timeout,
+        timeout=_network_timeout(request.timeout),
+    )
+    _log(
+        "request finished "
+        f"status={response.status_code} model={model} filename={request.filename}"
     )
     if response.status_code in _MISTRAL_AUTH_CODES:
         raise TranscriptionProviderAuthError(

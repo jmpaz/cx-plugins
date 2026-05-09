@@ -4,6 +4,7 @@ import hashlib
 import mimetypes
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 import shutil
@@ -35,6 +36,8 @@ _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 _PARAGRAPH_TARGET_CHARS = 420
 _PARAGRAPH_MAX_CHARS = 620
 _TRANSCRIPT_FORMAT_VERSION = 2
+_UNBOUNDED_CONNECT_TIMEOUT_SECONDS = 10.0
+_UNBOUNDED_READ_TIMEOUT_SECONDS = 1800.0
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,22 @@ def _requests_get(*args: object, **kwargs: object):
     import requests
 
     return requests.get(*args, **kwargs)
+
+
+def _log(message: str) -> None:
+    try:
+        from contextualize.runtime import get_verbose_logging
+
+        if get_verbose_logging():
+            print(f"[openai-transcribe] {message}", file=sys.stderr, flush=True)
+    except Exception:
+        return
+
+
+def _network_timeout(timeout: float | None) -> float | tuple[float, float]:
+    if timeout is not None:
+        return timeout
+    return (_UNBOUNDED_CONNECT_TIMEOUT_SECONDS, _UNBOUNDED_READ_TIMEOUT_SECONDS)
 
 
 def build_openai_provider() -> TranscriptionProvider:
@@ -536,12 +555,22 @@ def _transcribe_openai_once(
         )
         request_data = data_items
 
+    _log(
+        "request start "
+        f"endpoint={endpoint} model={model or 'server-default'} "
+        f"filename={filename} diarize={diarize}"
+    )
     response = _requests_post(
         endpoint,
         headers=headers,
         files={"file": (filename, data, content_type)},
         data=request_data,
-        timeout=timeout,
+        timeout=_network_timeout(timeout),
+    )
+    _log(
+        "request finished "
+        f"status={response.status_code} model={model or 'server-default'} "
+        f"filename={filename}"
     )
     if response.status_code in {401, 402, 403}:
         raise TranscriptionProviderAuthError(
@@ -582,7 +611,9 @@ def _bounded_timeout(
     maximum: float | None = None,
 ) -> float | None:
     if timeout is None:
-        return None
+        if maximum is not None:
+            return maximum
+        return _UNBOUNDED_READ_TIMEOUT_SECONDS
     value = max(minimum, timeout)
     if maximum is not None:
         value = min(value, maximum)

@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
+from contextualize import transcription
+from contextualize.runtime import reset_verbose_logging, set_verbose_logging
 from cx_plugins.providers.atproto import plugin as atproto_plugin
 from cx_plugins.providers.soundcloud import plugin as soundcloud_plugin
 from cx_plugins.providers.ytdlp import plugin as ytdlp_plugin
@@ -19,9 +21,9 @@ def test_render_cache_identity_varies_by_transcription_overrides(
 ) -> None:
     base = "youtube:abc123"
     monkeypatch.setattr(
-        ytdlp,
-        "_transcription_routing_identity",
-        lambda _overrides: {"model": "cohere"},
+        transcription,
+        "transcription_routing_identity",
+        lambda **_kwargs: {"model": "cohere"},
     )
 
     es_identity = ytdlp._render_cache_identity(
@@ -49,10 +51,12 @@ def test_render_cache_identity_varies_by_effective_transcription_routing(
     base = "youtube:abc123"
     routing = {"model": "cohere"}
 
-    def _routing_identity(_overrides):
+    def _routing_identity(**_kwargs):
         return dict(routing)
 
-    monkeypatch.setattr(ytdlp, "_transcription_routing_identity", _routing_identity)
+    monkeypatch.setattr(
+        transcription, "transcription_routing_identity", _routing_identity
+    )
 
     cohere_identity = ytdlp._render_cache_identity(
         base,
@@ -65,6 +69,17 @@ def test_render_cache_identity_varies_by_effective_transcription_routing(
     )
 
     assert cohere_identity != mistral_identity
+
+
+def test_providers_do_not_import_private_transcription_helpers() -> None:
+    provider_root = Path(__file__).parents[1] / "src" / "cx_plugins" / "providers"
+    offenders = []
+    for path in provider_root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        if "contextualize.references.audio_transcription import _" in text:
+            offenders.append(path.relative_to(provider_root).as_posix())
+
+    assert offenders == []
 
 
 def test_can_resolve_uses_extractor_matching_without_probe(monkeypatch) -> None:
@@ -141,6 +156,34 @@ def test_run_ytdlp_uses_resolved_command(monkeypatch) -> None:
 
     assert captured["command"] == ["python", "-m", "yt_dlp", "--version"]
     assert captured["kwargs"]["timeout"] == 3
+
+
+def test_run_ytdlp_streams_progress_to_verbose_stderr(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        ytdlp,
+        "_yt_dlp_command",
+        lambda: [
+            sys.executable,
+            "-c",
+            "import sys; print('download phase', flush=True)",
+        ],
+    )
+    token = set_verbose_logging(True)
+    try:
+        result = ytdlp._run_ytdlp(
+            ["--ignored"],
+            timeout_seconds=5,
+            idle_timeout_seconds=5,
+            stream_progress=True,
+        )
+    finally:
+        reset_verbose_logging(token)
+
+    captured = capsys.readouterr()
+    assert result.returncode == 0
+    assert "download phase" in result.stderr
+    assert captured.out == ""
+    assert "[ytdlp] yt-dlp: download phase" in captured.err
 
 
 def test_can_resolve_probes_substack_before_claiming(monkeypatch) -> None:
@@ -302,6 +345,27 @@ def test_resolve_returns_explicit_failure_doc_when_claimed_media_breaks(
     assert "failed to resolve" in docs[0]["content"]
 
 
+def test_resolve_returns_explicit_failure_doc_when_read_breaks(
+    monkeypatch,
+) -> None:
+    class _BrokenReference:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def read(self) -> str:
+            raise RuntimeError("download timed out")
+
+    monkeypatch.setattr(ytdlp, "looks_like_ytdlp_url", lambda _url: True)
+    monkeypatch.setattr(ytdlp, "YtDlpReference", _BrokenReference)
+
+    docs = ytdlp_plugin.resolve("https://youtu.be/example", {})
+
+    assert len(docs) == 1
+    assert docs[0]["metadata"]["provider"] == "ytdlp"
+    assert docs[0]["metadata"]["resolution_error"] == "download timed out"
+    assert "download timed out" in docs[0]["content"]
+
+
 def test_resolve_reraises_unexpected_reference_bugs(monkeypatch) -> None:
     class _BuggyReference:
         def __init__(self, *args, **kwargs) -> None:
@@ -316,6 +380,25 @@ def test_resolve_reraises_unexpected_reference_bugs(monkeypatch) -> None:
         assert str(exc) == "unexpected bug"
     else:
         raise AssertionError("expected unexpected reference bugs to be reraised")
+
+
+def test_resolve_reraises_unexpected_read_bugs(monkeypatch) -> None:
+    class _BuggyReference:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def read(self) -> str:
+            raise TypeError("unexpected read bug")
+
+    monkeypatch.setattr(ytdlp, "looks_like_ytdlp_url", lambda _url: True)
+    monkeypatch.setattr(ytdlp, "YtDlpReference", _BuggyReference)
+
+    try:
+        ytdlp_plugin.resolve("https://youtu.be/example", {})
+    except TypeError as exc:
+        assert str(exc) == "unexpected read bug"
+    else:
+        raise AssertionError("expected unexpected read bugs to be reraised")
 
 
 def test_build_identity_uses_extractor_and_id_or_url_hash() -> None:
@@ -376,7 +459,7 @@ def test_get_transcript_passes_transcription_cache_flags(
 
     monkeypatch.setattr(ytdlp.YtDlpReference, "_extract_audio", _extract_audio)
     monkeypatch.setattr(
-        "contextualize.references.audio_transcription.transcribe_media_file",
+        "contextualize.transcription.transcribe_media_file",
         _transcribe,
     )
 
@@ -433,3 +516,41 @@ def test_extract_audio_uses_cached_media_bytes(tmp_path: Path, monkeypatch) -> N
     assert audio_path.read_bytes() == b"cached-audio"
     assert calls == []
     audio_path.unlink(missing_ok=True)
+
+
+def test_extract_audio_requests_audio_only_format(monkeypatch) -> None:
+    ref = object.__new__(ytdlp.YtDlpReference)
+    ref.url = "https://example.com/watch"
+    ref.use_cache = False
+    ref.refresh_cache = False
+    ref.plugin_overrides = None
+    ref._metadata = {"extractor_key": "YouTube", "id": "abc123"}
+    ref._identity = ytdlp._build_identity(ref.url, ref._metadata)  # noqa: SLF001
+
+    monkeypatch.setattr(
+        "contextualize.runtime.get_refresh_audio",
+        lambda: False,
+    )
+    calls: list[list[str]] = []
+
+    def _run(args, **kwargs):
+        calls.append(args)
+        output_template = args[args.index("-o") + 1]
+        output_path = Path(output_template.replace("%(ext)s", "mp3"))
+        output_path.write_bytes(b"audio")
+
+        class _Result:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        return _Result()
+
+    monkeypatch.setattr(ytdlp, "_run_ytdlp", _run)
+
+    audio_path = ytdlp.YtDlpReference._extract_audio(ref)
+
+    assert audio_path.read_bytes() == b"audio"
+    assert calls
+    assert calls[0][0:2] == ["-f", "bestaudio/best"]
+    assert calls[0][2:4] == ["--concurrent-fragments", "16"]

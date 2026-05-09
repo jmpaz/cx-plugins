@@ -1931,7 +1931,7 @@ def _transcribe_media_path(
     filename: str,
     content_type: str,
 ) -> str | None:
-    from contextualize.references.audio_transcription import (
+    from contextualize.transcription import (
         transcribe_audio_bytes,
         transcribe_audio_file,
     )

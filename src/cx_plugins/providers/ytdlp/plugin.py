@@ -63,6 +63,24 @@ def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | No
     }
 
 
+def _failure_document(target: str, exc: BaseException) -> dict[str, Any]:
+    netloc = urlparse(target).netloc or "ytdlp"
+    return {
+        "source": target,
+        "label": target,
+        "content": f"yt-dlp claimed this media URL but failed to resolve it: {exc}",
+        "metadata": {
+            "trace_path": target,
+            "provider": PLUGIN_NAME,
+            "source_ref": netloc,
+            "source_path": target,
+            "context_subpath": "ytdlp-error.md",
+            "kind": "video",
+            "resolution_error": str(exc),
+        },
+    }
+
+
 def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
     from .ytdlp import YtDlpReference, looks_like_ytdlp_url
 
@@ -80,37 +98,30 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
     except _EXPECTED_RESOLUTION_ERRORS as exc:
         if not looks_like_ytdlp_url(target):
             raise
-        netloc = urlparse(target).netloc or "ytdlp"
-        return [
-            {
-                "source": target,
-                "label": target,
-                "content": (
-                    f"yt-dlp claimed this media URL but failed to resolve it: {exc}"
-                ),
-                "metadata": {
-                    "trace_path": target,
-                    "provider": PLUGIN_NAME,
-                    "source_ref": netloc,
-                    "source_path": target,
-                    "context_subpath": "ytdlp-error.md",
-                    "kind": "video",
-                    "resolution_error": str(exc),
-                },
-            }
-        ]
+        return [_failure_document(target, exc)]
+    try:
+        content = reference.read()
+        label = reference.get_label()
+        source_ref = reference.source_ref()
+        source_path = reference.source_path()
+        context_subpath = reference.context_subpath()
+        kind = reference.get_kind()
+    except _EXPECTED_RESOLUTION_ERRORS as exc:
+        if not looks_like_ytdlp_url(target):
+            raise
+        return [_failure_document(target, exc)]
     return [
         {
             "source": target,
-            "label": reference.get_label(),
-            "content": reference.read(),
+            "label": label,
+            "content": content,
             "metadata": {
-                "trace_path": reference.get_label(),
+                "trace_path": label,
                 "provider": PLUGIN_NAME,
-                "source_ref": reference.source_ref(),
-                "source_path": reference.source_path(),
-                "context_subpath": reference.context_subpath(),
-                "kind": reference.get_kind(),
+                "source_ref": source_ref,
+                "source_path": source_path,
+                "context_subpath": context_subpath,
+                "kind": kind,
             },
         }
     ]

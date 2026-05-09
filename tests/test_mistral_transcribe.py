@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextualize.runtime import reset_verbose_logging, set_verbose_logging
 from contextualize.plugins.api import TranscriptionRequest
 from cx_plugins.providers.transcribe import mistral
 
@@ -73,7 +74,7 @@ def test_mistral_provider_keeps_timestamps_when_language_is_auto(monkeypatch) ->
     }
 
 
-def test_mistral_provider_passes_unbounded_timeout(monkeypatch) -> None:
+def test_mistral_provider_uses_bounded_network_timeout_when_unbounded(monkeypatch) -> None:
     monkeypatch.setenv("MISTRAL_API_KEY", "key")
     captured: dict[str, object] = {}
 
@@ -97,7 +98,39 @@ def test_mistral_provider_passes_unbounded_timeout(monkeypatch) -> None:
         )
     )
 
-    assert captured["timeout"] is None
+    assert captured["timeout"] == (10.0, 1800.0)
+
+
+def test_mistral_provider_verbose_logs_to_stderr(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("MISTRAL_API_KEY", "key")
+
+    def _post(*args: object, **kwargs: object) -> _Response:
+        return _Response()
+
+    monkeypatch.setattr(mistral, "_requests_post", _post)
+    token = set_verbose_logging(True)
+    try:
+        result = mistral.build_mistral_provider().transcribe(
+            TranscriptionRequest(
+                data=b"audio",
+                filename="clip.mp3",
+                content_type="audio/mpeg",
+                timeout=30,
+                language=None,
+                prompt="",
+                bias_terms=(),
+                diarize=True,
+                speaker_count=2,
+            )
+        )
+    finally:
+        reset_verbose_logging(token)
+
+    captured = capsys.readouterr()
+    assert result.text == "transcribed"
+    assert captured.out == ""
+    assert "[mistral-transcribe] request start" in captured.err
+    assert "[mistral-transcribe] request finished" in captured.err
 
 
 def test_mistral_provider_uses_explicit_model_override(monkeypatch) -> None:

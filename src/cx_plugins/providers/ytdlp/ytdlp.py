@@ -4,10 +4,12 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import timedelta
 from functools import lru_cache
@@ -111,14 +113,123 @@ def _check_ytdlp() -> None:
 
 
 def _run_ytdlp(
-    args: list[str], *, timeout_seconds: int
+    args: list[str],
+    *,
+    timeout_seconds: int | float | None,
+    idle_timeout_seconds: int | float | None = None,
+    stream_progress: bool = False,
 ) -> subprocess.CompletedProcess:
+    command = [*_yt_dlp_command(), *args]
+    if stream_progress:
+        return _run_ytdlp_streaming(
+            command,
+            timeout_seconds=timeout_seconds,
+            idle_timeout_seconds=idle_timeout_seconds,
+        )
     return subprocess.run(
-        [*_yt_dlp_command(), *args],
+        command,
         capture_output=True,
         text=True,
         timeout=timeout_seconds,
     )
+
+
+def _run_ytdlp_streaming(
+    command: list[str],
+    *,
+    timeout_seconds: int | float | None,
+    idle_timeout_seconds: int | float | None,
+) -> subprocess.CompletedProcess:
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if process.stdout is None:
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="",
+            stderr="yt-dlp did not expose an output pipe",
+        )
+
+    started = time.monotonic()
+    last_activity = started
+    output = bytearray()
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+
+    def append_output(chunk: bytes) -> None:
+        nonlocal last_activity
+        if not chunk:
+            return
+        last_activity = time.monotonic()
+        output.extend(chunk)
+        text = chunk.decode("utf-8", errors="replace").replace("\r", "\n")
+        for line in text.splitlines():
+            cleaned = line.strip()
+            if cleaned:
+                _log(f"yt-dlp: {cleaned}")
+
+    def terminate(reason: str) -> subprocess.CompletedProcess:
+        process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        detail = output.decode("utf-8", errors="replace")
+        message = f"{reason}\n{detail}" if detail else reason
+        return subprocess.CompletedProcess(
+            command,
+            process.returncode if process.returncode is not None else -9,
+            stdout="",
+            stderr=message,
+        )
+
+    try:
+        while True:
+            now = time.monotonic()
+            if timeout_seconds is not None and now - started >= timeout_seconds:
+                return terminate(
+                    f"yt-dlp timed out after {timeout_seconds} seconds"
+                )
+            if (
+                idle_timeout_seconds is not None
+                and now - last_activity >= idle_timeout_seconds
+            ):
+                return terminate(
+                    "yt-dlp produced no output for "
+                    f"{idle_timeout_seconds} seconds"
+                )
+
+            if process.poll() is not None:
+                remaining = process.stdout.read()
+                if remaining:
+                    append_output(remaining)
+                break
+
+            deadlines: list[float] = []
+            if timeout_seconds is not None:
+                deadlines.append(started + timeout_seconds)
+            if idle_timeout_seconds is not None:
+                deadlines.append(last_activity + idle_timeout_seconds)
+            wait_for = 1.0
+            if deadlines:
+                wait_for = max(0.05, min(1.0, min(deadlines) - time.monotonic()))
+            events = selector.select(wait_for)
+            for key, _ in events:
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if chunk:
+                    append_output(chunk)
+
+        return subprocess.CompletedProcess(
+            command,
+            process.returncode or 0,
+            stdout="",
+            stderr=output.decode("utf-8", errors="replace"),
+        )
+    finally:
+        selector.close()
 
 
 def probe_ytdlp_metadata(
@@ -282,9 +393,9 @@ def _build_identity(url: str, metadata: dict[str, Any]) -> _YtDlpIdentity:
 def _transcription_routing_identity(
     plugin_overrides: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    from contextualize.references.audio_transcription import _routing_cache_identity
+    from contextualize.transcription import transcription_routing_identity
 
-    return _routing_cache_identity(
+    return transcription_routing_identity(
         filename="media.mp3",
         content_type="audio/mpeg",
         plugin_overrides=plugin_overrides,
@@ -395,6 +506,7 @@ class YtDlpReference:
         if self._metadata is not None:
             return self._metadata
 
+        _log(f"fetching metadata for {self.url}")
         result = _run_ytdlp(
             [
                 "--dump-single-json",
@@ -415,6 +527,8 @@ class YtDlpReference:
         if not isinstance(metadata, dict):
             raise RuntimeError("yt-dlp metadata returned unexpected payload")
         self._metadata = metadata
+        title = metadata.get("title") if isinstance(metadata, dict) else None
+        _log(f"metadata fetched for {title or self.url}")
         return self._metadata
 
     def _get_identity(self) -> _YtDlpIdentity:
@@ -447,7 +561,15 @@ class YtDlpReference:
 
         result = _run_ytdlp(
             [
+                "-f",
+                "bestaudio/best",
+                "--concurrent-fragments",
+                "16",
                 "-x",
+                "--newline",
+                "--progress",
+                "--socket-timeout",
+                "30",
                 "--audio-format",
                 "mp3",
                 "--audio-quality",
@@ -458,7 +580,9 @@ class YtDlpReference:
                 "--",
                 self.url,
             ],
-            timeout_seconds=600,
+            timeout_seconds=None,
+            idle_timeout_seconds=180,
+            stream_progress=True,
         )
         if result.returncode != 0:
             raise RuntimeError(f"yt-dlp audio extraction failed: {result.stderr}")
@@ -469,6 +593,7 @@ class YtDlpReference:
             audio_files = sorted(path for path in audio_dir.iterdir() if path.is_file())
         if not audio_files:
             raise RuntimeError("yt-dlp audio extraction produced no audio file")
+        _log(f"audio extraction finished for {identity.display_name}")
         if self.use_cache:
             try:
                 store_media_bytes(cache_identity, audio_files[0].read_bytes())
@@ -481,16 +606,20 @@ class YtDlpReference:
         audio_path = None
         try:
             audio_path = self._extract_audio()
-            from contextualize.references.audio_transcription import (
+            from contextualize.transcription import (
                 transcribe_media_file,
             )
 
+            identity = getattr(self, "_identity", None)
+            display_name = getattr(identity, "display_name", audio_path.name)
+            _log(f"transcribing extracted audio for {display_name}")
             transcript = transcribe_media_file(
                 audio_path,
                 use_cache=self.use_cache,
                 refresh_cache=self.refresh_cache,
                 plugin_overrides=self.plugin_overrides,
             )
+            _log(f"transcription finished for {display_name}")
             return transcript, "transcription"
         finally:
             if audio_path and audio_path.exists():
