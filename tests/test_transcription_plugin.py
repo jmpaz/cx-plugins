@@ -141,6 +141,8 @@ def test_get_transcription_providers_returns_openai_and_mistral() -> None:
     providers = get_transcription_providers()
 
     assert [provider.name for provider in providers] == ["openai", "mistral"]
+    assert [provider.supports_diarization for provider in providers] == [False, True]
+    assert providers[1].default_model == "voxtral-mini-latest"
 
 
 def test_get_transcription_gates_returns_pyannote_gate() -> None:

@@ -675,6 +675,16 @@ class YtDlpReference:
                 whisper_available=whisper_available,
             )
             if cached is not None:
+                from contextualize.transcription import (
+                    record_transcription_routing_summary,
+                )
+
+                record_transcription_routing_summary(
+                    filename="media.mp3",
+                    content_type="audio/mpeg",
+                    plugin_overrides=self.plugin_overrides,
+                    source="render-cache",
+                )
                 _log(f"render cache hit for {identity.display_name}")
                 self.original_file_content = cached
                 self.file_content = cached

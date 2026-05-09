@@ -87,6 +87,8 @@ def build_openai_provider() -> TranscriptionProvider:
         transcribe=_transcribe_openai,
         cache_identity=_openai_cache_identity,
         is_available=_is_openai_available,
+        supports_diarization=False,
+        default_model=_openai_model(),
     )
 
 

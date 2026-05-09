@@ -71,6 +71,51 @@ def test_render_cache_identity_varies_by_effective_transcription_routing(
     assert cohere_identity != mistral_identity
 
 
+def test_render_cache_hit_records_transcription_routing_without_changing_output(
+    monkeypatch,
+) -> None:
+    cached_text = "---\ntitle: Cached\n---\n\ncached transcript"
+    ref = object.__new__(ytdlp.YtDlpReference)
+    ref.url = "https://example.com/watch"
+    ref.format = "raw"
+    ref.label = "relative"
+    ref.token_target = "cl100k_base"
+    ref.include_token_count = False
+    ref.label_suffix = None
+    ref.inject = False
+    ref.depth = 5
+    ref.trace_collector = None
+    ref.use_cache = True
+    ref.cache_ttl = None
+    ref.refresh_cache = False
+    ref.plugin_overrides = {"transcribe": {"diarize": True, "speakers": 2}}
+    ref._metadata = {"extractor_key": "YouTube", "id": "abc123", "title": "Cached"}
+    ref._identity = ytdlp._build_identity(ref.url, ref._metadata)  # noqa: SLF001
+    calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        "contextualize.cache.youtube.get_cached_transcript",
+        lambda *_args, **_kwargs: cached_text,
+    )
+    monkeypatch.setattr(
+        transcription,
+        "record_transcription_routing_summary",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    output = ytdlp.YtDlpReference._get_contents(ref)
+
+    assert output == cached_text
+    assert calls == [
+        {
+            "filename": "media.mp3",
+            "content_type": "audio/mpeg",
+            "plugin_overrides": {"transcribe": {"diarize": True, "speakers": 2}},
+            "source": "render-cache",
+        }
+    ]
+
+
 def test_providers_do_not_import_private_transcription_helpers() -> None:
     provider_root = Path(__file__).parents[1] / "src" / "cx_plugins" / "providers"
     offenders = []

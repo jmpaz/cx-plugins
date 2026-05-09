@@ -48,6 +48,8 @@ def build_mistral_provider() -> TranscriptionProvider:
         transcribe=_transcribe_mistral,
         cache_identity=_mistral_cache_identity,
         is_available=_is_mistral_available,
+        supports_diarization=True,
+        default_model=_mistral_model(),
     )
 
 
