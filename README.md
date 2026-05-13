@@ -20,6 +20,7 @@ This package provides the following plugins:
 | `discord` | Discord | messages, threads, channels |
 | `soundcloud` | SoundCloud | tracks, playlists, profiles |
 | `wikipedia` | Wikipedia | article pages |
+| `whatsapp` | WhatsApp | exported chat archives |
 | `ytdlp` | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | supported media URLs (YouTube/Vimeo, TikTok/IG, etc) |
 
 ## Installation
