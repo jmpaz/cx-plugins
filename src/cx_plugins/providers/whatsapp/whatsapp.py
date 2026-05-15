@@ -389,12 +389,11 @@ class WhatsAppArchiveSource(WhatsAppSource):
             return None
 
     def media_identity(self, attachment: WhatsAppAttachment) -> str:
-        try:
-            stat = self.path.stat()
-            archive_key = f"{self.path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}"
-        except OSError:
-            archive_key = str(self.path)
-        return f"whatsapp:archive:{archive_key}:media:{attachment.member_name}"
+        data = self.read_media(attachment)
+        if data is not None:
+            media_key = hashlib.sha256(data).hexdigest()
+            return f"whatsapp:media:sha256:{media_key}"
+        return f"whatsapp:archive:{self.path}:media:{attachment.member_name}"
 
     def _load_chat_info(self) -> WhatsAppChatInfo:
         if self._chat_info is not None:
@@ -980,14 +979,14 @@ def _parse_media_kind(*, filename: str, content_type: str | None) -> str:
 
 def _media_render_cache_identity(
     *,
-    media_cache_identity: str,
+    media_sha256: str,
     suffix: str,
     mode: str,
     media_kind: str,
 ) -> str:
     return "whatsapp-media-render:" + json.dumps(
         {
-            "media_cache_identity": media_cache_identity,
+            "media_sha256": media_sha256,
             "suffix": suffix,
             "mode": mode,
             "media_kind": media_kind,
@@ -1000,7 +999,6 @@ def _media_render_cache_identity(
 def _describe_media_bytes(
     data: bytes,
     *,
-    media_cache_identity: str,
     filename: str,
     kind: str,
     content_type: str | None,
@@ -1008,9 +1006,10 @@ def _describe_media_bytes(
 ) -> str | None:
     if not data:
         return None
+    media_sha256 = hashlib.sha256(data).hexdigest()
     suffix = Path(filename).suffix.lower() or ".bin"
     render_identity = _media_render_cache_identity(
-        media_cache_identity=media_cache_identity,
+        media_sha256=media_sha256,
         suffix=suffix,
         mode=mode,
         media_kind=kind,
@@ -1020,7 +1019,9 @@ def _describe_media_bytes(
     if not get_refresh_media():
         cached = _get_cached_rendered(render_identity)
         if cached and cached.strip() and not _is_invalid_media_description(cached):
+            _log(f"  whatsapp media render cache hit: {filename}")
             return cached
+        _log(f"  whatsapp media render cache miss: {filename}")
 
     fd, raw_path = tempfile.mkstemp(suffix=suffix)
     path = Path(raw_path)
@@ -1169,8 +1170,6 @@ def _normalize_attachment_nodes(
         ):
             media_desc = _describe_media_bytes(
                 data,
-                media_cache_identity=source.media_identity(attachment)
-                + f":message:{message.id}:attachment:{index}",
                 filename=attachment.filename,
                 kind=kind,
                 content_type=attachment.content_type,

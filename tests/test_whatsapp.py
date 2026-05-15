@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import types
 import zipfile
 from datetime import datetime
 from pathlib import Path
+
+import pytest
 
 from cx_plugins.providers.whatsapp import plugin as whatsapp_plugin
 from cx_plugins.providers.whatsapp import whatsapp
@@ -52,6 +55,71 @@ def test_archive_parser_handles_bidi_prefixed_media_and_empty_captions(
     assert messages[2].attachments[0].filename == "photo.jpg"
     assert messages[3].content == "caption"
     assert messages[3].attachments[0].filename == "audio.opus"
+
+
+def test_archive_media_identity_uses_media_content_hash(tmp_path: Path) -> None:
+    archive = _write_archive(
+        tmp_path,
+        "\u200e[5/13/26, 10:33:28\u202fAM] Josh: \u200e<attached: photo.jpg>",
+        {"photo.jpg": b"\xff\xd8\xfffake"},
+    )
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    archive_with_different_chat_text = _write_archive(
+        other_dir,
+        "\u200e[5/13/26, 10:33:28\u202fAM] Josh: different words \u200e<attached: photo.jpg>",
+        {"photo.jpg": b"\xff\xd8\xfffake"},
+    )
+
+    first_source = whatsapp.WhatsAppArchiveSource(archive)
+    second_source = whatsapp.WhatsAppArchiveSource(archive_with_different_chat_text)
+    first_attachment = first_source.iter_messages("manu")[0].attachments[0]
+    second_attachment = second_source.iter_messages("manu")[0].attachments[0]
+
+    identity = first_source.media_identity(first_attachment)
+    assert identity.startswith("whatsapp:media:sha256:")
+    assert identity == second_source.media_identity(second_attachment)
+
+
+def test_media_render_cache_reuses_matching_media_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache: dict[str, str] = {}
+    convert_calls: list[bytes] = []
+
+    def fake_convert_path_to_markdown(path: str, *, refresh_images: bool = False):
+        convert_calls.append(Path(path).read_bytes())
+        return types.SimpleNamespace(markdown="cached description")
+
+    monkeypatch.setattr(whatsapp, "_get_cached_rendered", cache.get)
+    monkeypatch.setattr(
+        whatsapp,
+        "_store_rendered",
+        lambda identity, content: cache.setdefault(identity, content),
+    )
+    monkeypatch.setattr(
+        "contextualize.render.markitdown.convert_path_to_markdown",
+        fake_convert_path_to_markdown,
+    )
+
+    first = whatsapp._describe_media_bytes(
+        b"\xff\xd8\xffsame",
+        filename="first.jpg",
+        kind="image",
+        content_type="image/jpeg",
+        mode="describe",
+    )
+    second = whatsapp._describe_media_bytes(
+        b"\xff\xd8\xffsame",
+        filename="second.jpg",
+        kind="image",
+        content_type="image/jpeg",
+        mode="describe",
+    )
+
+    assert first == "cached description"
+    assert second == "cached description"
+    assert convert_calls == [b"\xff\xd8\xffsame"]
 
 
 def test_quote_like_content_is_not_promoted_to_reply_metadata(tmp_path: Path) -> None:
