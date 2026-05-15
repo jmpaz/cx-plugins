@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from cx_plugins.providers.discord import discord
 from cx_plugins.providers.discord import plugin as discord_plugin
 
@@ -18,6 +20,118 @@ def test_parse_discord_url_supports_attachment_selectors() -> None:
     assert parsed is not None
     assert parsed["kind"] == "attachment"
     assert parsed["attachment_name"] == "notes.json"
+
+
+def test_discord_message_listing_exposes_attachments_and_links(monkeypatch) -> None:
+    monkeypatch.setattr(
+        discord,
+        "_fetch_message",
+        lambda *_args, **_kwargs: {
+            "id": "3",
+            "content": "see https://youtu.be/example.",
+            "attachments": [
+                {
+                    "id": "a1",
+                    "filename": "WhatsApp Chat.zip",
+                    "content_type": "application/zip",
+                    "url": "https://cdn.example/chat.zip",
+                    "size": 1024,
+                }
+            ],
+            "embeds": [{"url": "https://example.com/post", "title": "Post"}],
+        },
+    )
+
+    items = discord_plugin.list_targets(
+        "https://discord.com/channels/1/2/3",
+        {"use_cache": False, "refresh_cache": True},
+    )
+
+    assert items == [
+        {
+            "target": "https://discord.com/channels/1/2/3?attachment-id=a1",
+            "label": "WhatsApp Chat.zip",
+            "kind": "attachment:file",
+            "metadata": {
+                "attachment_id": "a1",
+                "attachment_index": 0,
+                "filename": "WhatsApp Chat.zip",
+                "content_type": "application/zip",
+                "url": "https://cdn.example/chat.zip",
+                "bytes": 1024,
+                "source_message": "https://discord.com/channels/1/2/3",
+            },
+        },
+        {
+            "target": "https://youtu.be/example",
+            "label": "https://youtu.be/example",
+            "kind": "link",
+            "metadata": {"source": "message_content"},
+        },
+        {
+            "target": "https://example.com/post",
+            "label": "Post",
+            "kind": "link",
+            "metadata": {"source": "embed", "embed_index": 0},
+        },
+    ]
+
+
+def test_discord_attachment_materialize_downloads_bytes(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        discord,
+        "_fetch_message",
+        lambda *_args, **_kwargs: {
+            "id": "3",
+            "attachments": [
+                {
+                    "id": "a1",
+                    "filename": "WhatsApp Chat.zip",
+                    "content_type": "application/zip",
+                    "url": "https://cdn.example/chat.zip",
+                }
+            ],
+        },
+    )
+
+    payload_path = tmp_path / "chat.zip"
+    payload_path.write_bytes(b"zip-bytes")
+
+    def _download(url: str, **kwargs) -> Path:
+        assert url == "https://cdn.example/chat.zip"
+        assert kwargs["cache_identity"] == "discord:message:3:attachment:a1"
+        return payload_path
+
+    monkeypatch.setattr(
+        "cx_plugins.providers.shared.media.download_cached_media_to_temp",
+        _download,
+    )
+
+    files = discord_plugin.materialize(
+        "https://discord.com/channels/1/2/3?attachment-id=a1",
+        {"use_cache": False, "refresh_cache": True},
+    )
+
+    assert files == [
+        {
+            "source": "https://discord.com/channels/1/2/3?attachment-id=a1",
+            "label": "WhatsApp Chat.zip",
+            "filename": "WhatsApp Chat.zip",
+            "content": b"zip-bytes",
+            "content_type": "application/zip",
+            "metadata": {
+                "provider": "discord",
+                "kind": "attachment",
+                "sourceMessageUrl": "https://discord.com/channels/1/2/3",
+                "attachmentUrl": "https://cdn.example/chat.zip",
+                "attachmentId": "a1",
+                "attachmentName": "WhatsApp Chat.zip",
+                "channelId": "2",
+                "messageId": "3",
+                "bytes": 9,
+            },
+        }
+    ]
 
 
 def test_collect_cli_overrides_emits_media_controls() -> None:

@@ -76,6 +76,37 @@ def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | No
     }
 
 
+def list_targets(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+    from .discord import list_discord_message_targets, parse_discord_url
+
+    parsed = parse_discord_url(target)
+    if not isinstance(parsed, dict):
+        return []
+    return list_discord_message_targets(
+        target,
+        parsed,
+        use_cache=bool(context.get("use_cache", True)),
+        cache_ttl=context.get("cache_ttl"),
+        refresh_cache=bool(context.get("refresh_cache", False)),
+    )
+
+
+def materialize(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+    from .discord import materialize_discord_attachment_target, parse_discord_url
+
+    parsed = parse_discord_url(target)
+    if not isinstance(parsed, dict):
+        return []
+    return materialize_discord_attachment_target(
+        target,
+        parsed,
+        use_cache=bool(context.get("use_cache", True)),
+        cache_ttl=context.get("cache_ttl"),
+        refresh_cache=bool(context.get("refresh_cache", False)),
+        cache_only=bool(context.get("cache_only", False)),
+    )
+
+
 def register_cli_options(command_name: str, command: click.Command) -> None:
     if command_name not in {"cat", "hydrate"}:
         return

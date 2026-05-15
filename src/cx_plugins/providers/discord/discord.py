@@ -35,6 +35,7 @@ _DISCORD_GUILD_RE = re.compile(
     r"^https?://(?:ptb\.|canary\.)?discord(?:app)?\.com/channels/"
     r"(?P<guild_id>\d+)/?$"
 )
+_INLINE_TARGET_URL_RE = re.compile(r"https?://[^\s<>()]+")
 
 _GUILD_TEXT_CHANNEL_TYPES = frozenset({0, 5, 15})
 
@@ -4361,6 +4362,252 @@ def _select_attachment_for_target(
         return matches[0]
 
     raise ValueError(f"Discord attachment target is missing a selector: {parsed}")
+
+
+def _attachment_index(message: dict[str, Any], attachment: dict[str, Any]) -> int:
+    attachments = (
+        _message_with_snapshot_media(message).get("attachments")
+        if isinstance(_message_with_snapshot_media(message), dict)
+        else []
+    )
+    if not isinstance(attachments, list):
+        return 0
+
+    attachment_id = attachment.get("id")
+    if attachment_id is not None:
+        for index, candidate in enumerate(attachments):
+            if isinstance(candidate, dict) and str(candidate.get("id") or "") == str(
+                attachment_id
+            ):
+                return index
+
+    for index, candidate in enumerate(attachments):
+        if candidate is attachment or candidate == attachment:
+            return index
+    return 0
+
+
+def _clean_inline_target_url(raw: str) -> str:
+    return raw.rstrip(".,;:!?)]}'\"")
+
+
+def _message_inline_url_targets(message: dict[str, Any]) -> list[dict[str, Any]]:
+    urls: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    content = message.get("content")
+    if isinstance(content, str):
+        for match in _INLINE_TARGET_URL_RE.finditer(content):
+            url = _clean_inline_target_url(match.group(0))
+            if url and url not in seen:
+                seen.add(url)
+                urls.append(
+                    {
+                        "target": url,
+                        "label": url,
+                        "kind": "link",
+                        "metadata": {"source": "message_content"},
+                    }
+                )
+
+    embeds = message.get("embeds") if isinstance(message.get("embeds"), list) else []
+    for embed_index, embed in enumerate(embeds):
+        if not isinstance(embed, dict):
+            continue
+        url = embed.get("url")
+        if not isinstance(url, str):
+            continue
+        url = _clean_inline_target_url(url)
+        if url and url not in seen:
+            seen.add(url)
+            urls.append(
+                {
+                    "target": url,
+                    "label": embed.get("title") if isinstance(embed.get("title"), str) else url,
+                    "kind": "link",
+                    "metadata": {
+                        "source": "embed",
+                        "embed_index": embed_index,
+                    },
+                }
+            )
+
+    return urls
+
+
+def list_discord_message_targets(
+    target: str,
+    parsed: dict[str, str],
+    *,
+    use_cache: bool,
+    cache_ttl: timedelta | None,
+    refresh_cache: bool,
+) -> list[dict[str, Any]]:
+    if parsed.get("kind") != "message":
+        return []
+
+    guild_id = parsed["guild_id"]
+    channel_id = parsed["channel_id"]
+    message_id = parsed["message_id"]
+    message = _fetch_message(
+        channel_id,
+        message_id,
+        use_cache=use_cache,
+        cache_ttl=cache_ttl,
+        refresh_cache=refresh_cache,
+    )
+    message_media = _message_with_snapshot_media(message)
+    attachments = (
+        message_media.get("attachments")
+        if isinstance(message_media, dict)
+        else []
+    )
+    items: list[dict[str, Any]] = []
+    if isinstance(attachments, list):
+        for attachment_index, attachment in enumerate(attachments):
+            if not isinstance(attachment, dict):
+                continue
+            filename = str(attachment.get("filename") or "") or "attachment"
+            content_type = str(attachment.get("content_type") or "")
+            kind = _parse_media_kind(filename=filename, content_type=content_type)
+            attachment_id_raw = attachment.get("id")
+            attachment_id = (
+                str(attachment_id_raw) if attachment_id_raw is not None else None
+            )
+            child_target = _build_attachment_ref(
+                guild_id,
+                channel_id,
+                message_id,
+                attachment_id=attachment_id,
+                filename=filename,
+            )
+            items.append(
+                {
+                    "target": child_target,
+                    "label": filename,
+                    "kind": f"attachment:{kind}",
+                    "metadata": {
+                        "attachment_id": attachment_id,
+                        "attachment_index": attachment_index,
+                        "filename": filename,
+                        "content_type": content_type or None,
+                        "url": attachment.get("url"),
+                        "bytes": _attachment_size_bytes(attachment),
+                        "source_message": target,
+                    },
+                }
+            )
+
+    items.extend(_message_inline_url_targets(message))
+    return items
+
+
+def materialize_discord_attachment_target(
+    target: str,
+    parsed: dict[str, str],
+    *,
+    use_cache: bool,
+    cache_ttl: timedelta | None,
+    refresh_cache: bool,
+    cache_only: bool = False,
+) -> list[dict[str, Any]]:
+    if parsed.get("kind") != "attachment":
+        return []
+
+    guild_id = parsed["guild_id"]
+    channel_id = parsed["channel_id"]
+    message_id = parsed["message_id"]
+    message = _fetch_message(
+        channel_id,
+        message_id,
+        use_cache=use_cache,
+        cache_ttl=cache_ttl,
+        refresh_cache=refresh_cache,
+    )
+    attachment = _select_attachment_for_target(message, parsed)
+    attachment_url = str(attachment.get("url") or "")
+    if not attachment_url:
+        raise ValueError(
+            f"Discord attachment target {target} did not include a downloadable URL"
+        )
+
+    filename = str(attachment.get("filename") or "") or "attachment"
+    content_type = str(attachment.get("content_type") or "")
+    attachment_id_raw = attachment.get("id")
+    attachment_id = str(attachment_id_raw) if attachment_id_raw is not None else None
+    attachment_index = _attachment_index(message, attachment)
+    kind = _parse_media_kind(filename=filename, content_type=content_type)
+    suffix = _media_suffix(
+        filename=filename,
+        content_type=content_type,
+        kind=kind,
+        url=attachment_url,
+    )
+    media_cache_identity = _attachment_media_cache_identity(
+        message_id=message_id,
+        attachment_id=attachment_id,
+        attachment_index=attachment_index,
+        filename=filename,
+        url=attachment_url,
+    )
+
+    from contextualize.cache.discord import (
+        get_cached_media_bytes,
+        store_media_bytes,
+    )
+    from contextualize.runtime import get_refresh_media
+    from ..shared.media import download_cached_media_to_temp
+
+    cache_label = f"msg:{message_id}:attachment:{attachment_id or filename}"
+    content: bytes | None = None
+    if cache_only:
+        content = get_cached_media_bytes(media_cache_identity)
+    else:
+        tmp = download_cached_media_to_temp(
+            attachment_url,
+            suffix=suffix,
+            headers=_MEDIA_DOWNLOAD_HEADERS,
+            cache_identity=media_cache_identity,
+            get_cached_media_bytes=get_cached_media_bytes,
+            store_media_bytes=store_media_bytes,
+            refresh_cache=refresh_cache or get_refresh_media(),
+            on_cache_hit=lambda _identity: _log(
+                f"  discord media cache hit: {cache_label}"
+            ),
+            on_cache_miss=lambda _identity: _log(
+                f"  discord media cache miss: {cache_label}"
+            ),
+        )
+        if tmp is not None:
+            try:
+                content = tmp.read_bytes()
+            finally:
+                tmp.unlink(missing_ok=True)
+
+    if not content:
+        return []
+
+    source_url = _build_message_url(guild_id, channel_id, message_id)
+    return [
+        {
+            "source": target,
+            "label": filename,
+            "filename": filename,
+            "content": content,
+            "content_type": content_type or None,
+            "metadata": {
+                "provider": "discord",
+                "kind": "attachment",
+                "sourceMessageUrl": source_url,
+                "attachmentUrl": attachment_url,
+                "attachmentId": attachment_id,
+                "attachmentName": filename,
+                "channelId": channel_id,
+                "messageId": message_id,
+                "bytes": len(content),
+            },
+        }
+    ]
 
 
 def resolve_discord_attachment_target(
