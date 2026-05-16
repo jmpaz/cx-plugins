@@ -15,12 +15,30 @@ from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qs, urlparse, urlunparse
 
 
 def is_url_target(url: str) -> bool:
     parsed = urlparse(url)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _normalized_host(url: str) -> str:
+    parsed = urlparse(url.strip())
+    host = parsed.hostname or ""
+    host = host.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def is_excluded_ytdlp_url(url: str) -> bool:
+    return _normalized_host(url) in {
+        "x.com",
+        "twitter.com",
+        "mobile.x.com",
+        "mobile.twitter.com",
+    }
 
 
 @lru_cache(maxsize=1)
@@ -81,6 +99,46 @@ def _clean_identity_part(value: Any) -> str | None:
 def _normalize_url_for_key(url: str) -> str:
     parsed = urlparse(url.strip())
     return urlunparse(parsed._replace(fragment=""))
+
+
+def _youtube_video_id_from_url(url: str) -> str | None:
+    parsed = urlparse(url.strip())
+    host = _normalized_host(url)
+    path_parts = [part for part in parsed.path.split("/") if part]
+
+    if host == "youtu.be":
+        return path_parts[0] if path_parts else None
+
+    if host not in {
+        "youtube.com",
+        "m.youtube.com",
+        "music.youtube.com",
+    }:
+        return None
+
+    if parsed.path == "/watch":
+        values = parse_qs(parsed.query).get("v") or []
+        return values[0] if values and values[0] else None
+
+    if len(path_parts) >= 2 and path_parts[0] in {"embed", "shorts", "live", "v"}:
+        return path_parts[1] or None
+
+    return None
+
+
+def _url_cache_identity(url: str) -> str:
+    normalized = _normalize_url_for_key(url)
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"url:{digest}"
+
+
+def _candidate_render_base_identities(url: str) -> tuple[str, ...]:
+    identities: list[str] = []
+    youtube_id = _youtube_video_id_from_url(url)
+    if youtube_id:
+        identities.append(f"youtube:{youtube_id}")
+    identities.append(_url_cache_identity(url))
+    return tuple(dict.fromkeys(identities))
 
 
 def _slugify(value: str, *, default: str) -> str:
@@ -378,15 +436,44 @@ def _build_identity(url: str, metadata: dict[str, Any]) -> _YtDlpIdentity:
             slug=slug,
         )
 
-    normalized = _normalize_url_for_key(url)
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    cache_identity = _url_cache_identity(url)
+    digest = cache_identity.removeprefix("url:")
     short_digest = digest[:12]
     return _YtDlpIdentity(
         extractor=extractor,
         media_id=media_id,
-        cache_identity=f"url:{digest}",
+        cache_identity=cache_identity,
         display_name=f"url:{short_digest}",
         slug=f"url-{short_digest}",
+    )
+
+
+def _identity_from_cache_identity(cache_identity: str) -> _YtDlpIdentity:
+    if cache_identity.startswith("url:"):
+        digest = cache_identity.removeprefix("url:")
+        short_digest = digest[:12]
+        return _YtDlpIdentity(
+            extractor=None,
+            media_id=None,
+            cache_identity=cache_identity,
+            display_name=f"url:{short_digest}",
+            slug=f"url-{short_digest}",
+        )
+
+    extractor, _, media_id = cache_identity.partition(":")
+    extractor = extractor or None
+    media_id = media_id or None
+    slug_parts = [
+        _slugify(part, default="id")
+        for part in (extractor, media_id)
+        if part is not None
+    ]
+    return _YtDlpIdentity(
+        extractor=extractor,
+        media_id=media_id,
+        cache_identity=cache_identity,
+        display_name=cache_identity,
+        slug="-".join(slug_parts) or "media",
     )
 
 
@@ -417,6 +504,23 @@ def _render_cache_identity(
     payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()[:16]
     return f"{base_identity}:transcribe:{digest}"
+
+
+def _fast_render_cache_identity(
+    base_identity: str, plugin_overrides: dict[str, Any] | None
+) -> str:
+    transcribe_overrides = None
+    if isinstance(plugin_overrides, dict):
+        value = plugin_overrides.get("transcribe")
+        if isinstance(value, dict):
+            transcribe_overrides = dict(value)
+    payload = {
+        "overrides": transcribe_overrides or {},
+        "routing": "fast-v1",
+    }
+    payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()[:16]
+    return f"{base_identity}:transcribe-fast:{digest}"
 
 
 def _source_ref(url: str, metadata: dict[str, Any], extractor: str | None) -> str:
@@ -486,6 +590,10 @@ class YtDlpReference:
         return self.label
 
     def source_ref(self) -> str:
+        if self._metadata is None and self._identity is not None:
+            return urlparse(self.url.strip()).netloc.strip().lower() or (
+                self._identity.extractor or "ytdlp"
+            )
         metadata = self._fetch_metadata()
         return _source_ref(self.url, metadata, self._get_identity().extractor)
 
@@ -496,6 +604,8 @@ class YtDlpReference:
         return f"ytdlp-{self._get_identity().slug}.md"
 
     def get_kind(self) -> str:
+        if self._metadata is None and self._identity is not None:
+            return "video"
         metadata = self._fetch_metadata()
         duration = metadata.get("duration")
         if isinstance(duration, (int, float)) and duration > 0:
@@ -625,6 +735,117 @@ class YtDlpReference:
             if audio_path and audio_path.exists():
                 shutil.rmtree(audio_path.parent, ignore_errors=True)
 
+    def _render_output_text(self, text: str) -> str:
+        from contextualize.render.text import process_text
+
+        if self.inject:
+            from contextualize.render.inject import inject_content_in_text
+
+            text = inject_content_in_text(
+                text, self.depth, self.trace_collector, self.url
+            )
+            self.file_content = text
+
+        return process_text(
+            text,
+            format=self.format,
+            label=self.get_label(),
+            label_suffix=self.label_suffix,
+            token_target=self.token_target,
+            include_token_count=self.include_token_count,
+        )
+
+    def _record_render_cache_hit(self, text: str, identity: _YtDlpIdentity) -> str:
+        from contextualize.transcription import (
+            record_transcription_routing_summary,
+        )
+
+        self._identity = identity
+        record_transcription_routing_summary(
+            filename="media.mp3",
+            content_type="audio/mpeg",
+            plugin_overrides=self.plugin_overrides,
+            source="render-cache",
+        )
+        _log(f"render cache hit for {identity.display_name}")
+        self.original_file_content = text
+        self.file_content = text
+        return self._render_output_text(text)
+
+    def _cached_render_output(
+        self,
+        base_identity: str,
+        whisper_available: bool,
+        *,
+        fast: bool = False,
+    ) -> str | None:
+        if not self.use_cache or self.refresh_cache:
+            return None
+
+        from contextualize.cache.youtube import get_cached_transcript
+
+        if fast:
+            render_cache_identity = _fast_render_cache_identity(
+                base_identity,
+                self.plugin_overrides,
+            )
+        else:
+            render_cache_identity = _render_cache_identity(
+                base_identity,
+                self.plugin_overrides,
+            )
+        cached = get_cached_transcript(
+            render_cache_identity,
+            self.cache_ttl,
+            whisper_available=whisper_available,
+        )
+        if cached is None:
+            return None
+        if not fast:
+            from contextualize.cache.youtube import store_transcript
+
+            store_transcript(
+                _fast_render_cache_identity(base_identity, self.plugin_overrides),
+                cached,
+                source="render-cache",
+            )
+        return self._record_render_cache_hit(
+            cached,
+            _identity_from_cache_identity(base_identity),
+        )
+
+    def _store_render_cache_aliases(
+        self,
+        *,
+        primary_base_identity: str,
+        text: str,
+        source: str,
+    ) -> None:
+        if not self.use_cache:
+            return
+
+        from contextualize.cache.youtube import store_transcript
+
+        identities = (primary_base_identity, *_candidate_render_base_identities(self.url))
+        for base_identity in tuple(dict.fromkeys(identities)):
+            if base_identity == primary_base_identity:
+                full_identity = _render_cache_identity(
+                    base_identity,
+                    self.plugin_overrides,
+                )
+                store_transcript(full_identity, text, source=source)
+            else:
+                store_transcript(
+                    _render_cache_identity(base_identity, self.plugin_overrides),
+                    text,
+                    source=source,
+                )
+            store_transcript(
+                _fast_render_cache_identity(base_identity, self.plugin_overrides),
+                text,
+                source=source,
+            )
+
     def _format_output(self, metadata: dict, transcript: str, source: str) -> str:
         title = metadata.get("title", "Untitled")
         channel = metadata.get("channel") or metadata.get("uploader")
@@ -657,9 +878,25 @@ class YtDlpReference:
         return "\n".join(lines)
 
     def _get_contents(self) -> str:
-        from contextualize.render.text import process_text
-
         whisper_available = True
+
+        for base_identity in _candidate_render_base_identities(self.url):
+            cached_output = self._cached_render_output(
+                base_identity,
+                whisper_available,
+                fast=True,
+            )
+            if cached_output is not None:
+                return cached_output
+
+        for base_identity in _candidate_render_base_identities(self.url):
+            cached_output = self._cached_render_output(
+                base_identity,
+                whisper_available,
+            )
+            if cached_output is not None:
+                return cached_output
+
         identity = self._get_identity()
         render_cache_identity = _render_cache_identity(
             identity.cache_identity,
@@ -675,35 +912,12 @@ class YtDlpReference:
                 whisper_available=whisper_available,
             )
             if cached is not None:
-                from contextualize.transcription import (
-                    record_transcription_routing_summary,
-                )
-
-                record_transcription_routing_summary(
-                    filename="media.mp3",
-                    content_type="audio/mpeg",
-                    plugin_overrides=self.plugin_overrides,
+                self._store_render_cache_aliases(
+                    primary_base_identity=identity.cache_identity,
+                    text=cached,
                     source="render-cache",
                 )
-                _log(f"render cache hit for {identity.display_name}")
-                self.original_file_content = cached
-                self.file_content = cached
-                text = cached
-                if self.inject:
-                    from contextualize.render.inject import inject_content_in_text
-
-                    text = inject_content_in_text(
-                        text, self.depth, self.trace_collector, self.url
-                    )
-                    self.file_content = text
-                return process_text(
-                    text,
-                    format=self.format,
-                    label=self.get_label(),
-                    label_suffix=self.label_suffix,
-                    token_target=self.token_target,
-                    include_token_count=self.include_token_count,
-                )
+                return self._record_render_cache_hit(cached, identity)
 
         metadata = self._fetch_metadata()
         duration = int(metadata.get("duration", 0) or 0)
@@ -718,30 +932,13 @@ class YtDlpReference:
         self.file_content = text
 
         if self.use_cache:
-            from contextualize.cache.youtube import store_transcript
-
-            store_transcript(
-                render_cache_identity,
-                text,
+            self._store_render_cache_aliases(
+                primary_base_identity=identity.cache_identity,
+                text=text,
                 source=source,
             )
 
-        if self.inject:
-            from contextualize.render.inject import inject_content_in_text
-
-            text = inject_content_in_text(
-                text, self.depth, self.trace_collector, self.url
-            )
-            self.file_content = text
-
-        return process_text(
-            text,
-            format=self.format,
-            label=self.get_label(),
-            label_suffix=self.label_suffix,
-            token_target=self.token_target,
-            include_token_count=self.include_token_count,
-        )
+        return self._render_output_text(text)
 
     def get_contents(self) -> str:
         return self.output

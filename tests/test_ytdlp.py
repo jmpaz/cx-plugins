@@ -16,6 +16,28 @@ def test_ytdlp_priority_is_below_specialized_providers() -> None:
     assert ytdlp_plugin.PLUGIN_PRIORITY < atproto_plugin.PLUGIN_PRIORITY
 
 
+def _render_ref(url: str):
+    ref = object.__new__(ytdlp.YtDlpReference)
+    ref.url = url
+    ref.format = "raw"
+    ref.label = "relative"
+    ref.token_target = "cl100k_base"
+    ref.include_token_count = False
+    ref.label_suffix = None
+    ref.inject = False
+    ref.depth = 5
+    ref.trace_collector = None
+    ref.use_cache = True
+    ref.cache_ttl = None
+    ref.refresh_cache = False
+    ref.plugin_overrides = {"transcribe": {"diarize": True, "speakers": 2}}
+    ref._metadata = None
+    ref._identity = None
+    ref.file_content = ""
+    ref.original_file_content = ""
+    return ref
+
+
 def test_render_cache_identity_varies_by_transcription_overrides(
     monkeypatch,
 ) -> None:
@@ -116,6 +138,75 @@ def test_render_cache_hit_records_transcription_routing_without_changing_output(
     ]
 
 
+def test_youtube_render_cache_hit_does_not_fetch_metadata(monkeypatch) -> None:
+    cached_text = "---\ntitle: Cached\n---\n\ncached transcript"
+    ref = _render_ref("https://youtu.be/abc123?si=share")
+    checked_identities: list[str] = []
+
+    def _get_cached(identity: str, *_args, **_kwargs) -> str | None:
+        checked_identities.append(identity)
+        if identity.startswith("youtube:abc123:transcribe-fast:"):
+            return cached_text
+        return None
+
+    def _fetch_metadata(_self):
+        raise AssertionError("metadata should not be fetched on cache hit")
+
+    monkeypatch.setattr(
+        "contextualize.cache.youtube.get_cached_transcript",
+        _get_cached,
+    )
+    monkeypatch.setattr(ytdlp.YtDlpReference, "_fetch_metadata", _fetch_metadata)
+
+    output = ytdlp.YtDlpReference._get_contents(ref)
+
+    assert output == cached_text
+    assert checked_identities[0].startswith("youtube:abc123:transcribe-fast:")
+    assert ref.source_ref() == "youtu.be"
+    assert ref.source_path() == "youtube:abc123"
+    assert ref.context_subpath() == "ytdlp-youtube-abc123.md"
+    assert ref.get_kind() == "video"
+
+
+def test_legacy_metadata_cache_hit_backfills_url_cache(monkeypatch) -> None:
+    cached_text = "---\ntitle: Cached\n---\n\ncached transcript"
+    ref = _render_ref("https://vimeo.com/abc123")
+    ref._metadata = {"extractor_key": "Vimeo", "id": "abc123", "title": "Cached"}
+    checked_identities: list[str] = []
+    stored: list[tuple[str, str, str]] = []
+
+    def _get_cached(identity: str, *_args, **_kwargs) -> str | None:
+        checked_identities.append(identity)
+        if identity.startswith("vimeo:abc123:transcribe:"):
+            return cached_text
+        return None
+
+    def _store(identity: str, content: str, source: str = "unknown") -> None:
+        stored.append((identity, content, source))
+
+    monkeypatch.setattr(
+        "contextualize.cache.youtube.get_cached_transcript",
+        _get_cached,
+    )
+    monkeypatch.setattr("contextualize.cache.youtube.store_transcript", _store)
+
+    output = ytdlp.YtDlpReference._get_contents(ref)
+
+    assert output == cached_text
+    assert any(
+        identity.startswith("vimeo:abc123:transcribe:")
+        for identity in checked_identities
+    )
+    stored_identities = [identity for identity, _content, _source in stored]
+    assert any(
+        identity.startswith("vimeo:abc123:transcribe-fast:")
+        for identity in stored_identities
+    )
+    assert any(identity.startswith("url:") for identity in stored_identities)
+    assert all(content == cached_text for _identity, content, _source in stored)
+    assert all(source == "render-cache" for _identity, _content, source in stored)
+
+
 def test_providers_do_not_import_private_transcription_helpers() -> None:
     provider_root = Path(__file__).parents[1] / "src" / "cx_plugins" / "providers"
     offenders = []
@@ -152,6 +243,22 @@ def test_can_resolve_uses_extractor_matching_without_probe(monkeypatch) -> None:
 
     assert ytdlp_plugin.can_resolve("https://example.com/ok", {}) is True
     assert ytdlp_plugin.can_resolve("https://example.com/nope", {}) is False
+
+
+def test_twitter_urls_are_excluded_without_probe(monkeypatch) -> None:
+    def _probe(*_args, **_kwargs):
+        raise AssertionError("twitter urls should not be probed by ytdlp")
+
+    monkeypatch.setattr(ytdlp, "probe_ytdlp_metadata", _probe)
+
+    for target in (
+        "https://x.com/turtlekiosk/status/2054792241785311616?s=46",
+        "https://twitter.com/bashu_thanks/status/1736431291740963038",
+        "https://mobile.twitter.com/example/status/1",
+    ):
+        assert ytdlp.is_excluded_ytdlp_url(target) is True
+        assert ytdlp_plugin.can_resolve(target, {}) is False
+        assert ytdlp_plugin.classify_target(target, {}) is None
 
 
 def test_ytdlp_command_prefers_bundled_python_module(monkeypatch) -> None:
