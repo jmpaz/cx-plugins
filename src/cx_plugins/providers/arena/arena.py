@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import parse_qs, quote, urlparse
 
 from contextualize.references.helpers import parse_timestamp_or_duration
 from contextualize.render.text import process_text
@@ -21,7 +22,9 @@ _ARENA_CHANNEL_RE = re.compile(
     r"(?:channel/(?P<slug1>[^/?#]+)"
     r"|(?P<user>[^/?#]+)/(?P<slug2>[^/?#]+))$"
 )
-_ARENA_BLOCK_RE = re.compile(r"^https?://(?:www\.)?are\.na/block/(?P<id>\d+)$")
+_ARENA_BLOCK_RE = re.compile(
+    r"^https?://(?:www\.)?are\.na/block/(?P<id>\d+)(?:[?#].*)?$"
+)
 _ARENA_USER_TARGET_RE = re.compile(r"^arena:user:(?P<slug>[^/?#]+)$")
 _ARENA_GROUP_TARGET_RE = re.compile(r"^arena:group:(?P<slug>[^/?#]+)$")
 _ARENA_PROFILE_URL_RE = re.compile(r"^https?://(?:www\.)?are\.na/(?P<slug>[^/?#]+)$")
@@ -124,6 +127,36 @@ def extract_block_id(url: str) -> int | None:
     if not match:
         return None
     return int(match.group("id"))
+
+
+def _first_query_value(values: list[str] | None) -> str | None:
+    if not values:
+        return None
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def parse_arena_block_attachment_target(target: str) -> dict[str, Any] | None:
+    block_id = extract_block_id(target)
+    if block_id is None:
+        return None
+    query = parse_qs(urlparse(target).query)
+    attachment_id = _first_query_value(query.get("attachment-id"))
+    attachment_name = _first_query_value(query.get("attachment"))
+    if not attachment_id and not attachment_name:
+        return None
+    parsed: dict[str, Any] = {"kind": "attachment", "block_id": block_id}
+    if attachment_id:
+        parsed["attachment_id"] = attachment_id
+    if attachment_name:
+        parsed["attachment_name"] = attachment_name
+    return parsed
+
+
+def is_arena_block_attachment_url(target: str) -> bool:
+    return parse_arena_block_attachment_target(target) is not None
 
 
 def extract_user_slug(target: str) -> str | None:
@@ -1501,6 +1534,40 @@ def _block_comments_output(block: dict, *, include_comments: bool) -> str:
     return rendered
 
 
+def _attachment_filename(attachment: dict[str, Any]) -> str:
+    filename = attachment.get("filename")
+    if isinstance(filename, str) and filename.strip():
+        return filename.strip()
+    url = attachment.get("url")
+    if isinstance(url, str) and url.strip():
+        name = Path(urlparse(url).path).name
+        if name:
+            return name
+    return "attachment"
+
+
+def _attachment_content_type(attachment: dict[str, Any]) -> str:
+    content_type = attachment.get("content_type")
+    return content_type.strip() if isinstance(content_type, str) else ""
+
+
+def _attachment_extension(attachment: dict[str, Any], filename: str) -> str:
+    extension = attachment.get("file_extension")
+    if isinstance(extension, str) and extension.strip():
+        return extension.strip().lstrip(".")
+    return Path(filename).suffix.lstrip(".")
+
+
+def _attachment_size_bytes(attachment: dict[str, Any]) -> int | None:
+    for key in ("size", "file_size", "byte_size", "bytes"):
+        raw = attachment.get(key)
+        if isinstance(raw, int) and raw >= 0:
+            return raw
+        if isinstance(raw, str) and raw.isdigit():
+            return int(raw)
+    return None
+
+
 def _attachment_media_kind(
     *, filename: str, extension: str, content_type: str
 ) -> str | None:
@@ -1528,6 +1595,171 @@ def _attachment_media_kind(
     if suffix == ".pdf":
         return "pdf"
     return None
+
+
+def _block_attachment(block: dict[str, Any]) -> dict[str, Any] | None:
+    attachment = block.get("attachment")
+    if isinstance(attachment, dict) and attachment:
+        return attachment
+    return None
+
+
+def build_arena_block_attachment_target(
+    block_id: int, attachment: dict[str, Any]
+) -> str:
+    base = f"https://www.are.na/block/{block_id}"
+    for key in ("id", "uuid"):
+        value = attachment.get(key)
+        if value is not None and str(value).strip():
+            return f"{base}?attachment-id={quote(str(value).strip(), safe='')}"
+    return f"{base}?attachment={quote(_attachment_filename(attachment), safe='')}"
+
+
+def _attachment_media_cache_identity(
+    block: dict[str, Any], attachment: dict[str, Any]
+) -> str:
+    att_url = str(attachment.get("url") or "")
+    block_id = block.get("id")
+    updated_at = block.get("updated_at") or ""
+    if block_id and updated_at and att_url:
+        return f"arena:block:{block_id}:{updated_at}:attachment:{att_url}"
+    return att_url
+
+
+def _select_attachment_for_target(
+    block: dict[str, Any], parsed: dict[str, Any]
+) -> dict[str, Any]:
+    attachment = _block_attachment(block)
+    if attachment is None:
+        raise ValueError(f"Are.na block {parsed['block_id']} does not have an attachment")
+
+    attachment_id = parsed.get("attachment_id")
+    if attachment_id:
+        candidates = [
+            str(value).strip()
+            for value in (attachment.get("id"), attachment.get("uuid"))
+            if value is not None and str(value).strip()
+        ]
+        if candidates and str(attachment_id) not in candidates:
+            raise ValueError(
+                f"Are.na block {parsed['block_id']} does not have attachment id {attachment_id}"
+            )
+        return attachment
+
+    attachment_name = parsed.get("attachment_name")
+    if attachment_name:
+        filename = _attachment_filename(attachment)
+        if filename != str(attachment_name):
+            raise ValueError(
+                f"Are.na block {parsed['block_id']} does not have attachment {attachment_name}"
+            )
+    return attachment
+
+
+def _target_label(value: object, fallback: str) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return fallback
+
+
+def _append_structured_target(
+    items: list[dict[str, Any]],
+    seen: set[str],
+    target: str,
+    *,
+    label: str,
+    kind: str,
+    metadata: dict[str, Any],
+) -> None:
+    if not target or target in seen:
+        return
+    seen.add(target)
+    items.append(
+        {
+            "target": target,
+            "label": label,
+            "kind": kind,
+            "metadata": metadata,
+        }
+    )
+
+
+def list_arena_block_targets(
+    block: dict[str, Any], *, source_target: str
+) -> list[dict[str, Any]]:
+    block_id = block.get("id")
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    attachment = _block_attachment(block)
+    if isinstance(block_id, int) and attachment is not None:
+        att_url = str(attachment.get("url") or "")
+        if att_url:
+            filename = _attachment_filename(attachment)
+            content_type = _attachment_content_type(attachment)
+            extension = _attachment_extension(attachment, filename)
+            media_kind = _attachment_media_kind(
+                filename=filename,
+                extension=extension,
+                content_type=content_type,
+            )
+            child_target = build_arena_block_attachment_target(block_id, attachment)
+            _append_structured_target(
+                items,
+                seen,
+                child_target,
+                label=filename,
+                kind=f"attachment:{media_kind or 'file'}",
+                metadata={
+                    "block_id": block_id,
+                    "filename": filename,
+                    "content_type": content_type or None,
+                    "url": att_url,
+                    "bytes": _attachment_size_bytes(attachment),
+                    "source_block": source_target,
+                },
+            )
+
+    source = block.get("source")
+    if isinstance(source, dict):
+        source_url = source.get("url")
+        if isinstance(source_url, str) and source_url.strip():
+            _append_structured_target(
+                items,
+                seen,
+                source_url.strip(),
+                label=_target_label(source.get("title"), source_url.strip()),
+                kind="link",
+                metadata={"source": "source", "block_id": block_id},
+            )
+
+    embed = block.get("embed")
+    if isinstance(embed, dict):
+        embed_url = embed.get("url")
+        if isinstance(embed_url, str) and embed_url.strip():
+            _append_structured_target(
+                items,
+                seen,
+                embed_url.strip(),
+                label=_target_label(embed.get("title"), embed_url.strip()),
+                kind="embed",
+                metadata={"source": "embed", "block_id": block_id},
+            )
+
+    for image_index, image_url in enumerate(_block_image_urls(block)):
+        _append_structured_target(
+            items,
+            seen,
+            image_url,
+            label=Path(urlparse(image_url).path).name or image_url,
+            kind="image",
+            metadata={
+                "source": "image",
+                "image_index": image_index,
+                "block_id": block_id,
+            },
+        )
+    return items
 
 
 def _should_refresh_attachment_media(
@@ -1896,6 +2128,141 @@ def _render_channel_stub(item: dict) -> str:
     if description:
         parts.append(_format_channel_description(description))
     return "\n".join(parts)
+
+
+def materialize_arena_attachment_target(
+    target: str,
+    parsed: dict[str, Any],
+    *,
+    use_cache: bool,
+    cache_ttl: timedelta | None,
+    refresh_cache: bool,
+    cache_only: bool = False,
+    block: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    block_id = parsed["block_id"]
+    if block is None:
+        block = _fetch_block(block_id)
+    attachment = _select_attachment_for_target(block, parsed)
+    att_url = str(attachment.get("url") or "")
+    if not att_url:
+        raise ValueError(f"Are.na attachment target {target} did not include a URL")
+
+    filename = _attachment_filename(attachment)
+    content_type = _attachment_content_type(attachment)
+    extension = _attachment_extension(attachment, filename)
+    suffix = f".{extension}" if extension else Path(urlparse(att_url).path).suffix
+    media_cache_identity = _attachment_media_cache_identity(block, attachment)
+
+    from contextualize.cache.arena import get_cached_media_bytes, store_media_bytes
+    from contextualize.runtime import get_refresh_media
+    from ..shared.media import download_cached_media_to_temp
+
+    content: bytes | None = None
+    if cache_only:
+        content = get_cached_media_bytes(media_cache_identity)
+    else:
+        tmp = download_cached_media_to_temp(
+            att_url,
+            suffix=suffix,
+            headers=_DOWNLOAD_HEADERS,
+            cache_identity=media_cache_identity,
+            get_cached_media_bytes=(
+                get_cached_media_bytes if use_cache else lambda _key: None
+            ),
+            store_media_bytes=(
+                store_media_bytes if use_cache else lambda _key, _content: None
+            ),
+            refresh_cache=refresh_cache or get_refresh_media(),
+        )
+        if tmp is not None:
+            try:
+                content = tmp.read_bytes()
+            finally:
+                tmp.unlink(missing_ok=True)
+
+    if not content:
+        return []
+
+    return [
+        {
+            "source": target,
+            "label": filename,
+            "filename": filename,
+            "content": content,
+            "content_type": content_type or None,
+            "metadata": {
+                "provider": "arena",
+                "kind": "attachment",
+                "sourceBlockUrl": f"https://www.are.na/block/{block_id}",
+                "attachmentUrl": att_url,
+                "attachmentName": filename,
+                "blockId": block_id,
+                "bytes": len(content),
+            },
+        }
+    ]
+
+
+def resolve_arena_attachment_target(
+    target: str,
+    parsed: dict[str, Any],
+    *,
+    settings_key: tuple[Any, ...],
+    use_cache: bool,
+    cache_ttl: timedelta | None,
+    refresh_cache: bool,
+    plugin_overrides: dict[str, Any] | None = None,
+    block: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    from contextualize.references.url import URLReference
+
+    block_id = parsed["block_id"]
+    if block is None:
+        block = _fetch_block(block_id)
+    attachment = _select_attachment_for_target(block, parsed)
+    att_url = str(attachment.get("url") or "")
+    if not att_url:
+        raise ValueError(f"Are.na attachment target {target} did not include a URL")
+
+    filename = _attachment_filename(attachment)
+    attachment_key = str(
+        parsed.get("attachment_id") or parsed.get("attachment_name") or filename
+    )
+    suffix = Path(filename).suffix or ".txt"
+    reference = URLReference(
+        att_url,
+        format="raw",
+        label="name",
+        filename_override=filename,
+        use_cache=use_cache,
+        cache_ttl=cache_ttl,
+        refresh_cache=refresh_cache,
+        plugin_overrides=plugin_overrides,
+    )
+    created_at = block.get("connected_at") or block.get("created_at")
+    updated_at = block.get("updated_at") or created_at
+    return [
+        {
+            "source": target,
+            "label": f"arena:block/{block_id}/attachment/{filename}",
+            "content": reference.read(),
+            "metadata": {
+                "trace_path": target,
+                "provider": "arena",
+                "source_ref": "are.na",
+                "source_path": f"{block_id}/attachment/{attachment_key}",
+                "context_subpath": f"arena-block-{block_id}/attachment-{attachment_key}{suffix}",
+                "source_created": created_at,
+                "source_modified": updated_at,
+                "kind": "attachment",
+                "settings_key": settings_key,
+                "blockId": block_id,
+                "attachmentName": filename,
+                "attachmentUrl": att_url,
+            },
+        }
+    ]
 
 
 def _entity_display(entity: dict) -> str:

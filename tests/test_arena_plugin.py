@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from pathlib import Path
 
 import click
 import pytest
@@ -392,6 +393,326 @@ def test_list_targets_expands_user_channels_and_applies_exclusions(monkeypatch) 
             "metadata": {"owner_kind": "user", "owner_slug": "alice"},
         }
     ]
+
+
+def test_list_targets_channel_exposes_child_blocks(monkeypatch) -> None:
+    monkeypatch.setattr(
+        arena,
+        "resolve_channel",
+        lambda slug, **_kwargs: (
+            _channel(slug, 1, "Root", 2),
+            [
+                ("root", _text_block(100)),
+                ("root", _channel("nested", 200, "Nested", 0)),
+            ],
+        ),
+    )
+
+    items = arena_plugin.list_targets(
+        "https://www.are.na/channel/root",
+        {"use_cache": False},
+    )
+
+    assert items == [
+        {
+            "target": "https://www.are.na/block/100",
+            "label": "Block 100",
+            "kind": "block",
+            "metadata": {
+                "block_id": 100,
+                "block_type": "Text",
+                "channel_path": "root",
+                "source_channel": "https://www.are.na/channel/root",
+            },
+        },
+        {
+            "target": "https://www.are.na/channel/nested",
+            "label": "Nested",
+            "kind": "channel",
+            "metadata": {
+                "block_id": 200,
+                "block_type": "Channel",
+                "channel_path": "root",
+                "source_channel": "https://www.are.na/channel/root",
+            },
+        },
+    ]
+
+
+def test_list_targets_block_exposes_structured_children(monkeypatch) -> None:
+    monkeypatch.setattr(
+        arena,
+        "_fetch_block",
+        lambda block_id: {
+            "id": block_id,
+            "type": "Attachment",
+            "title": "Paper",
+            "attachment": {
+                "filename": "paper.pdf",
+                "content_type": "application/pdf",
+                "file_extension": "pdf",
+                "url": "https://attachments.are.na/335/paper.pdf?1",
+                "size": 2048,
+            },
+            "source": {"url": "https://example.com/source", "title": "Source"},
+            "embed": {"url": "https://youtu.be/example", "title": "Video"},
+            "image": {"src": "https://images.are.na/preview.jpg"},
+        },
+    )
+
+    items = arena_plugin.list_targets(
+        "https://www.are.na/block/335",
+        {"use_cache": False},
+    )
+
+    assert items == [
+        {
+            "target": "https://www.are.na/block/335?attachment=paper.pdf",
+            "label": "paper.pdf",
+            "kind": "attachment:pdf",
+            "metadata": {
+                "block_id": 335,
+                "filename": "paper.pdf",
+                "content_type": "application/pdf",
+                "url": "https://attachments.are.na/335/paper.pdf?1",
+                "bytes": 2048,
+                "source_block": "https://www.are.na/block/335",
+            },
+        },
+        {
+            "target": "https://example.com/source",
+            "label": "Source",
+            "kind": "link",
+            "metadata": {"source": "source", "block_id": 335},
+        },
+        {
+            "target": "https://youtu.be/example",
+            "label": "Video",
+            "kind": "embed",
+            "metadata": {"source": "embed", "block_id": 335},
+        },
+        {
+            "target": "https://images.are.na/preview.jpg",
+            "label": "preview.jpg",
+            "kind": "image",
+            "metadata": {
+                "source": "image",
+                "image_index": 0,
+                "block_id": 335,
+            },
+        },
+    ]
+
+
+def test_list_targets_reuses_channel_block_for_structured_children(monkeypatch) -> None:
+    arena_plugin._LISTED_BLOCK_CACHE.clear()
+    block = {
+        "id": 335,
+        "type": "Attachment",
+        "title": "Paper",
+        "attachment": {
+            "filename": "paper.pdf",
+            "content_type": "application/pdf",
+            "file_extension": "pdf",
+            "url": "https://attachments.are.na/335/paper.pdf?1",
+            "size": 2048,
+        },
+    }
+    monkeypatch.setattr(
+        arena,
+        "resolve_channel",
+        lambda slug, **_kwargs: (_channel(slug, 1, "Root", 1), [("root", block)]),
+    )
+    monkeypatch.setattr(
+        arena,
+        "_fetch_block",
+        lambda block_id: pytest.fail(f"unexpected block fetch: {block_id}"),
+    )
+
+    channel_items = arena_plugin.list_targets(
+        "https://www.are.na/channel/root",
+        {"use_cache": False},
+    )
+    block_items = arena_plugin.list_targets(
+        "https://www.are.na/block/335",
+        {"use_cache": False},
+    )
+
+    assert channel_items[0]["target"] == "https://www.are.na/block/335"
+    assert block_items[0]["target"] == "https://www.are.na/block/335?attachment=paper.pdf"
+
+
+def test_channel_listed_attachment_materialize_reuses_cached_block(
+    monkeypatch, tmp_path: Path
+) -> None:
+    arena_plugin._LISTED_BLOCK_CACHE.clear()
+    block = {
+        "id": 335,
+        "type": "Attachment",
+        "title": "Notes",
+        "updated_at": "2026-05-15T18:47:00Z",
+        "attachment": {
+            "filename": "notes.txt",
+            "content_type": "text/plain",
+            "file_extension": "txt",
+            "url": "https://attachments.are.na/335/notes.txt?1",
+        },
+    }
+    monkeypatch.setattr(
+        arena,
+        "resolve_channel",
+        lambda slug, **_kwargs: (_channel(slug, 1, "Root", 1), [("root", block)]),
+    )
+    monkeypatch.setattr(
+        arena,
+        "_fetch_block",
+        lambda block_id: pytest.fail(f"unexpected block fetch: {block_id}"),
+    )
+
+    payload_path = tmp_path / "notes.txt"
+    payload_path.write_text("cached attachment text", encoding="utf-8")
+
+    def _download(url: str, **_kwargs) -> Path:
+        assert url == "https://attachments.are.na/335/notes.txt?1"
+        return payload_path
+
+    monkeypatch.setattr(
+        "cx_plugins.providers.shared.media.download_cached_media_to_temp",
+        _download,
+    )
+
+    channel_items = arena_plugin.list_targets(
+        "https://www.are.na/channel/root",
+        {"use_cache": False},
+    )
+    block_items = arena_plugin.list_targets(
+        channel_items[0]["target"],
+        {"use_cache": False},
+    )
+    files = arena_plugin.materialize(block_items[0]["target"], {"use_cache": False})
+
+    assert files[0]["content"] == b"cached attachment text"
+
+
+def test_arena_attachment_materialize_downloads_bytes(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        arena,
+        "_fetch_block",
+        lambda block_id: {
+            "id": block_id,
+            "type": "Attachment",
+            "updated_at": "2026-05-15T18:47:00Z",
+            "attachment": {
+                "filename": "paper.pdf",
+                "content_type": "application/pdf",
+                "file_extension": "pdf",
+                "url": "https://attachments.are.na/335/paper.pdf?1",
+            },
+        },
+    )
+
+    payload_path = tmp_path / "paper.pdf"
+    payload_path.write_bytes(b"pdf-bytes")
+
+    def _download(url: str, **kwargs) -> Path:
+        assert url == "https://attachments.are.na/335/paper.pdf?1"
+        expected_identity = (
+            "arena:block:335:2026-05-15T18:47:00Z:attachment:"
+            "https://attachments.are.na/335/paper.pdf?1"
+        )
+        assert (
+            kwargs["cache_identity"]
+            == expected_identity
+        )
+        return payload_path
+
+    monkeypatch.setattr(
+        "cx_plugins.providers.shared.media.download_cached_media_to_temp",
+        _download,
+    )
+
+    files = arena_plugin.materialize(
+        "https://www.are.na/block/335?attachment=paper.pdf",
+        {"use_cache": False, "refresh_cache": True},
+    )
+
+    assert files == [
+        {
+            "source": "https://www.are.na/block/335?attachment=paper.pdf",
+            "label": "paper.pdf",
+            "filename": "paper.pdf",
+            "content": b"pdf-bytes",
+            "content_type": "application/pdf",
+            "metadata": {
+                "provider": "arena",
+                "kind": "attachment",
+                "sourceBlockUrl": "https://www.are.na/block/335",
+                "attachmentUrl": "https://attachments.are.na/335/paper.pdf?1",
+                "attachmentName": "paper.pdf",
+                "blockId": 335,
+                "bytes": 9,
+            },
+        }
+    ]
+
+
+def test_resolve_arena_attachment_target_uses_attachment_url_reference(monkeypatch) -> None:
+    monkeypatch.setattr(
+        arena,
+        "_fetch_block",
+        lambda block_id: {
+            "id": block_id,
+            "type": "Attachment",
+            "connected_at": "2026-05-15T18:47:00Z",
+            "updated_at": "2026-05-15T18:48:00Z",
+            "attachment": {
+                "filename": "paper.pdf",
+                "content_type": "application/pdf",
+                "url": "https://attachments.are.na/335/paper.pdf?1",
+            },
+        },
+    )
+
+    class _DummyReference:
+        def __init__(
+            self,
+            url: str,
+            *,
+            format: str,
+            label: str,
+            filename_override: str | None,
+            use_cache: bool,
+            cache_ttl,
+            refresh_cache: bool,
+            plugin_overrides,
+        ) -> None:
+            assert url == "https://attachments.are.na/335/paper.pdf?1"
+            assert format == "raw"
+            assert label == "name"
+            assert filename_override == "paper.pdf"
+            assert use_cache is False
+            assert refresh_cache is True
+            assert plugin_overrides == {"transcribe": {"provider": "mistral"}}
+
+        def read(self) -> str:
+            return "paper text"
+
+    monkeypatch.setattr("contextualize.references.url.URLReference", _DummyReference)
+
+    docs = arena_plugin.resolve(
+        "https://www.are.na/block/335?attachment=paper.pdf",
+        {
+            "use_cache": False,
+            "refresh_cache": True,
+            "overrides": {"transcribe": {"provider": "mistral"}},
+        },
+    )
+
+    assert len(docs) == 1
+    assert docs[0]["content"] == "paper text"
+    assert docs[0]["metadata"]["kind"] == "attachment"
+    assert docs[0]["metadata"]["blockId"] == 335
+    assert docs[0]["metadata"]["attachmentName"] == "paper.pdf"
 
 
 def test_resolve_user_emits_profile_doc_with_groups(monkeypatch) -> None:

@@ -18,6 +18,7 @@ _ARENA_SORT_CHOICES = (
     "position-asc",
     "position-desc",
 )
+_LISTED_BLOCK_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def normalize_manifest_config(
@@ -384,12 +385,20 @@ def can_resolve(target: str, context: dict[str, Any]) -> bool:
 
 def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | None:
     from .arena import (
+        is_arena_block_attachment_url,
         is_arena_block_url,
         is_arena_channel_url,
         is_arena_group_target,
         is_arena_user_target,
     )
 
+    if is_arena_block_attachment_url(target):
+        return {
+            "provider": PLUGIN_NAME,
+            "kind": "attachment",
+            "is_external": True,
+            "group_key": "attachment",
+        }
     if is_arena_channel_url(target):
         return {
             "provider": PLUGIN_NAME,
@@ -602,6 +611,84 @@ def _channel_target(slug: str) -> str:
     return f"https://www.are.na/channel/{slug}"
 
 
+def _block_target(block: dict[str, Any]) -> str | None:
+    block_type = block.get("type", "")
+    if block_type == "Channel" or block.get("base_type") == "Channel":
+        slug = block.get("slug")
+        return _channel_target(slug) if isinstance(slug, str) and slug else None
+    block_id = block.get("id")
+    if isinstance(block_id, int):
+        return f"https://www.are.na/block/{block_id}"
+    if isinstance(block_id, str) and block_id.isdigit():
+        return f"https://www.are.na/block/{block_id}"
+    return None
+
+
+def _canonical_block_target(block_id: Any) -> str | None:
+    if isinstance(block_id, int):
+        return f"https://www.are.na/block/{block_id}"
+    if isinstance(block_id, str) and block_id.isdigit():
+        return f"https://www.are.na/block/{block_id}"
+    return None
+
+
+def _remember_listed_block(target: str, block: dict[str, Any]) -> None:
+    snapshot = dict(block)
+    _LISTED_BLOCK_CACHE[target] = snapshot
+    canonical = _canonical_block_target(block.get("id"))
+    if canonical is not None:
+        _LISTED_BLOCK_CACHE[canonical] = snapshot
+
+
+def _cached_block_for_target(target: str) -> dict[str, Any] | None:
+    cached = _LISTED_BLOCK_CACHE.get(target)
+    if cached is not None:
+        return dict(cached)
+    from .arena import extract_block_id
+
+    canonical = _canonical_block_target(extract_block_id(target))
+    if canonical is None:
+        return None
+    cached = _LISTED_BLOCK_CACHE.get(canonical)
+    return dict(cached) if cached is not None else None
+
+
+def _cached_block_for_attachment_target(
+    target: str, parsed: dict[str, Any]
+) -> dict[str, Any] | None:
+    block = _cached_block_for_target(target)
+    if block is None:
+        return None
+    attachment = block.get("attachment")
+    if not isinstance(attachment, dict):
+        return block
+
+    attachment_id = parsed.get("attachment_id")
+    if attachment_id:
+        candidates = [
+            str(value).strip()
+            for value in (attachment.get("id"), attachment.get("uuid"))
+            if value is not None and str(value).strip()
+        ]
+        if candidates and str(attachment_id) not in candidates:
+            return None
+
+    attachment_name = parsed.get("attachment_name")
+    if attachment_name:
+        from .arena import _attachment_filename
+
+        if _attachment_filename(attachment) != str(attachment_name):
+            return None
+    return block
+
+
+def _block_list_label(block: dict[str, Any], fallback: str) -> str:
+    title = block.get("title")
+    if isinstance(title, str) and title.strip():
+        return title.strip()
+    return fallback
+
+
 def _owner_profile_document(
     *,
     target: str,
@@ -787,24 +874,74 @@ def _channel_documents(
 
 def list_targets(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
     from .arena import (
+        _fetch_block,
         build_arena_settings,
+        extract_block_id,
+        extract_channel_slug,
         is_arena_block_url,
         is_arena_channel_url,
+        list_arena_block_targets,
+        parse_arena_block_attachment_target,
+        resolve_channel,
         warmup_arena_network_stack,
     )
 
+    if parse_arena_block_attachment_target(target) is not None:
+        return []
+
+    arena_overrides = _arena_overrides(context)
+    settings = build_arena_settings(arena_overrides)
+    use_cache = bool(context.get("use_cache", True))
+    cache_ttl = context.get("cache_ttl")
+    refresh_cache = bool(context.get("refresh_cache", False))
+
     if is_arena_channel_url(target):
-        return [{"target": target, "kind": "channel"}]
+        slug = extract_channel_slug(target)
+        if not slug:
+            return []
+        settings = _apply_channel_safety_defaults(settings, arena_overrides)
+        warmup_arena_network_stack()
+        _channel_meta, flat_blocks = resolve_channel(
+            slug,
+            use_cache=use_cache,
+            cache_ttl=cache_ttl,
+            refresh_cache=refresh_cache,
+            settings=settings,
+        )
+        items: list[dict[str, Any]] = []
+        for channel_path, block in flat_blocks:
+            child_target = _block_target(block)
+            if child_target is None:
+                continue
+            _remember_listed_block(child_target, block)
+            block_type = str(block.get("type") or block.get("base_type") or "block")
+            block_id = block.get("id")
+            items.append(
+                {
+                    "target": child_target,
+                    "label": _block_list_label(block, child_target),
+                    "kind": "channel"
+                    if block_type == "Channel" or block.get("base_type") == "Channel"
+                    else "block",
+                    "metadata": {
+                        "block_id": block_id,
+                        "block_type": block_type,
+                        "channel_path": channel_path,
+                        "source_channel": target,
+                    },
+                }
+            )
+        return items
     if is_arena_block_url(target):
-        return [{"target": target, "kind": "block"}]
+        block_id = extract_block_id(target)
+        if block_id is None:
+            return []
+        block = _cached_block_for_target(target) or _fetch_block(block_id)
+        return list_arena_block_targets(block, source_target=target)
 
     owners = _owner_targets(target)
     if not owners:
         return []
-    settings = build_arena_settings(_arena_overrides(context))
-    use_cache = bool(context.get("use_cache", True))
-    cache_ttl = context.get("cache_ttl")
-    refresh_cache = bool(context.get("refresh_cache", False))
     warmup_arena_network_stack()
     owner_channels = _fetch_owner_channels_for_target(
         owners,
@@ -828,6 +965,27 @@ def list_targets(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def materialize(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+    from .arena import (
+        materialize_arena_attachment_target,
+        parse_arena_block_attachment_target,
+    )
+
+    parsed = parse_arena_block_attachment_target(target)
+    if parsed is None:
+        return []
+    block = _cached_block_for_attachment_target(target, parsed)
+    return materialize_arena_attachment_target(
+        target,
+        parsed,
+        use_cache=bool(context.get("use_cache", True)),
+        cache_ttl=context.get("cache_ttl"),
+        refresh_cache=bool(context.get("refresh_cache", False)),
+        cache_only=bool(context.get("cache_only", False)),
+        block=block,
+    )
+
+
 def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
     from .arena import (
         ArenaReference,
@@ -837,6 +995,8 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
         extract_channel_slug,
         is_arena_block_url,
         is_arena_channel_url,
+        parse_arena_block_attachment_target,
+        resolve_arena_attachment_target,
         warmup_arena_network_stack,
     )
 
@@ -848,6 +1008,20 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
     refresh_cache = bool(context.get("refresh_cache", False))
 
     out: list[dict[str, Any]] = []
+    parsed_attachment = parse_arena_block_attachment_target(target)
+    if parsed_attachment is not None:
+        block = _cached_block_for_attachment_target(target, parsed_attachment)
+        return resolve_arena_attachment_target(
+            target,
+            parsed_attachment,
+            settings_key=settings_key,
+            use_cache=use_cache,
+            cache_ttl=cache_ttl,
+            refresh_cache=refresh_cache,
+            plugin_overrides=context.get("overrides"),
+            block=block,
+        )
+
     owners = _owner_targets(target)
     if owners:
         settings = _apply_channel_safety_defaults(settings, arena_overrides)
@@ -912,7 +1086,7 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
         block_id = extract_block_id(target)
         if block_id is None:
             return out
-        block = _fetch_block(block_id)
+        block = _cached_block_for_target(target) or _fetch_block(block_id)
         ref = ArenaReference(
             target,
             block=block,
