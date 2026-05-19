@@ -18,6 +18,7 @@ This package provides the following plugins:
 | `arxiv` | [arXiv](https://arxiv.org/) | papers |
 | `atproto` | [AT Protocol](https://atproto.com/docs) | posts, profiles, lists, starter packs |
 | `discord` | Discord | messages, threads, channels |
+| `googledocs` | Google Docs public export | public documents |
 | `soundcloud` | SoundCloud | tracks, playlists, profiles |
 | `wikipedia` | Wikipedia | article pages |
 | `whatsapp` | WhatsApp | exported chat archives |
