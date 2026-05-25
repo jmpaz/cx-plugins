@@ -82,6 +82,8 @@ def test_register_cli_options_exposes_arena_controls() -> None:
     assert "--arena-recurse-blocks" in option_names
     assert "--arena-link-image-descriptions" in option_names
     assert "--arena-media-descriptions" in option_names
+    assert "--arena-block-connections" in option_names
+    assert "--arena-block-connections-max-items" in option_names
     assert "--arena-connected-after" in option_names
     assert "--arena-exclude-channel" in option_names
 
@@ -101,6 +103,8 @@ def test_collect_cli_overrides_builds_arena_mapping() -> None:
             "arena_created_before": None,
             "arena_block_descriptions": False,
             "arena_block_comments": True,
+            "arena_block_connections": True,
+            "arena_block_connections_max_items": 30,
             "arena_link_image_descriptions": True,
             "arena_pdf_content": True,
             "arena_media_descriptions": False,
@@ -121,6 +125,8 @@ def test_collect_cli_overrides_builds_arena_mapping() -> None:
         "block": {
             "description": False,
             "comments": True,
+            "connections": True,
+            "connections-max-items": 30,
             "link-image-desc": True,
             "pdf-content": True,
             "media-desc": False,
@@ -360,6 +366,45 @@ def test_resolve_channel_multiline_description_has_no_spacer_line(monkeypatch) -
 
     assert "Description:\nFirst paragraph." in docs[0]["content"]
     assert "Description:\n\nFirst paragraph." not in docs[0]["content"]
+
+
+def test_resolve_channel_preserves_block_connection_context(monkeypatch) -> None:
+    channel = _channel("root", 1, "Root", 1)
+    block = {
+        **_text_block(100),
+        "connection": {
+            "id": 9001,
+            "position": 3,
+            "connected_at": "2026-05-24T21:50:27Z",
+            "connected_by": {
+                "id": 2,
+                "name": "Adder Person",
+                "slug": "adder-person",
+            },
+        },
+    }
+
+    monkeypatch.setattr(arena, "_fetch_channel", lambda slug: channel)
+    monkeypatch.setattr(
+        arena,
+        "_fetch_channel_page",
+        lambda slug, page, per=100: {
+            "contents": [block],
+            "meta": {"total_pages": 1},
+        },
+    )
+
+    _metadata, flat = resolve_channel(
+        "root",
+        use_cache=False,
+        settings=ArenaSettings(sort_order="asc", include_connections=False),
+    )
+
+    resolved = flat[0][1]
+    assert resolved["connected_at"] == "2026-05-24T21:50:27Z"
+    assert resolved["connected_by"]["slug"] == "adder-person"
+    assert resolved["_contextualize_channel_context"]["slug"] == "root"
+    assert resolved["_contextualize_channel_context"]["owner"]["slug"] == "owner"
 
 
 def test_list_targets_expands_user_channels_and_applies_exclusions(monkeypatch) -> None:
@@ -673,6 +718,7 @@ def test_render_pdf_attachment_fallback_preserves_block_metadata() -> None:
             },
         },
         include_comments=False,
+        include_connections=False,
         include_pdf_content=False,
         include_media_descriptions=False,
     )
@@ -680,7 +726,7 @@ def test_render_pdf_attachment_fallback_preserves_block_metadata() -> None:
     assert rendered == "\n".join(
         [
             "Research Packet",
-            "2026-05-24",
+            "created 2026-05-24T21:50Z",
             "---",
             "",
             "Synthetic PDF packet.",
@@ -702,7 +748,9 @@ def test_render_pdf_attachment_fallback_dedupes_title_description() -> None:
             "type": "Attachment",
             "created_at": "2016-08-22T21:20:18Z",
             "title": "Shared Reading Notes",
-            "description": {"markdown": "Shared Reading Notes\n"},
+            "description": {
+                "markdown": "Shared Reading Notes\n"
+            },
             "attachment": {
                 "filename": "reading-notes.pdf",
                 "content_type": "application/pdf",
@@ -712,6 +760,7 @@ def test_render_pdf_attachment_fallback_dedupes_title_description() -> None:
             },
         },
         include_comments=False,
+        include_connections=False,
         include_pdf_content=False,
         include_media_descriptions=False,
     )
@@ -751,6 +800,7 @@ def test_render_pdf_attachment_fallback_uses_preview_image_when_enabled(
             },
         },
         include_comments=False,
+        include_connections=False,
         include_pdf_content=False,
         include_media_descriptions=True,
     )
@@ -798,6 +848,7 @@ def test_render_pdf_attachment_preview_ignores_old_render_cache(
             "image": {"src": "https://images.are.na/preview.png"},
         },
         include_comments=False,
+        include_connections=False,
         include_pdf_content=False,
         include_media_descriptions=True,
     )
@@ -806,6 +857,160 @@ def test_render_pdf_attachment_preview_ignores_old_render_cache(
     assert all("attachment-fallback=2" in variant for variant in seen_variants)
     assert "[Attachment: stale.pdf]" not in rendered
     assert "Fresh preview." in rendered
+
+
+def test_render_channel_block_uses_header_added_line_and_other_channels(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "contextualize.cache.arena.get_cached_block_connections",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "contextualize.cache.arena.store_block_connections",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def _fetch_connections_page(block_id, page, per=100):
+        assert block_id == 100
+        assert page == 1
+        return {
+            "data": [
+                _channel("root", 1, "Root", 2),
+                {
+                    **_channel("other", 2, "Other", 3),
+                    "visibility": "public",
+                    "owner": {
+                        "id": 3,
+                        "name": "Neighbor Owner",
+                        "slug": "neighbor-owner",
+                    },
+                },
+            ],
+            "meta": {"total_pages": 1},
+        }
+
+    monkeypatch.setattr(arena, "_fetch_block_connections_page", _fetch_connections_page)
+    block = {
+        **_text_block(100),
+        "created_at": "2026-05-20T10:00:00Z",
+        "user": {"id": 4, "name": "Creator Person", "slug": "creator-person"},
+        "_contextualize_channel_context": _channel("root", 1, "Root", 2),
+        "connection": {
+            "id": 9001,
+            "position": 20,
+            "connected_at": "2026-05-24T21:50:27Z",
+            "connected_by": {
+                "id": 2,
+                "name": "Adder Person",
+                "slug": "adder-person",
+            },
+        },
+    }
+
+    rendered = arena._render_block(
+        block,
+        include_comments=False,
+        include_connections=True,
+        connections_max_items=30,
+    )
+
+    assert rendered.startswith(
+        "\n".join(
+            [
+                "Block 100",
+                "created 2026-05-20T10:00Z by Creator Person",
+                "added   2026-05-24T21:50Z by Adder Person",
+                "---",
+            ]
+        )
+    )
+    assert "## Added to Channel" not in rendered
+    assert "## Other channels" in rendered
+    assert "- Other (Neighbor Owner, public; 3 blocks; other)" in rendered
+    assert "- Root (Owner; 2 blocks; root)" not in rendered
+
+
+def test_render_direct_block_shows_all_connected_channels(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "contextualize.cache.arena.get_cached_block_connections",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "contextualize.cache.arena.store_block_connections",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        arena,
+        "_fetch_block_connections_page",
+        lambda block_id, page, per=100: {
+            "data": [
+                _channel("root", 1, "Root", 2),
+                _channel("other", 2, "Other", 3),
+            ],
+            "meta": {"total_pages": 1},
+        },
+    )
+
+    block = {
+        **_text_block(100),
+        "created_at": "2026-05-20T10:00:00Z",
+        "user": {"id": 4, "name": "Creator Person", "slug": "creator-person"},
+    }
+
+    rendered = arena._render_block(
+        block,
+        include_comments=False,
+        include_connections=True,
+        connections_max_items=30,
+    )
+
+    assert "## Added to Channel" not in rendered
+    assert rendered.startswith(
+        "Block 100\ncreated 2026-05-20T10:00Z by Creator Person\n---"
+    )
+    assert "added   " not in rendered
+    assert "## Channels" in rendered
+    assert "- Root (Owner; 2 blocks; root)" in rendered
+    assert "- Other (Owner; 3 blocks; other)" in rendered
+
+
+def test_render_connected_channels_reports_limit(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "contextualize.cache.arena.get_cached_block_connections",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "contextualize.cache.arena.store_block_connections",
+        lambda *_args, **_kwargs: None,
+    )
+    channels = [
+        _channel(f"channel-{index}", index, f"Channel {index}", 1)
+        for index in range(1, 32)
+    ]
+    monkeypatch.setattr(
+        arena,
+        "_fetch_block_connections_page",
+        lambda block_id, page, per=100: {
+            "data": channels,
+            "meta": {"total_pages": 1},
+        },
+    )
+
+    rendered = arena._render_block(
+        _text_block(100),
+        include_comments=False,
+        include_connections=True,
+        connections_max_items=30,
+    )
+
+    limit_message = (
+        "Showing first 30 channels; "
+        "more omitted by limit."
+    )
+    assert limit_message in rendered
+    assert "- Channel 30 (Owner; 1 block; channel-30)" in rendered
+    assert "- Channel 31 " not in rendered
 
 
 def test_resolve_arena_attachment_target_uses_attachment_url_reference(monkeypatch) -> None:

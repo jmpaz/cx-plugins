@@ -45,6 +45,8 @@ def _arena_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
         "recurse_users",
         "include_descriptions",
         "include_comments",
+        "include_connections",
+        "connections_max_items",
         "include_link_image_descriptions",
         "include_pdf_content",
         "include_media_descriptions",
@@ -99,6 +101,8 @@ def _arena_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
         for config_key, result_key in (
             ("description", "include_descriptions"),
             ("comments", "include_comments"),
+            ("connections", "include_connections"),
+            ("connections-max-items", "connections_max_items"),
             ("link-image-desc", "include_link_image_descriptions"),
             ("pdf-content", "include_pdf_content"),
             ("media-desc", "include_media_descriptions"),
@@ -250,6 +254,23 @@ def register_cli_options(command_name: str, command: click.Command) -> None:
     _append_option(
         command,
         click.Option(
+            ["--arena-block-connections/--no-arena-block-connections"],
+            default=None,
+            help="Include or omit Are.na block channel provenance and connected channels.",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
+            ["--arena-block-connections-max-items"],
+            type=int,
+            default=None,
+            help="Maximum connected Are.na channels to render per block.",
+        ),
+    )
+    _append_option(
+        command,
+        click.Option(
             ["--arena-link-image-descriptions/--no-arena-link-image-descriptions"],
             default=None,
             help="Describe images attached to Are.na link blocks.",
@@ -353,6 +374,7 @@ def collect_cli_overrides(
     for param_key, config_key in (
         ("arena_block_descriptions", "description"),
         ("arena_block_comments", "comments"),
+        ("arena_block_connections", "connections"),
         ("arena_link_image_descriptions", "link-image-desc"),
         ("arena_pdf_content", "pdf-content"),
         ("arena_media_descriptions", "media-desc"),
@@ -360,6 +382,13 @@ def collect_cli_overrides(
         value = params.get(param_key)
         if value is not None:
             block[config_key] = bool(value)
+    connections_max_items = params.get("arena_block_connections_max_items")
+    if connections_max_items is not None:
+        if int(connections_max_items) <= 0:
+            raise ValueError(
+                "--arena-block-connections-max-items must be greater than 0"
+            )
+        block["connections-max-items"] = int(connections_max_items)
     if block:
         raw_mapping["block"] = block
 
@@ -448,6 +477,8 @@ def _settings_key(settings: Any) -> tuple[Any, ...]:
         ),
         settings.include_descriptions,
         settings.include_comments,
+        settings.include_connections,
+        settings.connections_max_items,
         settings.include_link_image_descriptions,
         settings.include_pdf_content,
         settings.include_media_descriptions,
@@ -767,6 +798,8 @@ def _channel_documents(
         inject=False,
         include_descriptions=settings.include_descriptions,
         include_comments=settings.include_comments,
+        include_connections=settings.include_connections,
+        connections_max_items=settings.connections_max_items,
         include_link_image_descriptions=settings.include_link_image_descriptions,
         include_pdf_content=settings.include_pdf_content,
         include_media_descriptions=settings.include_media_descriptions,
@@ -813,6 +846,8 @@ def _channel_documents(
             inject=False,
             include_descriptions=settings.include_descriptions,
             include_comments=settings.include_comments,
+            include_connections=settings.include_connections,
+            connections_max_items=settings.connections_max_items,
             include_link_image_descriptions=settings.include_link_image_descriptions,
             include_pdf_content=settings.include_pdf_content,
             include_media_descriptions=settings.include_media_descriptions,
@@ -1094,6 +1129,8 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
             inject=False,
             include_descriptions=settings.include_descriptions,
             include_comments=settings.include_comments,
+            include_connections=settings.include_connections,
+            connections_max_items=settings.connections_max_items,
             include_link_image_descriptions=settings.include_link_image_descriptions,
             include_pdf_content=settings.include_pdf_content,
             include_media_descriptions=settings.include_media_descriptions,

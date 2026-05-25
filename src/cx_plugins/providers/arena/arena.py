@@ -417,6 +417,29 @@ def _get_include_comments() -> bool:
     return raw not in ("0", "false", "no")
 
 
+def _get_include_connections() -> bool:
+    raw = os.environ.get("ARENA_BLOCK_CONNECTIONS", "1").lower()
+    return raw not in ("0", "false", "no")
+
+
+def _get_connections_max_items() -> int | None:
+    raw = (
+        os.environ.get("ARENA_BLOCK_CONNECTIONS_MAX_ITEMS")
+        or os.environ.get("ARENA_CONNECTIONS_MAX_ITEMS")
+        or "30"
+    )
+    value = raw.strip().lower()
+    if value in {"0", "all", "none", "unlimited"}:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return 30
+    if parsed <= 0:
+        return None
+    return parsed
+
+
 def _get_include_link_image_descriptions() -> bool:
     raw = os.environ.get("ARENA_BLOCK_LINK_IMAGE_DESC", "0").lower()
     return raw not in ("0", "false", "no")
@@ -432,8 +455,8 @@ def _get_include_media_descriptions() -> bool:
     return raw not in ("0", "false", "no")
 
 
-def _get_comments_cache_ttl() -> timedelta | None:
-    raw = (os.environ.get("ARENA_COMMENTS_CACHE_TTL") or "").strip().lower()
+def _parse_cache_ttl(raw: str) -> timedelta | None:
+    raw = raw.strip().lower()
     if not raw:
         return None
     if raw == "0":
@@ -452,6 +475,21 @@ def _get_comments_cache_ttl() -> timedelta | None:
     if unit == "d":
         return timedelta(days=amount)
     return timedelta(weeks=amount)
+
+
+def _get_comments_cache_ttl() -> timedelta | None:
+    return _parse_cache_ttl(os.environ.get("ARENA_COMMENTS_CACHE_TTL") or "")
+
+
+def _get_connections_cache_ttl() -> timedelta | None:
+    raw = (
+        os.environ.get("ARENA_BLOCK_CONNECTIONS_CACHE_TTL")
+        or os.environ.get("ARENA_CONNECTIONS_CACHE_TTL")
+        or ""
+    )
+    if raw:
+        return _parse_cache_ttl(raw)
+    return _get_comments_cache_ttl()
 
 
 def _get_sort_order() -> str:
@@ -641,6 +679,33 @@ def _normalize_optional_datetime_override(value: object) -> datetime | None:
     )
 
 
+def _normalize_connections_max_items_override(value: object) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("Are.na block connections max-items must be a positive integer")
+    if isinstance(value, int):
+        if value <= 0:
+            return None
+        return value
+    if not isinstance(value, str):
+        raise ValueError("Are.na block connections max-items must be a positive integer")
+    text = value.strip().lower()
+    if not text:
+        return None
+    if text in {"0", "all", "none", "unlimited"}:
+        return None
+    try:
+        parsed = int(text)
+    except ValueError as exc:
+        raise ValueError(
+            "Are.na block connections max-items must be a positive integer"
+        ) from exc
+    if parsed <= 0:
+        return None
+    return parsed
+
+
 def _validate_time_window(settings: ArenaSettings) -> None:
     has_connected = (
         settings.connected_after is not None or settings.connected_before is not None
@@ -685,6 +750,8 @@ class ArenaSettings:
     recurse_blocks: ArenaRecurseBlockLimit | None = None
     include_descriptions: bool = True
     include_comments: bool = True
+    include_connections: bool = True
+    connections_max_items: int | None = 30
     include_link_image_descriptions: bool = False
     include_pdf_content: bool = False
     include_media_descriptions: bool = True
@@ -707,6 +774,8 @@ def _arena_settings_from_env() -> ArenaSettings:
         recurse_blocks=_get_recurse_blocks(),
         include_descriptions=_get_include_descriptions(),
         include_comments=_get_include_comments(),
+        include_connections=_get_include_connections(),
+        connections_max_items=_get_connections_max_items(),
         include_link_image_descriptions=_get_include_link_image_descriptions(),
         include_pdf_content=_get_include_pdf_content(),
         include_media_descriptions=_get_include_media_descriptions(),
@@ -756,6 +825,10 @@ def build_arena_settings(overrides: dict | None = None) -> ArenaSettings:
         "include_descriptions", env.include_descriptions
     )
     include_comments = overrides.get("include_comments", env.include_comments)
+    include_connections = overrides.get("include_connections", env.include_connections)
+    connections_max_items = _normalize_connections_max_items_override(
+        overrides.get("connections_max_items", env.connections_max_items)
+    )
     include_link_image_descriptions = overrides.get(
         "include_link_image_descriptions", env.include_link_image_descriptions
     )
@@ -787,6 +860,8 @@ def build_arena_settings(overrides: dict | None = None) -> ArenaSettings:
         recurse_blocks=recurse_blocks,
         include_descriptions=include_descriptions,
         include_comments=include_comments,
+        include_connections=include_connections,
+        connections_max_items=connections_max_items,
         include_link_image_descriptions=include_link_image_descriptions,
         include_pdf_content=include_pdf_content,
         include_media_descriptions=include_media_descriptions,
@@ -1213,6 +1288,13 @@ def _fetch_block_comments_page(block_id: int, page: int, per: int = 100) -> dict
     return _api_get(f"/blocks/{block_id}/comments", {"page": page, "per": per})
 
 
+def _fetch_block_connections_page(block_id: int, page: int, per: int = 100) -> dict:
+    return _api_get(
+        f"/blocks/{block_id}/connections",
+        {"page": page, "per": per, "sort": "created_at_desc"},
+    )
+
+
 def _fetch_all_block_comments(block_id: int) -> list[dict]:
     first_page = _fetch_block_comments_page(block_id, 1)
     comments = list(first_page.get("data", first_page.get("comments", [])))
@@ -1222,6 +1304,65 @@ def _fetch_all_block_comments(block_id: int) -> list[dict]:
         page_data = _fetch_block_comments_page(block_id, page)
         comments.extend(page_data.get("data", page_data.get("comments", [])))
     return comments
+
+
+def _block_source_channel_context(block: dict) -> dict | None:
+    context = block.get("_contextualize_channel_context")
+    return context if isinstance(context, dict) else None
+
+
+def _channel_matches_source_context(channel: dict, source_context: dict | None) -> bool:
+    if not source_context:
+        return False
+    source_id = source_context.get("id")
+    channel_id = channel.get("id")
+    if isinstance(source_id, int) and isinstance(channel_id, int):
+        return source_id == channel_id
+    source_slug = source_context.get("slug")
+    channel_slug = channel.get("slug")
+    if isinstance(source_slug, str) and isinstance(channel_slug, str):
+        return source_slug.lower() == channel_slug.lower()
+    return False
+
+
+def _fetch_block_connections(
+    block_id: int,
+    *,
+    max_items: int | None,
+    source_context: dict | None,
+) -> tuple[list[dict], bool]:
+    requested_count = None if max_items is None else max_items + 1
+    per_page = 100 if requested_count is None else max(1, min(100, requested_count))
+    channels: list[dict] = []
+    page = 1
+
+    while True:
+        page_data = _fetch_block_connections_page(block_id, page, per=per_page)
+        page_channels = list(page_data.get("data", page_data.get("channels", [])))
+        for channel in page_channels:
+            if _channel_matches_source_context(channel, source_context):
+                continue
+            channels.append(channel)
+            if requested_count is not None and len(channels) >= requested_count:
+                return channels[:max_items], True
+
+        meta = page_data.get("meta") or {}
+        next_page = meta.get("next_page")
+        if isinstance(next_page, int):
+            page = next_page
+            continue
+        total_pages = meta.get("total_pages")
+        if isinstance(total_pages, int) and page < total_pages:
+            page += 1
+            continue
+        if meta.get("has_more_pages"):
+            page += 1
+            continue
+        break
+
+    if max_items is None:
+        return channels, False
+    return channels[:max_items], len(channels) > max_items
 
 
 def _block_image_urls(block: dict) -> list[str]:
@@ -1309,14 +1450,47 @@ def _desc_separator(description: str) -> str:
     return "*" * (max_stars + 2) if max_stars >= 3 else "***"
 
 
+def _block_creator(block: dict) -> dict | None:
+    for key in ("created_by", "user", "owner"):
+        value = block.get(key)
+        if isinstance(value, dict) and value:
+            return value
+    return None
+
+
+def _block_connection(block: dict) -> dict:
+    connection = block.get("connection")
+    return connection if isinstance(connection, dict) else {}
+
+
+def _block_added_by(block: dict) -> dict | None:
+    connection = _block_connection(block)
+    value = connection.get("connected_by") or block.get("connected_by")
+    return value if isinstance(value, dict) and value else None
+
+
+def _format_event_line(label: str, timestamp: str, actor: dict | None) -> str:
+    line = f"{label:<7} {timestamp}"
+    if actor:
+        line += f" by {_entity_name(actor)}"
+    return line
+
+
 def _format_date_line(block: dict) -> str:
-    connected = block.get("connected_at") or ""
-    created = block.get("created_at") or ""
-    c_date = connected[:10] if len(connected) >= 10 else ""
-    r_date = created[:10] if len(created) >= 10 else ""
-    if c_date and r_date and c_date != r_date:
-        return f"connected {c_date} (created {r_date})"
-    return c_date or r_date
+    lines: list[str] = []
+    created_at = _format_metadata_timestamp(block.get("created_at"))
+    if created_at:
+        lines.append(_format_event_line("created", created_at, _block_creator(block)))
+
+    if _block_source_channel_context(block):
+        connection = _block_connection(block)
+        added_at = _format_metadata_timestamp(
+            connection.get("connected_at") or block.get("connected_at")
+        )
+        if added_at:
+            lines.append(_format_event_line("added", added_at, _block_added_by(block)))
+
+    return "\n".join(lines)
 
 
 _DESCRIPTION_HEADING_RE = re.compile(
@@ -1408,6 +1582,100 @@ def _render_comments_section(comments: list[dict]) -> str:
         else:
             lines.append(f"{prefix}:")
     return "## Comments\n\n" + "\n\n".join(lines)
+
+
+def _source_channel_cache_key(source_context: dict | None) -> str:
+    if not source_context:
+        return "direct"
+    channel_id = source_context.get("id")
+    if isinstance(channel_id, int):
+        return f"id:{channel_id}"
+    slug = source_context.get("slug")
+    if isinstance(slug, str) and slug.strip():
+        return f"slug:{slug.strip().lower()}"
+    return "unknown"
+
+
+def _block_connection_cache_identity(
+    block: dict,
+    *,
+    max_items: int | None,
+    source_context: dict | None,
+) -> str | None:
+    block_id = block.get("id")
+    if not isinstance(block_id, int):
+        return None
+    connection = block.get("connection")
+    connection_key = "none"
+    if isinstance(connection, dict):
+        connection_id = connection.get("id")
+        connected_at = connection.get("connected_at")
+        if isinstance(connection_id, int):
+            connection_key = f"id:{connection_id}"
+        elif isinstance(connected_at, str) and connected_at:
+            connection_key = f"at:{connected_at}"
+    limit_key = "all" if max_items is None else str(max_items)
+    return (
+        f"v2:block:{block_id}:source={_source_channel_cache_key(source_context)}:"
+        f"connection={connection_key}:limit={limit_key}:auth={_auth_cache_partition()}"
+    )
+
+
+def _render_connected_channel_line(channel: dict) -> str:
+    title = channel.get("title") or channel.get("slug") or "Untitled"
+    details: list[str] = []
+    owner = channel.get("owner") or channel.get("user")
+    owner_name = ""
+    if isinstance(owner, dict) and owner:
+        owner_name = _entity_name(owner)
+    visibility = channel.get("visibility")
+    owner_visibility = owner_name
+    if isinstance(visibility, str) and visibility.strip():
+        owner_visibility = (
+            f"{owner_visibility}, {visibility.strip()}"
+            if owner_visibility
+            else visibility.strip()
+        )
+    if owner_visibility:
+        details.append(owner_visibility)
+    counts = channel.get("counts")
+    if isinstance(counts, dict):
+        block_count = counts.get("blocks")
+        if block_count is None or block_count == "":
+            block_count = counts.get("contents")
+        if block_count is not None and block_count != "":
+            suffix = "block" if block_count == 1 else "blocks"
+            details.append(f"{block_count} {suffix}")
+    slug = channel.get("slug")
+    if isinstance(slug, str) and slug:
+        details.append(slug)
+    if details:
+        return f"- {title} ({'; '.join(details)})"
+    return f"- {title}"
+
+
+def _render_connected_channels_section(
+    channels: list[dict],
+    *,
+    cap_hit: bool,
+    source_context: dict | None,
+) -> str:
+    if not channels:
+        return ""
+    heading = "## Other channels" if source_context else "## Channels"
+    lines = [heading, ""]
+    if cap_hit:
+        lines.extend(
+            [
+                (
+                    f"Showing first {len(channels)} channels; "
+                    "more omitted by limit."
+                ),
+                "",
+            ]
+        )
+    lines.extend(_render_connected_channel_line(channel) for channel in channels)
+    return "\n".join(lines)
 
 
 def _block_comment_count_hint(block: dict) -> int | None:
@@ -1526,11 +1794,22 @@ def _comments_separator(rendered: str) -> str:
     return best or "***"
 
 
-def _append_comments_section(rendered: str | None, comments_section: str) -> str | None:
-    if not rendered or not comments_section:
+def _append_block_detail_sections(
+    rendered: str | None, *sections: str
+) -> str | None:
+    if not rendered:
         return rendered
-    separator = _comments_separator(rendered)
-    return f"{rendered}\n\n{separator}\n\n{comments_section}"
+    output = rendered
+    for section in sections:
+        if not section:
+            continue
+        separator = _comments_separator(output)
+        output = f"{output}\n\n{separator}\n\n{section}"
+    return output
+
+
+def _append_comments_section(rendered: str | None, comments_section: str) -> str | None:
+    return _append_block_detail_sections(rendered, comments_section)
 
 
 def _block_comments_output(block: dict, *, include_comments: bool) -> str:
@@ -1561,6 +1840,71 @@ def _block_comments_output(block: dict, *, include_comments: bool) -> str:
         return ""
     rendered = _render_comments_section(comments)
     store_block_comments(block_id, rendered)
+    return rendered
+
+
+def _block_connections_output(
+    block: dict,
+    *,
+    include_connections: bool,
+    max_items: int | None,
+) -> str:
+    try:
+        from contextualize.cache.arena import (
+            get_cached_block_connections,
+            store_block_connections,
+        )
+    except ImportError:
+        def get_cached_block_connections(
+            identity: str,
+            ttl: timedelta | None = None,
+        ) -> str | None:
+            return None
+
+        def store_block_connections(identity: str, rendered: str) -> None:
+            return None
+
+    from contextualize.runtime import get_refresh_cache
+
+    if not include_connections:
+        return ""
+    block_id = block.get("id")
+    if not isinstance(block_id, int):
+        return ""
+
+    source_context = _block_source_channel_context(block)
+    cache_identity = _block_connection_cache_identity(
+        block,
+        max_items=max_items,
+        source_context=source_context,
+    )
+    if cache_identity is not None and not get_refresh_cache():
+        cached = get_cached_block_connections(
+            cache_identity, ttl=_get_connections_cache_ttl()
+        )
+        if cached is not None:
+            return cached
+
+    connected_section = ""
+    try:
+        channels, cap_hit = _fetch_block_connections(
+            block_id,
+            max_items=max_items,
+            source_context=source_context,
+        )
+        connected_section = _render_connected_channels_section(
+            channels,
+            cap_hit=cap_hit,
+            source_context=source_context,
+        )
+    except Exception as exc:
+        _log(
+            f"  failed to fetch connected channels for block {block_id}: {type(exc).__name__}"
+        )
+
+    rendered = connected_section
+    if cache_identity is not None:
+        store_block_connections(cache_identity, rendered)
     return rendered
 
 
@@ -1867,6 +2211,8 @@ def _render_block(
     *,
     include_descriptions: bool | None = None,
     include_comments: bool | None = None,
+    include_connections: bool | None = None,
+    connections_max_items: int | None = None,
     include_link_image_descriptions: bool | None = None,
     include_pdf_content: bool | None = None,
     include_media_descriptions: bool | None = None,
@@ -1895,6 +2241,10 @@ def _render_block(
         description = ""
     if include_comments is None:
         include_comments = _get_include_comments()
+    if include_connections is None:
+        include_connections = _get_include_connections()
+    if connections_max_items is None:
+        connections_max_items = _get_connections_max_items()
     if include_link_image_descriptions is None:
         include_link_image_descriptions = _get_include_link_image_descriptions()
     if include_pdf_content is None:
@@ -1903,7 +2253,7 @@ def _render_block(
         include_media_descriptions = _get_include_media_descriptions()
 
     render_variant = (
-        f"v2:type={str(block_type).lower()}"
+        f"v3:type={str(block_type).lower()}"
         f":desc={int(bool(include_descriptions))}"
         f":linkimg={int(bool(include_link_image_descriptions))}"
         f":pdf={int(bool(include_pdf_content))}"
@@ -1985,10 +2335,17 @@ def _render_block(
             if cached is not None:
                 core_output = cached
         if core_output is not None:
+            connections_section = _block_connections_output(
+                block,
+                include_connections=bool(include_connections),
+                max_items=connections_max_items,
+            )
             comments_section = _block_comments_output(
                 block, include_comments=bool(include_comments)
             )
-            return _append_comments_section(core_output, comments_section)
+            return _append_block_detail_sections(
+                core_output, connections_section, comments_section
+            )
 
         source = block.get("source") or {}
         source_url = source.get("url") or ""
@@ -2176,10 +2533,15 @@ def _render_block(
     else:
         core_output = _format_block_output(title, description, "", date=date)
 
+    connections_section = _block_connections_output(
+        block,
+        include_connections=bool(include_connections),
+        max_items=connections_max_items,
+    )
     comments_section = _block_comments_output(
         block, include_comments=bool(include_comments)
     )
-    return _append_comments_section(core_output, comments_section)
+    return _append_block_detail_sections(core_output, connections_section, comments_section)
 
 
 def _render_channel_stub(item: dict) -> str:
@@ -2344,12 +2706,17 @@ def resolve_arena_attachment_target(
 
 
 def _entity_display(entity: dict) -> str:
+    name = _entity_name(entity)
+    slug = entity.get("slug")
+    if isinstance(slug, str) and slug.strip():
+        return f"{name} (@{slug.strip()})"
+    return name
+
+
+def _entity_name(entity: dict) -> str:
     name = entity.get("name") or entity.get("username") or entity.get("slug")
     if not isinstance(name, str) or not name.strip():
         name = "Unknown"
-    slug = entity.get("slug")
-    if isinstance(slug, str) and slug.strip():
-        return f"{name.strip()} (@{slug.strip()})"
     return name.strip()
 
 
@@ -2437,6 +2804,37 @@ def _merge_channel_metadata(item: dict, metadata: object) -> dict:
     return block
 
 
+def _channel_context_from_metadata(metadata: dict, fallback_slug: str = "") -> dict:
+    context: dict[str, Any] = {}
+    channel_id = metadata.get("id")
+    if isinstance(channel_id, int):
+        context["id"] = channel_id
+    slug = metadata.get("slug") or fallback_slug
+    if isinstance(slug, str) and slug:
+        context["slug"] = slug
+    title = metadata.get("title")
+    if isinstance(title, str) and title:
+        context["title"] = title
+    owner = metadata.get("owner") or metadata.get("user")
+    if isinstance(owner, dict) and owner:
+        context["owner"] = owner
+    return context
+
+
+def _attach_channel_context(block: dict, source_context: dict | None) -> dict:
+    if source_context:
+        block["_contextualize_channel_context"] = source_context
+    connection = block.get("connection")
+    if isinstance(connection, dict):
+        connected_at = connection.get("connected_at")
+        connected_by = connection.get("connected_by")
+        if connected_at and not block.get("connected_at"):
+            block["connected_at"] = connected_at
+        if isinstance(connected_by, dict) and not block.get("connected_by"):
+            block["connected_by"] = connected_by
+    return block
+
+
 def _block_label(block: dict, channel_slug: str, channel_path: str = "") -> str:
     block_id = block.get("id", "unknown")
     prefix = channel_path or channel_slug or "are.na/block"
@@ -2448,6 +2846,7 @@ def _flatten_channel_blocks(
     channel_slug: str,
     channel_path: str = "",
     channel_slug_path: tuple[str, ...] | None = None,
+    channel_context: dict | None = None,
 ) -> list[tuple[str, dict]]:
     result: list[tuple[str, dict]] = []
     path = channel_path or channel_slug
@@ -2471,10 +2870,14 @@ def _flatten_channel_blocks(
                 nested_slug_path = current_slug_path + (
                     (nested_slug,) if nested_slug else ()
                 )
+                nested_context = _channel_context_from_metadata(
+                    nested_meta, nested_slug
+                )
                 if item.get("_nested_sampled_by_recurse_blocks"):
                     block = _merge_channel_metadata(item, nested_meta)
                     block.pop("_nested_metadata", None)
                     block.pop("_nested_contents", None)
+                    block = _attach_channel_context(block, channel_context)
                     block["_contextualize_keep_duplicate"] = True
                     if current_slug_path:
                         block["_channel_slug_path"] = list(current_slug_path)
@@ -2485,15 +2888,18 @@ def _flatten_channel_blocks(
                         nested_slug,
                         sub_path,
                         nested_slug_path,
+                        nested_context,
                     )
                 )
             else:
                 block = dict(item)
+                block = _attach_channel_context(block, channel_context)
                 if current_slug_path:
                     block["_channel_slug_path"] = list(current_slug_path)
                 result.append((path, block))
         else:
             block = dict(item)
+            block = _attach_channel_context(block, channel_context)
             if current_slug_path:
                 block["_channel_slug_path"] = list(current_slug_path)
             result.append((path, block))
@@ -2562,7 +2968,19 @@ def _sort_channel_contents(contents: list[dict], order: str) -> list[dict]:
 
 
 def _block_chrono_value(block: dict) -> str:
-    return block.get("connected_at") or block.get("created_at") or ""
+    return _block_connected_at(block) or block.get("created_at") or ""
+
+
+def _block_connected_at(block: dict) -> str | None:
+    connected_at = block.get("connected_at")
+    if isinstance(connected_at, str) and connected_at:
+        return connected_at
+    connection = block.get("connection")
+    if isinstance(connection, dict):
+        connected_at = connection.get("connected_at")
+        if isinstance(connected_at, str) and connected_at:
+            return connected_at
+    return None
 
 
 def _parse_block_timestamp(value: Any) -> datetime | None:
@@ -2577,7 +2995,7 @@ def _passes_block_time_window(block: dict, settings: ArenaSettings) -> bool:
     before: datetime | None = None
 
     if settings.connected_after is not None or settings.connected_before is not None:
-        timestamp = _parse_block_timestamp(block.get("connected_at"))
+        timestamp = _parse_block_timestamp(_block_connected_at(block))
         after = settings.connected_after
         before = settings.connected_before
     elif settings.created_after is not None or settings.created_before is not None:
@@ -2655,7 +3073,7 @@ def resolve_channel(
     cra_key = settings.created_after.isoformat() if settings.created_after else "none"
     crb_key = settings.created_before.isoformat() if settings.created_before else "none"
     cache_key = (
-        f"v3:{slug}:d={max_depth}:u={ru_key}:s={sort_order}:m={mb_key}:rb={rb_key}:"
+        f"v4:{slug}:d={max_depth}:u={ru_key}:s={sort_order}:m={mb_key}:rb={rb_key}:"
         f"ca={ca_key}:cb={cb_key}:cra={cra_key}:crb={crb_key}:"
         f"auth={auth_key}:exclude={exclude_key}"
     )
@@ -2684,7 +3102,11 @@ def resolve_channel(
         _time_window_settings=settings,
         _recurse_users=recurse_users,
     )
-    flat_unsorted = _flatten_channel_blocks(contents, slug)
+    flat_unsorted = _flatten_channel_blocks(
+        contents,
+        slug,
+        channel_context=_channel_context_from_metadata(metadata, slug),
+    )
     flat = _sort_blocks(flat_unsorted, sort_order)
     flat = _filter_flat_blocks(flat, settings)
     flat = _limit_flat_blocks(flat, settings)
@@ -2716,6 +3138,8 @@ class ArenaReference:
     trace_collector: list = None
     include_descriptions: bool | None = None
     include_comments: bool | None = None
+    include_connections: bool | None = None
+    connections_max_items: int | None = None
     include_link_image_descriptions: bool | None = None
     include_pdf_content: bool | None = None
     include_media_descriptions: bool | None = None
@@ -2781,6 +3205,8 @@ class ArenaReference:
                     self.block,
                     include_descriptions=self.include_descriptions,
                     include_comments=self.include_comments,
+                    include_connections=self.include_connections,
+                    connections_max_items=self.connections_max_items,
                     include_link_image_descriptions=self.include_link_image_descriptions,
                     include_pdf_content=self.include_pdf_content,
                     include_media_descriptions=self.include_media_descriptions,
