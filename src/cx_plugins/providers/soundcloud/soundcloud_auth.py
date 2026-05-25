@@ -37,7 +37,7 @@ def _soundcloud_me_profile(access_token: str) -> dict[str, str] | None:
 
 
 def _run_soundcloud_login(timeout: int, no_browser: bool) -> None:
-    from contextualize.cache.soundcloud import store_user_token
+    from .cache import store_user_token
     from .oauth import (
         build_authorize_url,
         build_pkce_challenge,
@@ -104,7 +104,7 @@ def _run_soundcloud_login(timeout: int, no_browser: bool) -> None:
 
 
 def _soundcloud_has_active_user_auth() -> bool:
-    from contextualize.cache.soundcloud import get_cached_user_access_token
+    from .cache import get_cached_user_access_token
 
     load_dotenv_optional()
     env_token = (os.environ.get("SOUNDCLOUD_ACCESS_TOKEN") or "").strip()
@@ -114,7 +114,7 @@ def _soundcloud_has_active_user_auth() -> bool:
 
 
 def _print_soundcloud_auth_status() -> None:
-    from contextualize.cache.soundcloud import (
+    from .cache import (
         get_cached_user_access_token,
         get_cached_user_token_record,
     )
@@ -170,7 +170,7 @@ def _print_soundcloud_auth_status() -> None:
 
 
 def _run_soundcloud_logout() -> None:
-    from contextualize.cache.soundcloud import clear_cached_user_token
+    from .cache import clear_cached_user_token
 
     load_dotenv_optional()
 

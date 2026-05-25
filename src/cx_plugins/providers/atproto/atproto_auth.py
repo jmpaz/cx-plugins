@@ -150,7 +150,7 @@ def _atproto_refresh_cached_oauth_session() -> dict[str, object] | None:
 
 
 def _atproto_has_active_user_auth() -> bool:
-    from contextualize.cache.atproto import get_cached_oauth_access_token
+    from .cache import get_cached_oauth_access_token
 
     load_dotenv_optional()
     env_token = (os.environ.get("ATPROTO_ACCESS_TOKEN") or "").strip()
@@ -165,7 +165,7 @@ def _atproto_has_active_user_auth() -> bool:
 
 
 def _print_atproto_auth_status() -> None:
-    from contextualize.cache.atproto import (
+    from .cache import (
         get_cached_oauth_access_token,
         get_cached_oauth_session_record,
     )
@@ -259,7 +259,7 @@ def _print_atproto_auth_status() -> None:
 
 
 def _run_atproto_logout() -> None:
-    from contextualize.cache.atproto import clear_cached_oauth_session
+    from .cache import clear_cached_oauth_session
 
     load_dotenv_optional()
     clear_cached_oauth_session()
@@ -271,7 +271,7 @@ def _run_atproto_logout() -> None:
 
 
 def _run_atproto_login(timeout: int, no_browser: bool) -> None:
-    from contextualize.cache.atproto import store_oauth_session
+    from .cache import store_oauth_session
     from .oauth import (
         build_authorize_url,
         build_pkce_challenge,

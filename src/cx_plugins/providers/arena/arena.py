@@ -208,7 +208,7 @@ def _get_auth_headers() -> dict[str, str]:
 
 
 def _resolve_arena_access_token() -> str | None:
-    from contextualize.cache.arena import get_cached_user_access_token
+    from .cache import get_cached_user_access_token
 
     _load_dotenv()
     env_token = (os.environ.get("ARENA_ACCESS_TOKEN") or "").strip()
@@ -929,7 +929,7 @@ def fetch_owner_profile(
 ) -> dict:
     cache_key = f"v1:owner-profile:{kind}:{slug}:auth={_auth_cache_partition()}"
     if use_cache and not refresh_cache:
-        from contextualize.cache.arena import get_cached_channel
+        from .cache import get_cached_channel
 
         cached = get_cached_channel(cache_key, cache_ttl)
         if cached is not None:
@@ -940,7 +940,7 @@ def fetch_owner_profile(
     profile = _fetch_owner_profile(kind, slug)
 
     if use_cache:
-        from contextualize.cache.arena import store_channel
+        from .cache import store_channel
 
         store_channel(
             cache_key,
@@ -960,7 +960,7 @@ def fetch_user_groups(
 ) -> list[dict]:
     cache_key = f"v1:user-groups:{slug}:sort={sort}:auth={_auth_cache_partition()}"
     if use_cache and not refresh_cache:
-        from contextualize.cache.arena import get_cached_channel
+        from .cache import get_cached_channel
 
         cached = get_cached_channel(cache_key, cache_ttl)
         if cached is not None:
@@ -982,7 +982,7 @@ def fetch_user_groups(
         )
 
     if use_cache:
-        from contextualize.cache.arena import store_channel
+        from .cache import store_channel
 
         store_channel(
             cache_key,
@@ -1009,7 +1009,7 @@ def fetch_owner_channels(
         f"auth={_auth_cache_partition()}:exclude={settings.exclude_channels.cache_key()}"
     )
     if use_cache and not refresh_cache:
-        from contextualize.cache.arena import get_cached_channel
+        from .cache import get_cached_channel
 
         cached = get_cached_channel(cache_key, cache_ttl)
         if cached is not None:
@@ -1036,7 +1036,7 @@ def fetch_owner_channels(
     channels = _dedupe_channels(channels)
 
     if use_cache:
-        from contextualize.cache.arena import store_channel
+        from .cache import store_channel
 
         store_channel(
             cache_key,
@@ -1393,7 +1393,7 @@ _DOWNLOAD_HEADERS = {
 def _download_to_temp(
     url: str, suffix: str = "", *, media_cache_identity: str | None = None
 ) -> Path | None:
-    from contextualize.cache.arena import get_cached_media_bytes, store_media_bytes
+    from .cache import get_cached_media_bytes, store_media_bytes
     from ..shared.media import download_cached_media_to_temp
     from contextualize.runtime import get_refresh_media
 
@@ -1813,7 +1813,7 @@ def _append_comments_section(rendered: str | None, comments_section: str) -> str
 
 
 def _block_comments_output(block: dict, *, include_comments: bool) -> str:
-    from contextualize.cache.arena import (
+    from .cache import (
         get_cached_block_comments,
         store_block_comments,
     )
@@ -1849,20 +1849,10 @@ def _block_connections_output(
     include_connections: bool,
     max_items: int | None,
 ) -> str:
-    try:
-        from contextualize.cache.arena import (
-            get_cached_block_connections,
-            store_block_connections,
-        )
-    except ImportError:
-        def get_cached_block_connections(
-            identity: str,
-            ttl: timedelta | None = None,
-        ) -> str | None:
-            return None
-
-        def store_block_connections(identity: str, rendered: str) -> None:
-            return None
+    from .cache import (
+        get_cached_block_connections,
+        store_block_connections,
+    )
 
     from contextualize.runtime import get_refresh_cache
 
@@ -2217,7 +2207,7 @@ def _render_block(
     include_pdf_content: bool | None = None,
     include_media_descriptions: bool | None = None,
 ) -> str | None:
-    from contextualize.cache.arena import get_cached_block_render, store_block_render
+    from .cache import get_cached_block_render, store_block_render
 
     block_type = block.get("class") or block.get("type", "")
     state = block.get("state")
@@ -2594,7 +2584,7 @@ def materialize_arena_attachment_target(
     suffix = f".{extension}" if extension else Path(urlparse(att_url).path).suffix
     media_cache_identity = _attachment_media_cache_identity(block, attachment)
 
-    from contextualize.cache.arena import get_cached_media_bytes, store_media_bytes
+    from .cache import get_cached_media_bytes, store_media_bytes
     from contextualize.runtime import get_refresh_media
     from ..shared.media import download_cached_media_to_temp
 
@@ -3079,7 +3069,7 @@ def resolve_channel(
     )
 
     if use_cache and not refresh_cache:
-        from contextualize.cache.arena import get_cached_channel
+        from .cache import get_cached_channel
 
         cached = get_cached_channel(cache_key, cache_ttl)
         if cached is not None:
@@ -3112,7 +3102,7 @@ def resolve_channel(
     flat = _limit_flat_blocks(flat, settings)
 
     if use_cache:
-        from contextualize.cache.arena import store_channel
+        from .cache import store_channel
 
         data = json.dumps(
             {"metadata": metadata, "blocks": flat_unsorted}, ensure_ascii=False

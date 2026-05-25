@@ -734,7 +734,7 @@ def _store_oauth_session_record(
     auth_server_nonce: str | None = None,
     expires_in_seconds: int | None = None,
 ) -> None:
-    from contextualize.cache.atproto import store_oauth_session
+    from .cache import store_oauth_session
 
     dpop_public_jwk = record.get("dpop_public_jwk")
     if not isinstance(dpop_public_jwk, dict):
@@ -764,7 +764,7 @@ def _store_oauth_session_record(
 
 
 def _refresh_cached_oauth_session(*, force: bool = False) -> dict[str, Any] | None:
-    from contextualize.cache.atproto import (
+    from .cache import (
         clear_cached_oauth_session,
         get_cached_oauth_session_record,
     )
@@ -990,7 +990,7 @@ def _resolve_actor_to_did(
     use_cache: bool,
     refresh_cache: bool,
 ) -> str:
-    from contextualize.cache.atproto import get_cached_handle_did, store_handle_did
+    from .cache import get_cached_handle_did, store_handle_did
 
     cleaned = actor.strip().lstrip("@")
     if cleaned.startswith("did:"):
@@ -1500,7 +1500,7 @@ def _describe_media(
     *,
     settings: AtprotoSettings,
 ) -> str | None:
-    from contextualize.cache.atproto import (
+    from .cache import (
         get_cached_media_bytes,
         get_cached_rendered,
         store_media_bytes,
@@ -3494,7 +3494,7 @@ def resolve_atproto_url(
     cache_ttl: timedelta | None = None,
     refresh_cache: bool = False,
 ) -> list[AtprotoDocument]:
-    from contextualize.cache.atproto import get_cached_api_json, store_api_json
+    from .cache import get_cached_api_json, store_api_json
     from contextualize.runtime import get_refresh_media
 
     warmup_atproto_network_stack()

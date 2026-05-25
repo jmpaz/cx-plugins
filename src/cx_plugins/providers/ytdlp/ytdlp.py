@@ -647,7 +647,7 @@ class YtDlpReference:
         return self._identity
 
     def _extract_audio(self) -> Path:
-        from contextualize.cache.youtube import (
+        from .cache import (
             get_cached_media_bytes,
             store_media_bytes,
         )
@@ -782,7 +782,7 @@ class YtDlpReference:
         if not self.use_cache or self.refresh_cache:
             return None
 
-        from contextualize.cache.youtube import get_cached_transcript
+        from .cache import get_cached_transcript
 
         if fast:
             render_cache_identity = _fast_render_cache_identity(
@@ -802,7 +802,7 @@ class YtDlpReference:
         if cached is None:
             return None
         if not fast:
-            from contextualize.cache.youtube import store_transcript
+            from .cache import store_transcript
 
             store_transcript(
                 _fast_render_cache_identity(base_identity, self.plugin_overrides),
@@ -824,7 +824,7 @@ class YtDlpReference:
         if not self.use_cache:
             return
 
-        from contextualize.cache.youtube import store_transcript
+        from .cache import store_transcript
 
         identities = (primary_base_identity, *_candidate_render_base_identities(self.url))
         for base_identity in tuple(dict.fromkeys(identities)):
@@ -904,7 +904,7 @@ class YtDlpReference:
         )
 
         if self.use_cache and not self.refresh_cache:
-            from contextualize.cache.youtube import get_cached_transcript
+            from .cache import get_cached_transcript
 
             cached = get_cached_transcript(
                 render_cache_identity,

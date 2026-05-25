@@ -825,7 +825,10 @@ def test_render_pdf_attachment_preview_ignores_old_render_cache(
             return "[Attachment: stale.pdf]"
         return None
 
-    monkeypatch.setattr("contextualize.cache.arena.get_cached_block_render", _cached)
+    monkeypatch.setattr(
+        "cx_plugins.providers.arena.cache.get_cached_block_render",
+        _cached,
+    )
     monkeypatch.setattr(
         arena,
         "_render_block_binary",
@@ -863,11 +866,11 @@ def test_render_channel_block_uses_header_added_line_and_other_channels(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
-        "contextualize.cache.arena.get_cached_block_connections",
+        "cx_plugins.providers.arena.cache.get_cached_block_connections",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "contextualize.cache.arena.store_block_connections",
+        "cx_plugins.providers.arena.cache.store_block_connections",
         lambda *_args, **_kwargs: None,
     )
 
@@ -933,11 +936,11 @@ def test_render_channel_block_uses_header_added_line_and_other_channels(
 
 def test_render_direct_block_shows_all_connected_channels(monkeypatch) -> None:
     monkeypatch.setattr(
-        "contextualize.cache.arena.get_cached_block_connections",
+        "cx_plugins.providers.arena.cache.get_cached_block_connections",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "contextualize.cache.arena.store_block_connections",
+        "cx_plugins.providers.arena.cache.store_block_connections",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
@@ -977,11 +980,11 @@ def test_render_direct_block_shows_all_connected_channels(monkeypatch) -> None:
 
 def test_render_connected_channels_reports_limit(monkeypatch) -> None:
     monkeypatch.setattr(
-        "contextualize.cache.arena.get_cached_block_connections",
+        "cx_plugins.providers.arena.cache.get_cached_block_connections",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "contextualize.cache.arena.store_block_connections",
+        "cx_plugins.providers.arena.cache.store_block_connections",
         lambda *_args, **_kwargs: None,
     )
     channels = [

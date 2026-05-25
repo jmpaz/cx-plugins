@@ -116,7 +116,7 @@ def test_render_cache_hit_records_transcription_routing_without_changing_output(
     calls: list[dict[str, object]] = []
 
     monkeypatch.setattr(
-        "contextualize.cache.youtube.get_cached_transcript",
+        "cx_plugins.providers.ytdlp.cache.get_cached_transcript",
         lambda *_args, **_kwargs: cached_text,
     )
     monkeypatch.setattr(
@@ -153,7 +153,7 @@ def test_youtube_render_cache_hit_does_not_fetch_metadata(monkeypatch) -> None:
         raise AssertionError("metadata should not be fetched on cache hit")
 
     monkeypatch.setattr(
-        "contextualize.cache.youtube.get_cached_transcript",
+        "cx_plugins.providers.ytdlp.cache.get_cached_transcript",
         _get_cached,
     )
     monkeypatch.setattr(ytdlp.YtDlpReference, "_fetch_metadata", _fetch_metadata)
@@ -185,10 +185,10 @@ def test_legacy_metadata_cache_hit_backfills_url_cache(monkeypatch) -> None:
         stored.append((identity, content, source))
 
     monkeypatch.setattr(
-        "contextualize.cache.youtube.get_cached_transcript",
+        "cx_plugins.providers.ytdlp.cache.get_cached_transcript",
         _get_cached,
     )
-    monkeypatch.setattr("contextualize.cache.youtube.store_transcript", _store)
+    monkeypatch.setattr("cx_plugins.providers.ytdlp.cache.store_transcript", _store)
 
     output = ytdlp.YtDlpReference._get_contents(ref)
 
@@ -639,7 +639,7 @@ def test_extract_audio_uses_cached_media_bytes(tmp_path: Path, monkeypatch) -> N
     ref._identity = ytdlp._build_identity(ref.url, ref._metadata)  # noqa: SLF001
 
     monkeypatch.setattr(
-        "contextualize.cache.youtube.get_cached_media_bytes",
+        "cx_plugins.providers.ytdlp.cache.get_cached_media_bytes",
         lambda identity: (
             b"cached-audio" if identity == "audio:youtube:abc123" else None
         ),

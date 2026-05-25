@@ -628,7 +628,7 @@ def _expires_within(value: str, *, seconds: int) -> bool:
 
 
 def _refresh_cached_user_token() -> _AuthContext | None:
-    from contextualize.cache.soundcloud import (
+    from .cache import (
         clear_cached_user_token,
         get_cached_user_token_record,
         store_user_token,
@@ -689,7 +689,7 @@ def _build_auth_context() -> _AuthContext:
     if not client_id or not client_secret:
         return _AuthContext(access_token=None, has_user_token=False)
 
-    from contextualize.cache.soundcloud import (
+    from .cache import (
         get_cached_client_token,
         store_client_token,
     )
@@ -1311,7 +1311,7 @@ def _describe_artwork(
     if not settings.include_artwork_descriptions:
         return None
 
-    from contextualize.cache.soundcloud import (
+    from .cache import (
         get_cached_media_bytes,
         get_cached_rendered,
         store_media_bytes,
@@ -2245,7 +2245,7 @@ def resolve_soundcloud_url(
     cache_ttl: timedelta | None = None,
     refresh_cache: bool = False,
 ) -> list[SoundCloudDocument]:
-    from contextualize.cache.soundcloud import get_cached_api_json, store_api_json
+    from .cache import get_cached_api_json, store_api_json
     from contextualize.runtime import get_refresh_media
 
     warmup_soundcloud_network_stack()

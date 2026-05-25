@@ -40,7 +40,7 @@ def _arena_me_profile(access_token: str) -> dict[str, str] | None:
 
 
 def _resolve_arena_active_token() -> tuple[str | None, str]:
-    from contextualize.cache.arena import get_cached_user_access_token
+    from .cache import get_cached_user_access_token
 
     load_dotenv_optional()
     env_token = (os.environ.get("ARENA_ACCESS_TOKEN") or "").strip()
@@ -73,7 +73,7 @@ def _arena_has_active_user_auth() -> bool:
 
 
 def _print_arena_auth_status() -> None:
-    from contextualize.cache.arena import (
+    from .cache import (
         get_cached_user_access_token,
         get_cached_user_token_record,
     )
@@ -128,7 +128,7 @@ def _validate_arena_token_for_storage(token: str) -> dict[str, str]:
 
 
 def _run_arena_logout() -> None:
-    from contextualize.cache.arena import clear_cached_user_token
+    from .cache import clear_cached_user_token
 
     load_dotenv_optional()
     clear_cached_user_token()
@@ -140,7 +140,7 @@ def _run_arena_logout() -> None:
 
 
 def _store_arena_pat(token: str, *, profile: dict[str, str] | None = None) -> None:
-    from contextualize.cache.arena import store_user_token
+    from .cache import store_user_token
 
     token_clean = token.strip()
     if not token_clean:

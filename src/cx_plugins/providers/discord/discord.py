@@ -1403,7 +1403,7 @@ def _api_get(
 ) -> Any:
     import requests
 
-    from contextualize.cache.discord import get_cached_api_json, store_api_json
+    from .cache import get_cached_api_json, store_api_json
 
     identity = _api_cache_identity(path, params)
     if use_cache and not refresh_cache:
@@ -1874,7 +1874,7 @@ def _extract_utf8_remote_media(
     if not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return None
 
-    from contextualize.cache.discord import (
+    from .cache import (
         get_cached_media_bytes,
         get_cached_rendered,
         store_media_bytes,
@@ -2006,7 +2006,7 @@ def _describe_remote_media(
     if not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return None
 
-    from contextualize.cache.discord import (
+    from .cache import (
         get_cached_media_bytes,
         get_cached_rendered,
         store_media_bytes,
@@ -3952,7 +3952,7 @@ def resolve_discord_url(
     cache_ttl: timedelta | None = None,
     refresh_cache: bool = False,
 ) -> list[DiscordDocument]:
-    from contextualize.cache.discord import get_cached_api_json, store_api_json
+    from .cache import get_cached_api_json, store_api_json
     from contextualize.runtime import get_refresh_media
 
     warmup_discord_network_stack()
@@ -4551,7 +4551,7 @@ def materialize_discord_attachment_target(
         url=attachment_url,
     )
 
-    from contextualize.cache.discord import (
+    from .cache import (
         get_cached_media_bytes,
         store_media_bytes,
     )
