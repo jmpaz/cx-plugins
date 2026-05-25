@@ -656,6 +656,158 @@ def test_arena_attachment_materialize_downloads_bytes(monkeypatch, tmp_path: Pat
     ]
 
 
+def test_render_pdf_attachment_fallback_preserves_block_metadata() -> None:
+    rendered = arena._render_block(
+        {
+            "id": 1001,
+            "type": "Attachment",
+            "created_at": "2026-05-24T21:50:27Z",
+            "title": "Research Packet",
+            "description": {"markdown": "Synthetic PDF packet."},
+            "attachment": {
+                "filename": "research-packet.pdf",
+                "content_type": "application/pdf",
+                "file_size": 403548,
+                "file_extension": "pdf",
+                "url": "https://attachments.are.na/1001/research-packet.pdf?1",
+            },
+        },
+        include_comments=False,
+        include_pdf_content=False,
+        include_media_descriptions=False,
+    )
+
+    assert rendered == "\n".join(
+        [
+            "Research Packet",
+            "2026-05-24",
+            "---",
+            "",
+            "Synthetic PDF packet.",
+            "",
+            "***",
+            "",
+            "[Attachment: research-packet.pdf]",
+            "Type: application/pdf",
+            "Size: 403548 bytes",
+            "URL: https://attachments.are.na/1001/research-packet.pdf?1",
+        ]
+    )
+
+
+def test_render_pdf_attachment_fallback_dedupes_title_description() -> None:
+    rendered = arena._render_block(
+        {
+            "id": 1002,
+            "type": "Attachment",
+            "created_at": "2016-08-22T21:20:18Z",
+            "title": "Shared Reading Notes",
+            "description": {"markdown": "Shared Reading Notes\n"},
+            "attachment": {
+                "filename": "reading-notes.pdf",
+                "content_type": "application/pdf",
+                "file_size": 1011519,
+                "file_extension": "pdf",
+                "url": "https://attachments.are.na/1002/reading-notes.pdf?1",
+            },
+        },
+        include_comments=False,
+        include_pdf_content=False,
+        include_media_descriptions=False,
+    )
+
+    assert rendered.count("Shared Reading Notes") == 1
+    assert "Size: 1011519 bytes" in rendered
+
+
+def test_render_pdf_attachment_fallback_uses_preview_image_when_enabled(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def _render_preview(url: str, suffix: str, **kwargs) -> str:
+        calls.append((url, suffix, kwargs))
+        return "Image size: 1582 x 994\n\nA scanned title page."
+
+    monkeypatch.setattr(arena, "_render_block_binary", _render_preview)
+
+    rendered = arena._render_block(
+        {
+            "id": 1001,
+            "type": "Attachment",
+            "created_at": "2026-05-24T21:50:27Z",
+            "title": "Research Packet",
+            "attachment": {
+                "filename": "paper.pdf",
+                "content_type": "application/pdf",
+                "file_size": 403548,
+                "file_extension": "pdf",
+                "url": "https://attachments.are.na/1001/paper.pdf?1",
+            },
+            "image": {
+                "src": "https://images.are.na/preview.png",
+                "width": 1582,
+                "height": 994,
+            },
+        },
+        include_comments=False,
+        include_pdf_content=False,
+        include_media_descriptions=True,
+    )
+
+    assert calls[0][0] == "https://images.are.na/preview.png"
+    assert calls[0][1] == ".png"
+    assert (
+        "## Block image description (auto-generated, dimensions: 1582x994)"
+        in rendered
+    )
+    assert "A scanned title page." in rendered
+
+
+def test_render_pdf_attachment_preview_ignores_old_render_cache(
+    monkeypatch,
+) -> None:
+    seen_variants = []
+
+    def _cached(_block_id, _updated_at, *, render_variant):
+        seen_variants.append(render_variant)
+        if "attachment-fallback=2" not in render_variant:
+            return "[Attachment: stale.pdf]"
+        return None
+
+    monkeypatch.setattr("contextualize.cache.arena.get_cached_block_render", _cached)
+    monkeypatch.setattr(
+        arena,
+        "_render_block_binary",
+        lambda *_args, **_kwargs: "Image size: 100 x 100\n\nFresh preview.",
+    )
+
+    rendered = arena._render_block(
+        {
+            "id": 1001,
+            "type": "Attachment",
+            "updated_at": "2026-05-24T22:44:17Z",
+            "title": "Research Packet",
+            "attachment": {
+                "filename": "paper.pdf",
+                "content_type": "application/pdf",
+                "file_size": 403548,
+                "file_extension": "pdf",
+                "url": "https://attachments.are.na/1001/paper.pdf?1",
+            },
+            "image": {"src": "https://images.are.na/preview.png"},
+        },
+        include_comments=False,
+        include_pdf_content=False,
+        include_media_descriptions=True,
+    )
+
+    assert seen_variants
+    assert all("attachment-fallback=2" in variant for variant in seen_variants)
+    assert "[Attachment: stale.pdf]" not in rendered
+    assert "Fresh preview." in rendered
+
+
 def test_resolve_arena_attachment_target_uses_attachment_url_reference(monkeypatch) -> None:
     monkeypatch.setattr(
         arena,

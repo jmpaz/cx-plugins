@@ -1486,6 +1486,36 @@ def _render_link_image_description(
     return ""
 
 
+def _render_attachment_preview_description(
+    block: dict, *, block_id: object, updated_at: str, title: str
+) -> str:
+    image_urls = _block_image_urls(block)
+    for image_url in image_urls:
+        suffix = Path(image_url.split("?")[0]).suffix or ".jpg"
+        media_cache_identity = (
+            f"arena:block:{block_id}:{updated_at}:attachment-preview:{image_url}"
+            if block_id and updated_at
+            else image_url
+        )
+        send_label = (
+            f"attachment-preview:{block_id or 'unknown'}:"
+            f"{(title or 'untitled')[:80]}"
+        )
+        converted = _render_block_binary(
+            image_url,
+            suffix,
+            media_cache_identity=media_cache_identity,
+            send_label=send_label,
+        )
+        if not converted:
+            continue
+        normalized = _normalize_image_description_markdown(converted)
+        if not normalized:
+            continue
+        return normalized
+    return ""
+
+
 def _comments_separator(rendered: str) -> str:
     best = ""
     for line in rendered.splitlines():
@@ -1566,6 +1596,25 @@ def _attachment_size_bytes(attachment: dict[str, Any]) -> int | None:
         if isinstance(raw, str) and raw.isdigit():
             return int(raw)
     return None
+
+
+def _attachment_fallback_lines(
+    block: dict[str, Any],
+    attachment: dict[str, Any],
+    *,
+    filename: str,
+    content_type: str,
+    att_url: str,
+) -> list[str]:
+    lines = [f"[Attachment: {filename or block.get('title') or block.get('id')}]"]
+    if content_type:
+        lines.append(f"Type: {content_type}")
+    size = _attachment_size_bytes(attachment)
+    if size is not None:
+        lines.append(f"Size: {size} bytes")
+    if att_url:
+        lines.append(f"URL: {att_url}")
+    return lines
 
 
 def _attachment_media_kind(
@@ -1860,6 +1909,8 @@ def _render_block(
         f":pdf={int(bool(include_pdf_content))}"
         f":media={int(bool(include_media_descriptions))}"
     )
+    if block_type == "Attachment":
+        render_variant += ":attachment-fallback=2"
 
     date = _format_date_line(block)
     core_output: str | None = None
@@ -1984,17 +2035,27 @@ def _render_block(
             attachment_media_kind in {"image", "video", "audio"}
             and not include_media_descriptions
         )
+        uses_pdf_preview_description = (
+            attachment_media_kind == "pdf"
+            and bool(include_media_descriptions)
+            and should_skip_pdf_content
+        )
         refresh_attachment = _should_refresh_attachment_media(
             filename=filename,
             extension=extension,
             content_type=content_type,
+        ) or (
+            uses_pdf_preview_description
+            and (get_refresh_images() or get_refresh_media())
         )
         if (
             block_id
             and updated_at
             and not refresh_attachment
-            and not should_skip_pdf_content
-            and not should_skip_media_description
+            and (
+                uses_pdf_preview_description
+                or (not should_skip_pdf_content and not should_skip_media_description)
+            )
         ):
             cached = get_cached_block_render(
                 block_id, updated_at, render_variant=render_variant
@@ -2029,12 +2090,29 @@ def _render_block(
                             att_title, description, converted, date=date
                         )
             if core_output is None:
-                fallback = f"[Attachment: {filename or title or block.get('id')}]"
-                if content_type:
-                    fallback += f"\nType: {content_type}"
-                if att_url:
-                    fallback += f"\nURL: {att_url}"
-                core_output = fallback
+                fallback_lines = _attachment_fallback_lines(
+                    block,
+                    attachment,
+                    filename=filename,
+                    content_type=content_type,
+                    att_url=att_url,
+                )
+                if uses_pdf_preview_description:
+                    preview_description = _render_attachment_preview_description(
+                        block,
+                        block_id=block_id,
+                        updated_at=updated_at,
+                        title=title,
+                    )
+                    if preview_description:
+                        fallback_lines.extend(["", preview_description])
+                att_title = title if title != filename else ""
+                att_description = description
+                if att_title and description.strip() == att_title.strip():
+                    att_description = ""
+                core_output = _format_block_output(
+                    att_title, att_description, "\n".join(fallback_lines), date=date
+                )
             if core_output and block_id and updated_at:
                 store_block_render(
                     block_id,
