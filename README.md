@@ -20,6 +20,7 @@ This package provides the following plugins:
 | `discord` | Discord | messages, threads, channels |
 | `googledocs` | Google Docs public export | public documents |
 | `soundcloud` | SoundCloud | tracks, playlists, profiles |
+| `snipd` | Snipd | public shared snips |
 | `wikipedia` | Wikipedia | article pages |
 | `whatsapp` | WhatsApp | exported chat archives |
 | `ytdlp` | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | supported media URLs (YouTube/Vimeo, TikTok/IG, etc) |
