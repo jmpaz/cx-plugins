@@ -1476,8 +1476,44 @@ def _format_event_line(label: str, timestamp: str, actor: dict | None) -> str:
     return line
 
 
-def _format_date_line(block: dict) -> str:
+def _format_metadata_line(label: str, value: str) -> str:
+    return f"{label:<7} {value}"
+
+
+def _normalize_source_title(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
+def _format_source_line(block: dict, *, block_title: str, block_type: str) -> str:
+    if block_type == "Link":
+        return ""
+    source = block.get("source")
+    if not isinstance(source, dict):
+        return ""
+    source_url = source.get("url")
+    if not isinstance(source_url, str) or not source_url.strip():
+        return ""
+    source_value = source_url.strip()
+    source_title = source.get("title")
+    if isinstance(source_title, str) and source_title.strip():
+        clean_title = " ".join(source_title.split())
+        if _normalize_source_title(clean_title) != _normalize_source_title(
+            block_title
+        ):
+            source_value = f"{clean_title} <{source_value}>"
+    return _format_metadata_line("source", source_value)
+
+
+def _format_date_line(
+    block: dict, *, block_title: str = "", block_type: str = ""
+) -> str:
     lines: list[str] = []
+    source_line = _format_source_line(
+        block, block_title=block_title, block_type=block_type
+    )
+    if source_line:
+        lines.append(source_line)
+
     created_at = _format_metadata_timestamp(block.get("created_at"))
     if created_at:
         lines.append(_format_event_line("created", created_at, _block_creator(block)))
@@ -2178,11 +2214,11 @@ def _format_block_output(
 
     parts: list[str] = []
     if title and date:
-        parts.append(f"{title}\n{date}\n---")
+        parts.append(f"{_format_metadata_line('title', title)}\n{date}\n---")
     elif date:
         parts.append(f"{date}\n---")
     elif title:
-        parts.append(f"{title}\n---")
+        parts.append(f"{_format_metadata_line('title', title)}\n---")
 
     if description and content:
         sep = _desc_separator(description)
@@ -2194,6 +2230,14 @@ def _format_block_output(
         parts.append(content)
 
     return "\n\n".join(parts)
+
+
+def _format_media_fallback_output(
+    title: str, description: str, content: str, *, date: str
+) -> str:
+    if date or description:
+        return _format_block_output(title, description, content, date=date) or content
+    return content
 
 
 def _render_block(
@@ -2242,8 +2286,9 @@ def _render_block(
     if include_media_descriptions is None:
         include_media_descriptions = _get_include_media_descriptions()
 
+    render_variant_version = "v3" if block_type == "Link" else "v4"
     render_variant = (
-        f"v3:type={str(block_type).lower()}"
+        f"{render_variant_version}:type={str(block_type).lower()}"
         f":desc={int(bool(include_descriptions))}"
         f":linkimg={int(bool(include_link_image_descriptions))}"
         f":pdf={int(bool(include_pdf_content))}"
@@ -2252,7 +2297,7 @@ def _render_block(
     if block_type == "Attachment":
         render_variant += ":attachment-fallback=2"
 
-    date = _format_date_line(block)
+    date = _format_date_line(block, block_title=title, block_type=str(block_type))
     core_output: str | None = None
 
     if block_type == "Text":
@@ -2300,7 +2345,9 @@ def _render_block(
                 fallback = f"[Image: {title or block.get('id')}]"
                 if fallback_url:
                     fallback += f"\nURL: {fallback_url}"
-                core_output = fallback
+                core_output = _format_media_fallback_output(
+                    title, description, fallback, date=date
+                )
             if core_output and block_id and updated_at:
                 store_block_render(
                     block_id,
@@ -2314,7 +2361,9 @@ def _render_block(
             fallback = f"[Image: {title or block.get('id')}]"
             if fallback_url:
                 fallback += f"\nURL: {fallback_url}"
-            core_output = fallback
+            core_output = _format_media_fallback_output(
+                title, description, fallback, date=date
+            )
 
     elif block_type == "Link":
         refresh_link = get_refresh_images() or get_refresh_media()

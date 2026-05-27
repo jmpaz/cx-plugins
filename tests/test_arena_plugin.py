@@ -303,6 +303,112 @@ def _group_profile(slug: str = "studio", name: str = "Studio") -> dict:
     }
 
 
+def test_render_text_block_sources_matching_title_as_header_url() -> None:
+    rendered = arena._render_block(
+        {
+            **_text_block(100),
+            "created_at": "2026-05-20T10:00:00Z",
+            "user": {"id": 4, "name": "Creator Person", "slug": "creator-person"},
+            "source": {
+                "url": "https://example.com/source",
+                "title": "Block 100",
+            },
+        },
+        include_comments=False,
+        include_connections=False,
+    )
+
+    assert rendered == "\n".join(
+        [
+            "title   Block 100",
+            "source  https://example.com/source",
+            "created 2026-05-20T10:00Z by Creator Person",
+            "---",
+            "",
+            "body 100",
+        ]
+    )
+
+
+def test_render_text_block_sources_different_title_as_header_title_url() -> None:
+    rendered = arena._render_block(
+        {
+            **_text_block(101),
+            "source": {
+                "url": "https://example.com/source",
+                "title": "Original Page",
+            },
+        },
+        include_comments=False,
+        include_connections=False,
+    )
+
+    assert rendered == "\n".join(
+        [
+            "title   Block 101",
+            "source  Original Page <https://example.com/source>",
+            "---",
+            "",
+            "body 101",
+        ]
+    )
+
+
+def test_render_image_block_keeps_image_url_and_sources_page_in_header() -> None:
+    rendered = arena._render_block(
+        {
+            "id": 45704370,
+            "type": "Image",
+            "title": "Saved image",
+            "source": {
+                "url": "https://example.com/article",
+                "title": "Original Article",
+            },
+            "image": {"src": "https://images.are.na/preview.jpg"},
+        },
+        include_comments=False,
+        include_connections=False,
+        include_media_descriptions=False,
+    )
+
+    assert rendered == "\n".join(
+        [
+            "title   Saved image",
+            "source  Original Article <https://example.com/article>",
+            "---",
+            "",
+            "[Image: Saved image]",
+            "URL: https://images.are.na/preview.jpg",
+        ]
+    )
+
+
+def test_render_link_block_does_not_duplicate_source_header() -> None:
+    rendered = arena._render_block(
+        {
+            "id": 200,
+            "type": "Link",
+            "title": "Original Page",
+            "source": {
+                "url": "https://example.com/source",
+                "title": "Original Page",
+            },
+        },
+        include_comments=False,
+        include_connections=False,
+    )
+
+    assert "source  " not in rendered
+    assert rendered == "\n".join(
+        [
+            "title   Original Page",
+            "---",
+            "",
+            "https://example.com/source",
+        ]
+    )
+
+
 def test_resolve_channel_includes_root_channel_metadata(monkeypatch) -> None:
     channel = _channel(
         "root",
@@ -725,7 +831,7 @@ def test_render_pdf_attachment_fallback_preserves_block_metadata() -> None:
 
     assert rendered == "\n".join(
         [
-            "Research Packet",
+            "title   Research Packet",
             "created 2026-05-24T21:50Z",
             "---",
             "",
@@ -921,7 +1027,7 @@ def test_render_channel_block_uses_header_added_line_and_other_channels(
     assert rendered.startswith(
         "\n".join(
             [
-                "Block 100",
+                "title   Block 100",
                 "created 2026-05-20T10:00Z by Creator Person",
                 "added   2026-05-24T21:50Z by Adder Person",
                 "---",
@@ -970,7 +1076,7 @@ def test_render_direct_block_shows_all_connected_channels(monkeypatch) -> None:
 
     assert "## Added to Channel" not in rendered
     assert rendered.startswith(
-        "Block 100\ncreated 2026-05-20T10:00Z by Creator Person\n---"
+        "title   Block 100\ncreated 2026-05-20T10:00Z by Creator Person\n---"
     )
     assert "added   " not in rendered
     assert "## Channels" in rendered
