@@ -4610,6 +4610,88 @@ def materialize_discord_attachment_target(
     ]
 
 
+def _is_whatsapp_zip_attachment(filename: str, content_type: str) -> bool:
+    suffix = Path(filename).suffix.lower()
+    if suffix != ".zip" and content_type.lower() not in {
+        "application/zip",
+        "application/x-zip-compressed",
+    }:
+        return False
+    return "whatsapp" in filename.lower()
+
+
+def _resolve_whatsapp_attachment_documents(
+    target: str,
+    parsed: dict[str, str],
+    *,
+    filename: str,
+    source_url: str,
+    attachment_url: str,
+    attachment_id: str | None,
+    channel_id: str,
+    message_id: str,
+    use_cache: bool,
+    cache_ttl: timedelta | None,
+    refresh_cache: bool,
+    plugin_overrides: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    from cx_plugins.providers.whatsapp import plugin as whatsapp_plugin
+
+    files = materialize_discord_attachment_target(
+        target,
+        parsed,
+        use_cache=use_cache,
+        cache_ttl=cache_ttl,
+        refresh_cache=refresh_cache,
+    )
+    if not files:
+        return []
+
+    with tempfile.TemporaryDirectory(prefix="discord-whatsapp-") as tmpdir:
+        archive_path = Path(tmpdir) / (Path(filename).name or "whatsapp.zip")
+        archive_path.write_bytes(files[0]["content"])
+        whatsapp_target = f"whatsapp:zip:{quote(str(archive_path), safe='/:')}"
+        documents = whatsapp_plugin.resolve(
+            whatsapp_target,
+            {
+                "overrides": plugin_overrides or {},
+                "use_cache": use_cache,
+                "cache_ttl": cache_ttl,
+                "refresh_cache": refresh_cache,
+            },
+        )
+
+    out: list[dict[str, Any]] = []
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        rendered = document.get("content")
+        source = document.get("source")
+        if isinstance(rendered, str) and isinstance(source, str) and source:
+            rendered = rendered.replace(source, target)
+        metadata = dict(document.get("metadata") or {})
+        metadata.update(
+            {
+                "trace_path": target,
+                "sourceMessageUrl": source_url,
+                "attachmentUrl": attachment_url,
+                "attachmentId": attachment_id,
+                "attachmentName": filename,
+                "channelId": channel_id,
+                "messageId": message_id,
+                "archivePath": target,
+                "hostProvider": "discord",
+            }
+        )
+        resolved = dict(document)
+        resolved["source"] = target
+        if isinstance(rendered, str):
+            resolved["content"] = rendered
+        resolved["metadata"] = metadata
+        out.append(resolved)
+    return out
+
+
 def resolve_discord_attachment_target(
     target: str,
     parsed: dict[str, str],
@@ -4644,8 +4726,25 @@ def resolve_discord_attachment_target(
         )
 
     filename = str(attachment.get("filename") or "") or "attachment"
+    content_type = str(attachment.get("content_type") or "")
     attachment_id = str(attachment.get("id") or "") or None
     source_url = _build_message_url(guild_id, channel_id, message_id)
+    if _is_whatsapp_zip_attachment(filename, content_type):
+        return _resolve_whatsapp_attachment_documents(
+            target,
+            parsed,
+            filename=filename,
+            source_url=source_url,
+            attachment_url=attachment_url,
+            attachment_id=attachment_id,
+            channel_id=channel_id,
+            message_id=message_id,
+            use_cache=use_cache,
+            cache_ttl=cache_ttl,
+            refresh_cache=refresh_cache,
+            plugin_overrides=plugin_overrides,
+        )
+
     reference = URLReference(
         attachment_url,
         format="raw",

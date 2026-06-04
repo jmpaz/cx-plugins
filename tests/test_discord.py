@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 
 from cx_plugins.providers.discord import discord
@@ -132,6 +133,64 @@ def test_discord_attachment_materialize_downloads_bytes(monkeypatch, tmp_path: P
             },
         }
     ]
+
+
+def test_discord_whatsapp_zip_attachment_resolves_as_whatsapp(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        discord,
+        "_fetch_message",
+        lambda *_args, **_kwargs: {
+            "id": "3",
+            "timestamp": "2026-05-13T12:00:00.000000+00:00",
+            "attachments": [
+                {
+                    "id": "a1",
+                    "filename": "WhatsApp_Chat_-_Manu.zip",
+                    "content_type": "application/zip",
+                    "url": "https://cdn.example/chat.zip",
+                }
+            ],
+        },
+    )
+
+    payload_path = tmp_path / "chat.zip"
+    with zipfile.ZipFile(payload_path, "w") as archive:
+        archive.writestr(
+            "_chat.txt",
+            "[5/12/26, 5:47:29 PM] Josh: like whether and to what extent",
+        )
+
+    def _download(url: str, **kwargs) -> Path:
+        assert url == "https://cdn.example/chat.zip"
+        return payload_path
+
+    monkeypatch.setattr(
+        "cx_plugins.providers.shared.media.download_cached_media_to_temp",
+        _download,
+    )
+
+    docs = discord_plugin.resolve(
+        "https://discord.com/channels/1/2/3?attachment-id=a1",
+        {"use_cache": False, "refresh_cache": True},
+    )
+
+    assert len(docs) == 1
+    assert docs[0]["source"] == "https://discord.com/channels/1/2/3?attachment-id=a1"
+    assert "like whether and to what extent" in docs[0]["content"]
+    assert "/tmp/discord-whatsapp-" not in docs[0]["content"]
+    assert (
+        "url: https://discord.com/channels/1/2/3?attachment-id=a1"
+        in docs[0]["content"]
+    )
+    metadata = docs[0]["metadata"]
+    assert metadata["provider"] == "whatsapp"
+    assert metadata["source_ref"] == "whatsapp"
+    assert metadata["hostProvider"] == "discord"
+    assert metadata["attachmentName"] == "WhatsApp_Chat_-_Manu.zip"
+    assert metadata["sourceMessageUrl"] == "https://discord.com/channels/1/2/3"
 
 
 def test_collect_cli_overrides_emits_media_controls() -> None:
