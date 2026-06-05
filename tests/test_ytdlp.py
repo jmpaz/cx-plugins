@@ -11,6 +11,28 @@ from cx_plugins.providers.ytdlp import plugin as ytdlp_plugin
 from cx_plugins.providers.ytdlp import ytdlp
 
 
+SYNTHETIC_TIKTOK_ITEM_ID = "7000000000000000001"
+SYNTHETIC_IMAGE_SOUND_ID = "7000000000000000002"
+SYNTHETIC_VIDEO_SOUND_ID = "7000000000000000003"
+SYNTHETIC_TIKTOK_HOST = "www.tiktok.com"
+SYNTHETIC_TIKTOK_USER = "synthetic-user"
+SYNTHETIC_TIKTOK_SHORT_CODE = "SYNTHETIC"
+SYNTHETIC_SUBSTACK_URL = (
+    "https://synthetic-substack.substack.com/p/synthetic-post"
+)
+
+
+def _synthetic_tiktok_url(kind: str) -> str:
+    return (
+        f"https://{SYNTHETIC_TIKTOK_HOST}/@{SYNTHETIC_TIKTOK_USER}/"
+        f"{kind}/{SYNTHETIC_TIKTOK_ITEM_ID}"
+    )
+
+
+def _synthetic_tiktok_short_url() -> str:
+    return f"https://{SYNTHETIC_TIKTOK_HOST}/t/{SYNTHETIC_TIKTOK_SHORT_CODE}/"
+
+
 def test_ytdlp_priority_is_below_specialized_providers() -> None:
     assert ytdlp_plugin.PLUGIN_PRIORITY < soundcloud_plugin.PLUGIN_PRIORITY
     assert ytdlp_plugin.PLUGIN_PRIORITY < atproto_plugin.PLUGIN_PRIORITY
@@ -252,9 +274,9 @@ def test_twitter_urls_are_excluded_without_probe(monkeypatch) -> None:
     monkeypatch.setattr(ytdlp, "probe_ytdlp_metadata", _probe)
 
     for target in (
-        "https://x.com/turtlekiosk/status/2054792241785311616?s=46",
-        "https://twitter.com/bashu_thanks/status/1736431291740963038",
-        "https://mobile.twitter.com/example/status/1",
+        "https://x.com/synthetic_user/status/2000000000000000001?s=46",
+        "https://twitter.com/synthetic_user/status/2000000000000000002",
+        "https://mobile.twitter.com/synthetic_user/status/1",
     ):
         assert ytdlp.is_excluded_ytdlp_url(target) is True
         assert ytdlp_plugin.can_resolve(target, {}) is False
@@ -262,7 +284,7 @@ def test_twitter_urls_are_excluded_without_probe(monkeypatch) -> None:
 
 
 def test_tiktok_photo_urls_are_claimed_without_ytdlp_probe(monkeypatch) -> None:
-    target = "https://www.tiktok.com/@exampleuser/photo/7312345678901234567"
+    target = _synthetic_tiktok_url("photo")
 
     def _probe(*_args, **_kwargs):
         raise AssertionError("photo urls should not need a ytdlp probe")
@@ -276,6 +298,67 @@ def test_tiktok_photo_urls_are_claimed_without_ytdlp_probe(monkeypatch) -> None:
     assert classified is not None
     assert classified["kind"] == "image"
     assert classified["group_key"] == "image"
+
+
+def test_tiktok_short_url_resolution_uses_tiktok_redirect(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    target = _synthetic_tiktok_short_url()
+    resolved = _synthetic_tiktok_url("video")
+
+    class _Response:
+        headers = {"Location": resolved}
+
+    class _Requests:
+        @staticmethod
+        def get(url: str, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return _Response()
+
+    monkeypatch.setitem(sys.modules, "requests", _Requests)
+
+    assert ytdlp._resolve_tiktok_short_url(target, timeout_seconds=30) == resolved
+    assert captured["url"] == target
+    assert captured["kwargs"]["allow_redirects"] is False
+
+
+def test_probe_ytdlp_metadata_uses_resolved_tiktok_short_url(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    target = _synthetic_tiktok_short_url()
+    resolved = _synthetic_tiktok_url("video")
+
+    monkeypatch.setattr(ytdlp, "_check_ytdlp", lambda: None)
+    monkeypatch.setattr(
+        ytdlp,
+        "_resolve_tiktok_short_url",
+        lambda _url, *, timeout_seconds: resolved,
+    )
+
+    def _run(args: list[str], **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return ytdlp.subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=ytdlp.json.dumps(
+                {
+                    "extractor_key": "TikTok",
+                    "id": SYNTHETIC_TIKTOK_ITEM_ID,
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(ytdlp, "_run_ytdlp", _run)
+
+    metadata = ytdlp.probe_ytdlp_metadata(target, timeout_seconds=12)
+
+    assert metadata == {
+        "extractor_key": "TikTok",
+        "id": SYNTHETIC_TIKTOK_ITEM_ID,
+    }
+    assert captured["args"][-1] == resolved
+    assert captured["kwargs"]["timeout_seconds"] == 12
 
 
 def test_ytdlp_command_prefers_bundled_python_module(monkeypatch) -> None:
@@ -361,7 +444,7 @@ def test_can_resolve_probes_substack_before_claiming(monkeypatch) -> None:
 
         @staticmethod
         def suitable(url: str) -> bool:
-            return url == "https://regroup.substack.com/p/on-fluid-objects-static-self"
+            return url == SYNTHETIC_SUBSTACK_URL
 
     monkeypatch.setattr(ytdlp, "_ytdlp_extractors", lambda: (_SubstackExtractor(),))
     ytdlp.matching_ytdlp_extractors.cache_clear()
@@ -370,7 +453,7 @@ def test_can_resolve_probes_substack_before_claiming(monkeypatch) -> None:
 
     assert (
         ytdlp_plugin.can_resolve(
-            "https://regroup.substack.com/p/on-fluid-objects-static-self",
+            SYNTHETIC_SUBSTACK_URL,
             {},
         )
         is False
@@ -384,7 +467,7 @@ def test_can_resolve_probes_substack_before_claiming(monkeypatch) -> None:
 
     assert (
         ytdlp_plugin.can_resolve(
-            "https://regroup.substack.com/p/on-fluid-objects-static-self",
+            SYNTHETIC_SUBSTACK_URL,
             {},
         )
         is True
@@ -430,14 +513,14 @@ def test_classify_target_marks_tiktok_photomode_metadata_as_image(
         "probe_ytdlp_metadata",
         lambda _url, timeout_seconds=10: {
             "extractor_key": "TikTok",
-            "id": "7312345678901234567",
+            "id": SYNTHETIC_TIKTOK_ITEM_ID,
             "duration": 278,
             "thumbnail": "https://example.com/tplv-photomode-image.jpeg",
         },
     )
 
     classified = ytdlp_plugin.classify_target(
-        "https://www.tiktok.com/@exampleuser/video/7312345678901234567",
+        _synthetic_tiktok_url("video"),
         {},
     )
 
@@ -453,7 +536,7 @@ def test_classify_target_skips_probe_required_url_without_metadata(monkeypatch) 
 
     assert (
         ytdlp_plugin.classify_target(
-            "https://regroup.substack.com/p/on-fluid-objects-static-self",
+            SYNTHETIC_SUBSTACK_URL,
             {},
         )
         is None
@@ -618,14 +701,14 @@ def test_build_identity_uses_extractor_and_id_or_url_hash() -> None:
 
 
 def test_tiktok_image_post_render_describes_each_image(monkeypatch) -> None:
-    ref = _render_ref("https://www.tiktok.com/@exampleuser/photo/7312345678901234567")
+    ref = _render_ref(_synthetic_tiktok_url("photo"))
     ref._metadata = {
         "extractor_key": "TikTok",
-        "id": "7312345678901234567",
-        "title": "Textile art",
-        "description": "textile and computer graphics",
-        "channel": "alyssa",
-        "uploader": "exampleuser",
+        "id": SYNTHETIC_TIKTOK_ITEM_ID,
+        "title": "Synthetic image title",
+        "description": "Synthetic image caption",
+        "channel": "Synthetic image channel",
+        "uploader": SYNTHETIC_TIKTOK_USER,
         "thumbnail": "https://example.com/tplv-photomode-image.jpeg",
     }
     ref._identity = ytdlp._build_identity(ref.url, ref._metadata)  # noqa: SLF001
@@ -643,6 +726,16 @@ def test_tiktok_image_post_render_describes_each_image(monkeypatch) -> None:
             },
         ]
     }
+    tiktok_item = {
+        "imagePost": image_post,
+        "music": {
+            "id": SYNTHETIC_IMAGE_SOUND_ID,
+            "title": "Synthetic image sound",
+            "authorName": "Synthetic image artist",
+            "duration": 47,
+            "original": True,
+        },
+    }
     stored: list[tuple[str, str, str]] = []
 
     def _get_transcript(*_args, **_kwargs):
@@ -653,7 +746,7 @@ def test_tiktok_image_post_render_describes_each_image(monkeypatch) -> None:
         assert total_images == 2
         return f"Alt text {image['index']}"
 
-    monkeypatch.setattr(ytdlp, "_fetch_tiktok_image_post", lambda _metadata: image_post)
+    monkeypatch.setattr(ytdlp, "_fetch_tiktok_item", lambda _metadata: tiktok_item)
     monkeypatch.setattr(ytdlp, "_should_refresh_tiktok_images", lambda: False)
     monkeypatch.setattr(ytdlp.YtDlpReference, "_get_transcript", _get_transcript)
     monkeypatch.setattr(ytdlp.YtDlpReference, "_describe_tiktok_image", _describe)
@@ -672,13 +765,85 @@ def test_tiktok_image_post_render_describes_each_image(monkeypatch) -> None:
 
     assert 'kind: image' in output
     assert 'image_count: 2' in output
+    assert "## Sound" in output
+    assert "- title: Synthetic image sound" in output
+    assert "- artist: Synthetic image artist" in output
+    assert "- duration_seconds: 47" in output
+    image_sound_url = ytdlp._tiktok_music_url(
+        "Synthetic image sound", SYNTHETIC_IMAGE_SOUND_ID
+    )
+    assert f"- url: {image_sound_url}" in output
+    assert "\n- id:" not in output
+    assert "- original: true" in output
     assert '<image index="1" width="2160" height="3240">' in output
     assert "Alt text 1" in output
     assert '<image index="2" width="1080" height="1920">' in output
     assert "Alt text 2" in output
     assert stored
-    assert stored[0][0] == "tiktok:7312345678901234567:image-post:v1"
+    assert stored[0][0] == f"tiktok:{SYNTHETIC_TIKTOK_ITEM_ID}:image-post:v2"
     assert stored[0][2] == "image-post"
+
+
+def test_tiktok_video_render_includes_sound_metadata(monkeypatch) -> None:
+    ref = _render_ref(_synthetic_tiktok_url("video"))
+    ref._metadata = {
+        "extractor_key": "TikTok",
+        "id": SYNTHETIC_TIKTOK_ITEM_ID,
+        "title": "Synthetic video title",
+        "description": "Synthetic video caption",
+        "channel": "Synthetic video channel",
+        "uploader": SYNTHETIC_TIKTOK_USER,
+        "duration": 12,
+        "track": "Synthetic fallback sound",
+        "artists": ["Synthetic fallback artist"],
+    }
+    ref._identity = ytdlp._build_identity(ref.url, ref._metadata)  # noqa: SLF001
+    tiktok_item = {
+        "music": {
+            "id": SYNTHETIC_VIDEO_SOUND_ID,
+            "title": "Synthetic video sound",
+            "authorName": "Synthetic video artist",
+            "duration": 31,
+            "original": False,
+        }
+    }
+    stored: list[tuple[str, str, str]] = []
+
+    monkeypatch.setattr(ytdlp, "_fetch_tiktok_item", lambda _metadata: tiktok_item)
+    monkeypatch.setattr(
+        "cx_plugins.providers.ytdlp.cache.get_cached_transcript",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "cx_plugins.providers.ytdlp.cache.store_transcript",
+        lambda identity, content, source="unknown": stored.append(
+            (identity, content, source)
+        ),
+    )
+    monkeypatch.setattr(
+        ytdlp.YtDlpReference,
+        "_get_transcript",
+        lambda _self, _duration: ("Transcript body.", "transcription"),
+    )
+
+    output = ytdlp.YtDlpReference._get_contents(ref)
+
+    assert "## Sound" in output
+    assert "- title: Synthetic video sound" in output
+    assert "- artist: Synthetic video artist" in output
+    assert "- duration_seconds: 31" in output
+    video_sound_url = ytdlp._tiktok_music_url(
+        "Synthetic video sound", SYNTHETIC_VIDEO_SOUND_ID
+    )
+    assert f"- url: {video_sound_url}" in output
+    assert "\n- id:" not in output
+    assert "- original: false" in output
+    assert "Transcript body." in output
+    assert stored
+    assert stored[0][0].startswith(
+        f"tiktok:{SYNTHETIC_TIKTOK_ITEM_ID}:tiktok-sound:v1:transcribe:"
+    )
+    assert stored[0][2] == "transcription"
 
 
 def test_get_transcript_passes_transcription_cache_flags(

@@ -17,7 +17,7 @@ from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse, urlunparse
+from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
 
 def is_url_target(url: str) -> bool:
@@ -37,6 +37,7 @@ def _normalized_host(url: str) -> str:
 _TIKTOK_PHOTO_PATH_RE = re.compile(
     r"^/@(?P<user_id>[\w.-]+)/photo/(?P<id>\d+)(?:/)?$"
 )
+_TIKTOK_SHORT_PATH_RE = re.compile(r"^/t/[^/]+/?$")
 
 
 def _is_tiktok_host(url: str) -> bool:
@@ -53,6 +54,39 @@ def _tiktok_photo_match(url: str) -> re.Match[str] | None:
 
 def is_tiktok_photo_url(url: str) -> bool:
     return _tiktok_photo_match(url) is not None
+
+
+def _is_tiktok_short_url(url: str) -> bool:
+    if not _is_tiktok_host(url):
+        return False
+    parsed = urlparse(url.strip())
+    return _TIKTOK_SHORT_PATH_RE.match(parsed.path) is not None
+
+
+def _resolve_tiktok_short_url(
+    url: str, *, timeout_seconds: int | float
+) -> str:
+    if not _is_tiktok_short_url(url):
+        return url
+    try:
+        import requests
+
+        response = requests.get(
+            url,
+            headers=_TIKTOK_API_HEADERS,
+            timeout=max(1.0, min(float(timeout_seconds), 10.0)),
+            allow_redirects=False,
+        )
+    except Exception as exc:
+        _log(f"TikTok short link resolution failed for {url}: {exc}")
+        return url
+    location = response.headers.get("Location")
+    if not isinstance(location, str) or not location.strip():
+        return url
+    resolved = urljoin(url, location.strip())
+    if _is_tiktok_host(resolved):
+        return resolved
+    return url
 
 
 def _tiktok_photo_as_video_url(url: str) -> str:
@@ -329,7 +363,9 @@ def probe_ytdlp_metadata(
 ) -> dict[str, Any] | None:
     if not is_url_target(url):
         return None
-    ytdlp_url = _tiktok_photo_as_video_url(url)
+    ytdlp_url = _tiktok_photo_as_video_url(
+        _resolve_tiktok_short_url(url, timeout_seconds=timeout_seconds)
+    )
     try:
         _check_ytdlp()
         result = _run_ytdlp(
@@ -677,7 +713,11 @@ def _normalize_image_alttext(markdown: str) -> str:
 
 
 def _tiktok_image_post_render_cache_identity(base_identity: str) -> str:
-    return f"{base_identity}:image-post:v1"
+    return f"{base_identity}:image-post:v2"
+
+
+def _tiktok_transcript_render_base_identity(base_identity: str) -> str:
+    return f"{base_identity}:tiktok-sound:v1"
 
 
 def _tiktok_image_cache_identity(base_identity: str, image: dict[str, Any]) -> str:
@@ -769,11 +809,7 @@ def _tiktok_item_list_cursors(metadata: dict[str, Any]) -> tuple[int, ...]:
     return tuple(dict.fromkeys(cursors))
 
 
-def _fetch_tiktok_image_post(metadata: dict[str, Any]) -> dict[str, Any] | None:
-    image_post = metadata.get("imagePost")
-    if isinstance(image_post, dict) and _tiktok_image_entries(image_post):
-        return image_post
-
+def _fetch_tiktok_item(metadata: dict[str, Any]) -> dict[str, Any] | None:
     if not _is_tiktok_metadata(metadata):
         return None
     sec_uid = metadata.get("channel_id")
@@ -796,16 +832,140 @@ def _fetch_tiktok_image_post(metadata: dict[str, Any]) -> dict[str, Any] | None:
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:
-            _log(f"TikTok image post lookup failed for {item_id}: {exc}")
+            _log(f"TikTok item lookup failed for {item_id}: {exc}")
             continue
         for item in payload.get("itemList") or ():
             if not isinstance(item, dict) or item.get("id") != item_id:
                 continue
-            image_post = item.get("imagePost")
-            if isinstance(image_post, dict) and _tiktok_image_entries(image_post):
-                return image_post
-            return None
+            return item
     return None
+
+
+def _tiktok_image_post_from_item(
+    metadata: dict[str, Any],
+    item: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    image_post = metadata.get("imagePost")
+    if isinstance(image_post, dict) and _tiktok_image_entries(image_post):
+        return image_post
+    if not isinstance(item, dict):
+        return None
+    image_post = item.get("imagePost")
+    if isinstance(image_post, dict) and _tiktok_image_entries(image_post):
+        return image_post
+    return None
+
+
+def _fetch_tiktok_image_post(metadata: dict[str, Any]) -> dict[str, Any] | None:
+    return _tiktok_image_post_from_item(metadata, _fetch_tiktok_item(metadata))
+
+
+def _clean_metadata_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _metadata_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _metadata_artists(value: Any) -> str | None:
+    if isinstance(value, list):
+        names = [
+            item.strip()
+            for item in value
+            if isinstance(item, str) and item.strip()
+        ]
+        return ", ".join(names) or None
+    return _clean_metadata_text(value)
+
+
+def _tiktok_music_metadata(
+    metadata: dict[str, Any],
+    item: dict[str, Any] | None,
+) -> dict[str, Any]:
+    music = item.get("music") if isinstance(item, dict) else None
+    if not isinstance(music, dict):
+        music = {}
+
+    title = _clean_metadata_text(music.get("title")) or _clean_metadata_text(
+        metadata.get("track")
+    )
+    artist = (
+        _clean_metadata_text(music.get("authorName"))
+        or _clean_metadata_text(music.get("author"))
+        or _clean_metadata_text(metadata.get("artist"))
+        or _metadata_artists(metadata.get("artists"))
+    )
+    album = _clean_metadata_text(music.get("album")) or _clean_metadata_text(
+        metadata.get("album")
+    )
+    music_id = _clean_metadata_text(music.get("id")) or _clean_metadata_text(
+        metadata.get("music_id")
+    )
+    duration_seconds = _metadata_int(music.get("duration"))
+    original = music.get("original")
+    if not isinstance(original, bool):
+        original = None
+
+    return {
+        "title": title,
+        "artist": artist,
+        "album": album,
+        "id": music_id,
+        "duration_seconds": duration_seconds,
+        "original": original,
+        "url": _tiktok_music_url(title, music_id),
+    }
+
+
+def _tiktok_music_url(title: str | None, music_id: str | None) -> str | None:
+    if not music_id:
+        return None
+    slug = _slugify(title or "sound", default="sound")
+    return f"https://www.tiktok.com/music/{slug}-{music_id}"
+
+
+def _append_sound_field(lines: list[str], key: str, value: Any) -> None:
+    if isinstance(value, bool):
+        lines.append(f"- {key}: {str(value).lower()}")
+        return
+    if isinstance(value, int):
+        lines.append(f"- {key}: {value}")
+        return
+    cleaned = _clean_metadata_text(value)
+    if cleaned:
+        lines.append(f"- {key}: {cleaned}")
+
+
+def _format_tiktok_sound_section(
+    metadata: dict[str, Any],
+    item: dict[str, Any] | None,
+) -> list[str]:
+    if not _is_tiktok_metadata(metadata):
+        return []
+    sound = _tiktok_music_metadata(metadata, item)
+    if not any(value is not None for value in sound.values()):
+        return []
+
+    lines = ["## Sound", ""]
+    _append_sound_field(lines, "title", sound.get("title"))
+    _append_sound_field(lines, "artist", sound.get("artist"))
+    _append_sound_field(lines, "duration_seconds", sound.get("duration_seconds"))
+    _append_sound_field(lines, "url", sound.get("url"))
+    _append_sound_field(lines, "album", sound.get("album"))
+    _append_sound_field(lines, "original", sound.get("original"))
+    return lines
 
 
 @dataclass
@@ -1099,7 +1259,10 @@ class YtDlpReference:
 
         from .cache import store_transcript
 
-        identities = (primary_base_identity, *_candidate_render_base_identities(self.url))
+        identities = (
+            primary_base_identity,
+            *_candidate_render_base_identities(self.url),
+        )
         for base_identity in tuple(dict.fromkeys(identities)):
             if base_identity == primary_base_identity:
                 full_identity = _render_cache_identity(
@@ -1115,6 +1278,60 @@ class YtDlpReference:
                 )
             store_transcript(
                 _fast_render_cache_identity(base_identity, self.plugin_overrides),
+                text,
+                source=source,
+            )
+
+    def _tiktok_transcript_base_identities(
+        self, identity: _YtDlpIdentity
+    ) -> tuple[str, ...]:
+        identities = (
+            identity.cache_identity,
+            *_candidate_render_base_identities(self.url),
+        )
+        return tuple(dict.fromkeys(identities))
+
+    def _cached_tiktok_transcript_output(
+        self,
+        identity: _YtDlpIdentity,
+        whisper_available: bool,
+    ) -> str | None:
+        if not self.use_cache or self.refresh_cache:
+            return None
+
+        from .cache import get_cached_transcript
+
+        for base_identity in self._tiktok_transcript_base_identities(identity):
+            cached = get_cached_transcript(
+                _render_cache_identity(
+                    _tiktok_transcript_render_base_identity(base_identity),
+                    self.plugin_overrides,
+                ),
+                self.cache_ttl,
+                whisper_available=whisper_available,
+            )
+            if cached is not None:
+                return self._record_render_cache_hit(cached, identity)
+        return None
+
+    def _store_tiktok_transcript_output(
+        self,
+        identity: _YtDlpIdentity,
+        *,
+        text: str,
+        source: str,
+    ) -> None:
+        if not self.use_cache:
+            return
+
+        from .cache import store_transcript
+
+        for base_identity in self._tiktok_transcript_base_identities(identity):
+            store_transcript(
+                _render_cache_identity(
+                    _tiktok_transcript_render_base_identity(base_identity),
+                    self.plugin_overrides,
+                ),
                 text,
                 source=source,
             )
@@ -1211,6 +1428,7 @@ class YtDlpReference:
         self,
         metadata: dict[str, Any],
         image_post: dict[str, Any],
+        tiktok_item: dict[str, Any] | None = None,
     ) -> str:
         entries = _tiktok_image_entries(image_post)
         title = metadata.get("title") or "TikTok image post"
@@ -1233,7 +1451,12 @@ class YtDlpReference:
             lines.append(f"track: {_escape_yaml_string(str(track))}")
         if description:
             lines.append(f"description: {_escape_yaml_string(str(description))}")
-        lines.extend(["---", "", "## Images"])
+        lines.extend(["---", ""])
+        sound_lines = _format_tiktok_sound_section(metadata, tiktok_item)
+        if sound_lines:
+            lines.extend(sound_lines)
+            lines.append("")
+        lines.append("## Images")
 
         total_images = len(entries)
         for image in entries:
@@ -1257,19 +1480,31 @@ class YtDlpReference:
         self,
         metadata: dict[str, Any],
         image_post: dict[str, Any],
+        tiktok_item: dict[str, Any] | None = None,
     ) -> str:
         identity = self._get_identity()
         cached = self._cached_tiktok_image_post_output(identity.cache_identity)
         if cached is not None:
             return cached
 
-        text = self._format_tiktok_image_post_output(metadata, image_post)
+        text = self._format_tiktok_image_post_output(
+            metadata,
+            image_post,
+            tiktok_item=tiktok_item,
+        )
         self.original_file_content = text
         self.file_content = text
         self._store_tiktok_image_post_output(identity.cache_identity, text)
         return self._render_output_text(text)
 
-    def _format_output(self, metadata: dict, transcript: str, source: str) -> str:
+    def _format_output(
+        self,
+        metadata: dict,
+        transcript: str,
+        source: str,
+        *,
+        tiktok_item: dict[str, Any] | None = None,
+    ) -> str:
         title = metadata.get("title", "Untitled")
         channel = metadata.get("channel") or metadata.get("uploader")
         description = metadata.get("description")
@@ -1292,6 +1527,11 @@ class YtDlpReference:
             lines.append(f"# {title}")
             lines.append("")
 
+        sound_lines = _format_tiktok_sound_section(metadata, tiktok_item)
+        if sound_lines:
+            lines.extend(sound_lines)
+            lines.append("")
+
         if transcript:
             formatted_transcript = _insert_timestamps(transcript, duration)
             lines.append(formatted_transcript)
@@ -1305,12 +1545,49 @@ class YtDlpReference:
 
         if _is_tiktok_host(self._metadata_url()):
             metadata = self._fetch_metadata()
+            identity = self._get_identity()
             if is_tiktok_photo_url(self.url) or _metadata_has_tiktok_image_post(
                 metadata
             ):
-                image_post = _fetch_tiktok_image_post(metadata)
+                cached_image = self._cached_tiktok_image_post_output(
+                    identity.cache_identity
+                )
+                if cached_image is not None:
+                    return cached_image
+                tiktok_item = _fetch_tiktok_item(metadata)
+                image_post = _tiktok_image_post_from_item(metadata, tiktok_item)
                 if image_post is not None:
-                    return self._render_tiktok_image_post(metadata, image_post)
+                    return self._render_tiktok_image_post(
+                        metadata,
+                        image_post,
+                        tiktok_item=tiktok_item,
+                    )
+
+            cached_tiktok = self._cached_tiktok_transcript_output(
+                identity,
+                whisper_available,
+            )
+            if cached_tiktok is not None:
+                return cached_tiktok
+
+            tiktok_item = _fetch_tiktok_item(metadata)
+            duration = int(metadata.get("duration", 0) or 0)
+            _log(
+                f"building transcript for {identity.display_name} "
+                f"(duration={duration}s, refresh_cache={self.refresh_cache})"
+            )
+            transcript, source = self._get_transcript(duration)
+            text = self._format_output(
+                metadata,
+                transcript,
+                source,
+                tiktok_item=tiktok_item,
+            )
+
+            self.original_file_content = text
+            self.file_content = text
+            self._store_tiktok_transcript_output(identity, text=text, source=source)
+            return self._render_output_text(text)
 
         for base_identity in _candidate_render_base_identities(self.url):
             cached_output = self._cached_render_output(
