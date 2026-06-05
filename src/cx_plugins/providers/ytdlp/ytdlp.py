@@ -38,11 +38,34 @@ _TIKTOK_PHOTO_PATH_RE = re.compile(
     r"^/@(?P<user_id>[\w.-]+)/photo/(?P<id>\d+)(?:/)?$"
 )
 _TIKTOK_SHORT_PATH_RE = re.compile(r"^/t/[^/]+/?$")
+_INSTAGRAM_MEDIA_PATH_RE = re.compile(
+    r"^/(?:[^/]+/)?(?P<kind>p|tv|reel|reels)/"
+    r"(?!audio(?:/|$))(?P<shortcode>[^/?#&/]+)/?$"
+)
 
 
 def _is_tiktok_host(url: str) -> bool:
     host = _normalized_host(url)
     return host == "tiktok.com" or host.endswith(".tiktok.com")
+
+
+def _is_instagram_host(url: str) -> bool:
+    host = _normalized_host(url)
+    return host == "instagram.com" or host.endswith(".instagram.com")
+
+
+def _instagram_shortcode(url: str) -> str | None:
+    if not _is_instagram_host(url):
+        return None
+    parsed = urlparse(url.strip())
+    match = _INSTAGRAM_MEDIA_PATH_RE.match(parsed.path)
+    if match is None:
+        return None
+    return match.group("shortcode")
+
+
+def is_instagram_media_url(url: str) -> bool:
+    return _instagram_shortcode(url) is not None
 
 
 def _tiktok_photo_match(url: str) -> re.Match[str] | None:
@@ -142,7 +165,7 @@ def requires_ytdlp_probe_for_claim(url: str) -> bool:
 
 @lru_cache(maxsize=512)
 def looks_like_ytdlp_url(url: str) -> bool:
-    if is_tiktok_photo_url(url):
+    if is_tiktok_photo_url(url) or is_instagram_media_url(url):
         return True
     return bool(matching_ytdlp_extractors(url))
 
@@ -384,17 +407,25 @@ def probe_ytdlp_metadata(
         return None
 
     if result.returncode != 0:
+        if is_instagram_media_url(url):
+            return _fetch_instagram_metadata(url)
         return None
 
     payload = result.stdout.strip()
     if not payload:
+        if is_instagram_media_url(url):
+            return _fetch_instagram_metadata(url)
         return None
     try:
         data = json.loads(payload)
     except json.JSONDecodeError:
+        if is_instagram_media_url(url):
+            return _fetch_instagram_metadata(url)
         return None
     if not isinstance(data, dict):
         return None
+    if is_instagram_media_url(url) or _is_instagram_metadata(data):
+        return _enrich_instagram_metadata(url, data)
     return data
 
 
@@ -616,6 +647,16 @@ def _is_tiktok_metadata(metadata: dict[str, Any]) -> bool:
     return isinstance(webpage_url, str) and _is_tiktok_host(webpage_url)
 
 
+def _is_instagram_metadata(metadata: dict[str, Any]) -> bool:
+    extractor = str(
+        metadata.get("extractor_key") or metadata.get("extractor") or ""
+    ).lower()
+    if extractor == "instagram":
+        return True
+    webpage_url = metadata.get("webpage_url") or metadata.get("original_url")
+    return isinstance(webpage_url, str) and _is_instagram_host(webpage_url)
+
+
 def _metadata_has_tiktok_image_post(metadata: dict[str, Any]) -> bool:
     if isinstance(metadata.get("imagePost"), dict):
         return True
@@ -631,8 +672,24 @@ def _metadata_has_tiktok_image_post(metadata: dict[str, Any]) -> bool:
     return isinstance(thumbnail, str) and "photomode" in thumbnail.lower()
 
 
+def _instagram_media_from_metadata(metadata: dict[str, Any]) -> dict[str, Any] | None:
+    media = metadata.get("__instagram_media")
+    return media if isinstance(media, dict) else None
+
+
+def _metadata_has_instagram_image_post(metadata: dict[str, Any]) -> bool:
+    if not _is_instagram_metadata(metadata):
+        return False
+    media = _instagram_media_from_metadata(metadata)
+    return media is not None and bool(_instagram_image_entries(media))
+
+
 def kind_from_ytdlp_metadata(url: str, metadata: dict[str, Any]) -> str:
-    if is_tiktok_photo_url(url) or _metadata_has_tiktok_image_post(metadata):
+    if (
+        is_tiktok_photo_url(url)
+        or _metadata_has_tiktok_image_post(metadata)
+        or _metadata_has_instagram_image_post(metadata)
+    ):
         return "image"
     duration = metadata.get("duration")
     if isinstance(duration, (int, float)) and duration > 0:
@@ -720,25 +777,45 @@ def _tiktok_transcript_render_base_identity(base_identity: str) -> str:
     return f"{base_identity}:tiktok-sound:v1"
 
 
-def _tiktok_image_cache_identity(base_identity: str, image: dict[str, Any]) -> str:
+def _instagram_image_post_render_cache_identity(base_identity: str) -> str:
+    return f"{base_identity}:instagram-image-post:v1"
+
+
+def _instagram_transcript_render_base_identity(base_identity: str) -> str:
+    return f"{base_identity}:instagram-sound:v1"
+
+
+def _image_cache_identity(base_identity: str, image: dict[str, Any]) -> str:
     url = str(image.get("url") or "")
     index = image.get("index")
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
     return f"image:{base_identity}:{index}:{digest}"
 
 
-def _tiktok_image_suffix(url: str) -> str:
+def _tiktok_image_cache_identity(base_identity: str, image: dict[str, Any]) -> str:
+    return _image_cache_identity(base_identity, image)
+
+
+def _image_suffix(url: str) -> str:
     suffix = Path(urlparse(url).path).suffix
     return suffix if suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
 
 
-def _should_refresh_tiktok_images() -> bool:
+def _tiktok_image_suffix(url: str) -> str:
+    return _image_suffix(url)
+
+
+def _should_refresh_social_images() -> bool:
     try:
         from contextualize.runtime import get_refresh_images, get_refresh_media
 
         return get_refresh_images() or get_refresh_media()
     except Exception:
         return False
+
+
+def _should_refresh_tiktok_images() -> bool:
+    return _should_refresh_social_images()
 
 
 _TIKTOK_API_HEADERS = {
@@ -754,6 +831,18 @@ _TIKTOK_IMAGE_HEADERS = {
     "User-Agent": _TIKTOK_API_HEADERS["User-Agent"],
     "Accept": "image/*,*/*;q=0.8",
     "Referer": "https://www.tiktok.com/",
+}
+
+_INSTAGRAM_API_HEADERS = {
+    "User-Agent": _TIKTOK_API_HEADERS["User-Agent"],
+    "Accept": "*/*",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+_INSTAGRAM_IMAGE_HEADERS = {
+    "User-Agent": _TIKTOK_API_HEADERS["User-Agent"],
+    "Accept": "image/*,*/*;q=0.8",
+    "Referer": "https://www.instagram.com/",
 }
 
 
@@ -860,6 +949,51 @@ def _fetch_tiktok_image_post(metadata: dict[str, Any]) -> dict[str, Any] | None:
     return _tiktok_image_post_from_item(metadata, _fetch_tiktok_item(metadata))
 
 
+def _instagram_graphql_variables(shortcode: str) -> dict[str, Any]:
+    return {
+        "shortcode": shortcode,
+        "child_comment_count": 3,
+        "fetch_comment_count": 40,
+        "parent_comment_count": 24,
+        "has_threaded_comments": True,
+    }
+
+
+def _fetch_instagram_media(url: str) -> dict[str, Any] | None:
+    shortcode = _instagram_shortcode(url)
+    if not shortcode:
+        return None
+
+    import requests
+
+    try:
+        response = requests.get(
+            "https://www.instagram.com/graphql/query/",
+            headers={
+                **_INSTAGRAM_API_HEADERS,
+                "Referer": url,
+                "X-CSRFToken": "",
+            },
+            params={
+                "doc_id": "8845758582119845",
+                "variables": json.dumps(
+                    _instagram_graphql_variables(shortcode),
+                    separators=(",", ":"),
+                ),
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception as exc:
+        _log(f"Instagram media lookup failed for {shortcode}: {exc}")
+        return None
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    media = data.get("xdt_shortcode_media") if isinstance(data, dict) else None
+    return media if isinstance(media, dict) else None
+
+
 def _clean_metadata_text(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -879,6 +1013,19 @@ def _metadata_int(value: Any) -> int | None:
     return None
 
 
+def _metadata_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
 def _metadata_artists(value: Any) -> str | None:
     if isinstance(value, list):
         names = [
@@ -888,6 +1035,201 @@ def _metadata_artists(value: Any) -> str | None:
         ]
         return ", ".join(names) or None
     return _clean_metadata_text(value)
+
+
+def _instagram_owner(media: dict[str, Any]) -> dict[str, Any]:
+    owner = media.get("owner")
+    if isinstance(owner, dict):
+        return owner
+    user = media.get("user")
+    return user if isinstance(user, dict) else {}
+
+
+def _instagram_caption_text(media: dict[str, Any]) -> str | None:
+    edge = media.get("edge_media_to_caption")
+    if isinstance(edge, dict):
+        edges = edge.get("edges")
+        if isinstance(edges, list):
+            for item in edges:
+                if not isinstance(item, dict):
+                    continue
+                node = item.get("node")
+                if not isinstance(node, dict):
+                    continue
+                text = _clean_metadata_text(node.get("text"))
+                if text:
+                    return text
+    caption = media.get("caption")
+    if isinstance(caption, dict):
+        return _clean_metadata_text(caption.get("text"))
+    return _clean_metadata_text(caption)
+
+
+def _instagram_display_image_url(media: dict[str, Any]) -> str | None:
+    url = _first_image_url(media.get("display_url")) or _first_image_url(
+        media.get("thumbnail_src")
+    )
+    if url:
+        return url
+    resources = media.get("display_resources")
+    if isinstance(resources, list):
+        for resource in reversed(resources):
+            if isinstance(resource, dict):
+                url = _first_image_url(resource)
+                if url:
+                    return url
+    image_versions = media.get("image_versions2")
+    if isinstance(image_versions, dict):
+        candidates = image_versions.get("candidates")
+        if isinstance(candidates, list):
+            for candidate in candidates:
+                if isinstance(candidate, dict):
+                    url = _first_image_url(candidate)
+                    if url:
+                        return url
+    return None
+
+
+def _instagram_dimensions(media: dict[str, Any]) -> tuple[int | None, int | None]:
+    dimensions = media.get("dimensions")
+    if isinstance(dimensions, dict):
+        width = dimensions.get("width")
+        height = dimensions.get("height")
+    else:
+        width = media.get("width")
+        height = media.get("height")
+    return (
+        width if isinstance(width, int) else None,
+        height if isinstance(height, int) else None,
+    )
+
+
+def _instagram_image_entries(media: dict[str, Any]) -> list[dict[str, Any]]:
+    sidecar = media.get("edge_sidecar_to_children")
+    edges = sidecar.get("edges") if isinstance(sidecar, dict) else None
+    if isinstance(edges, list) and edges:
+        nodes = [
+            edge.get("node")
+            for edge in edges
+            if isinstance(edge, dict) and isinstance(edge.get("node"), dict)
+        ]
+    else:
+        nodes = [media]
+
+    entries: list[dict[str, Any]] = []
+    for index, node in enumerate(nodes, start=1):
+        if not isinstance(node, dict):
+            continue
+        if node.get("is_video") is True or str(node.get("__typename", "")).endswith(
+            "Video"
+        ):
+            continue
+        url = _instagram_display_image_url(node)
+        if not url:
+            continue
+        width, height = _instagram_dimensions(node)
+        alt = _clean_metadata_text(node.get("accessibility_caption"))
+        entries.append(
+            {
+                "index": index,
+                "url": url,
+                "width": width,
+                "height": height,
+                "alt": alt,
+            }
+        )
+    return entries
+
+
+def _instagram_metadata_from_media(
+    url: str, media: dict[str, Any]
+) -> dict[str, Any]:
+    owner = _instagram_owner(media)
+    username = _clean_metadata_text(owner.get("username"))
+    full_name = _clean_metadata_text(owner.get("full_name"))
+    description = _instagram_caption_text(media)
+    shortcode = _clean_metadata_text(media.get("shortcode")) or _instagram_shortcode(
+        url
+    )
+    is_video = media.get("is_video") is True or str(
+        media.get("__typename", "")
+    ).endswith("Video")
+    title = _clean_metadata_text(media.get("title"))
+    if not title:
+        if username:
+            title = f"{'Video' if is_video else 'Post'} by {username}"
+        else:
+            title = "Instagram media"
+
+    metadata: dict[str, Any] = {
+        "extractor": "Instagram",
+        "extractor_key": "Instagram",
+        "id": shortcode or _clean_metadata_text(media.get("id")),
+        "webpage_url": url,
+        "original_url": url,
+        "title": title,
+        "__instagram_media": media,
+    }
+    if description:
+        metadata["description"] = description
+    if username:
+        metadata["channel"] = username
+    if full_name:
+        metadata["uploader"] = full_name
+    uploader_id = _clean_metadata_text(owner.get("id")) or _clean_metadata_text(
+        owner.get("pk")
+    )
+    if uploader_id:
+        metadata["uploader_id"] = uploader_id
+    timestamp = _metadata_int(media.get("taken_at_timestamp") or media.get("taken_at"))
+    if timestamp is not None:
+        metadata["timestamp"] = timestamp
+    duration = _metadata_float(media.get("video_duration"))
+    if duration is not None:
+        metadata["duration"] = duration
+    thumbnail = _instagram_display_image_url(media)
+    if thumbnail:
+        metadata["thumbnail"] = thumbnail
+    resources = media.get("display_resources")
+    if isinstance(resources, list):
+        thumbnails = []
+        for resource in resources:
+            if not isinstance(resource, dict):
+                continue
+            thumb_url = _first_image_url(resource)
+            if not thumb_url:
+                continue
+            thumbnails.append(
+                {
+                    "url": thumb_url,
+                    "width": resource.get("config_width"),
+                    "height": resource.get("config_height"),
+                }
+            )
+        if thumbnails:
+            metadata["thumbnails"] = thumbnails
+    return metadata
+
+
+def _enrich_instagram_metadata(
+    url: str, metadata: dict[str, Any]
+) -> dict[str, Any]:
+    media = _fetch_instagram_media(url)
+    if media is None:
+        return metadata
+    graph_metadata = _instagram_metadata_from_media(url, media)
+    enriched = dict(metadata)
+    for key, value in graph_metadata.items():
+        if key == "__instagram_media" or enriched.get(key) in (None, "", []):
+            enriched[key] = value
+    return enriched
+
+
+def _fetch_instagram_metadata(url: str) -> dict[str, Any] | None:
+    media = _fetch_instagram_media(url)
+    if media is None:
+        return None
+    return _instagram_metadata_from_media(url, media)
 
 
 def _tiktok_music_metadata(
@@ -936,6 +1278,58 @@ def _tiktok_music_url(title: str | None, music_id: str | None) -> str | None:
     return f"https://www.tiktok.com/music/{slug}-{music_id}"
 
 
+def _instagram_audio_url(audio_id: str | None) -> str | None:
+    if not audio_id or audio_id == "0":
+        return None
+    return f"https://www.instagram.com/reels/audio/{audio_id}/"
+
+
+def _instagram_sound_metadata(
+    metadata: dict[str, Any],
+    media: dict[str, Any] | None,
+) -> dict[str, Any]:
+    music = (
+        media.get("clips_music_attribution_info")
+        if isinstance(media, dict)
+        else None
+    )
+    if not isinstance(music, dict):
+        music = {}
+
+    original = music.get("uses_original_audio")
+    if not isinstance(original, bool):
+        original = None
+    muted = music.get("should_mute_audio")
+    if not isinstance(muted, bool):
+        muted = None
+
+    title = _clean_metadata_text(music.get("song_name")) or _clean_metadata_text(
+        metadata.get("track")
+    )
+    artist = (
+        _clean_metadata_text(music.get("artist_name"))
+        or _clean_metadata_text(metadata.get("artist"))
+        or _metadata_artists(metadata.get("artists"))
+    )
+    if original is True:
+        title = title or "original audio"
+        artist = artist or _clean_metadata_text(
+            metadata.get("channel") or metadata.get("uploader")
+        )
+    audio_id = _clean_metadata_text(music.get("audio_id"))
+
+    return {
+        "title": title,
+        "artist": artist,
+        "album": _clean_metadata_text(metadata.get("album")),
+        "duration_seconds": None,
+        "original": original,
+        "url": _instagram_audio_url(audio_id),
+        "muted": muted,
+        "mute_reason": _clean_metadata_text(music.get("should_mute_audio_reason")),
+    }
+
+
 def _append_sound_field(lines: list[str], key: str, value: Any) -> None:
     if isinstance(value, bool):
         lines.append(f"- {key}: {str(value).lower()}")
@@ -948,14 +1342,15 @@ def _append_sound_field(lines: list[str], key: str, value: Any) -> None:
         lines.append(f"- {key}: {cleaned}")
 
 
-def _format_tiktok_sound_section(
-    metadata: dict[str, Any],
-    item: dict[str, Any] | None,
-) -> list[str]:
-    if not _is_tiktok_metadata(metadata):
-        return []
-    sound = _tiktok_music_metadata(metadata, item)
-    if not any(value is not None for value in sound.values()):
+def _sound_has_renderable_metadata(sound: dict[str, Any]) -> bool:
+    for key in ("title", "artist", "duration_seconds", "url", "album", "mute_reason"):
+        if sound.get(key) is not None:
+            return True
+    return sound.get("original") is True or sound.get("muted") is True
+
+
+def _format_sound_section(sound: dict[str, Any]) -> list[str]:
+    if not _sound_has_renderable_metadata(sound):
         return []
 
     lines = ["## Sound", ""]
@@ -965,7 +1360,28 @@ def _format_tiktok_sound_section(
     _append_sound_field(lines, "url", sound.get("url"))
     _append_sound_field(lines, "album", sound.get("album"))
     _append_sound_field(lines, "original", sound.get("original"))
+    if sound.get("muted") is True or sound.get("mute_reason") is not None:
+        _append_sound_field(lines, "muted", sound.get("muted"))
+    _append_sound_field(lines, "mute_reason", sound.get("mute_reason"))
     return lines
+
+
+def _format_tiktok_sound_section(
+    metadata: dict[str, Any],
+    item: dict[str, Any] | None,
+) -> list[str]:
+    if not _is_tiktok_metadata(metadata):
+        return []
+    return _format_sound_section(_tiktok_music_metadata(metadata, item))
+
+
+def _format_instagram_sound_section(
+    metadata: dict[str, Any],
+    media: dict[str, Any] | None,
+) -> list[str]:
+    if not _is_instagram_metadata(metadata):
+        return []
+    return _format_sound_section(_instagram_sound_metadata(metadata, media))
 
 
 @dataclass
@@ -1061,14 +1477,26 @@ class YtDlpReference:
             timeout_seconds=60,
         )
         if result.returncode != 0:
+            if is_instagram_media_url(self.url):
+                metadata = _fetch_instagram_metadata(self.url)
+                if metadata is not None:
+                    self._metadata = metadata
+                    return self._metadata
             raise RuntimeError(f"yt-dlp metadata failed: {result.stderr}")
 
         try:
             metadata = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
+            if is_instagram_media_url(self.url):
+                metadata = _fetch_instagram_metadata(self.url)
+                if metadata is not None:
+                    self._metadata = metadata
+                    return self._metadata
             raise RuntimeError(f"yt-dlp metadata parse failed: {exc}") from exc
         if not isinstance(metadata, dict):
             raise RuntimeError("yt-dlp metadata returned unexpected payload")
+        if is_instagram_media_url(self.url) or _is_instagram_metadata(metadata):
+            metadata = _enrich_instagram_metadata(self.url, metadata)
         self._metadata = metadata
         title = metadata.get("title") if isinstance(metadata, dict) else None
         _log(f"metadata fetched for {title or self.url}")
@@ -1336,6 +1764,60 @@ class YtDlpReference:
                 source=source,
             )
 
+    def _instagram_transcript_base_identities(
+        self, identity: _YtDlpIdentity
+    ) -> tuple[str, ...]:
+        identities = (
+            identity.cache_identity,
+            *_candidate_render_base_identities(self.url),
+        )
+        return tuple(dict.fromkeys(identities))
+
+    def _cached_instagram_transcript_output(
+        self,
+        identity: _YtDlpIdentity,
+        whisper_available: bool,
+    ) -> str | None:
+        if not self.use_cache or self.refresh_cache:
+            return None
+
+        from .cache import get_cached_transcript
+
+        for base_identity in self._instagram_transcript_base_identities(identity):
+            cached = get_cached_transcript(
+                _render_cache_identity(
+                    _instagram_transcript_render_base_identity(base_identity),
+                    self.plugin_overrides,
+                ),
+                self.cache_ttl,
+                whisper_available=whisper_available,
+            )
+            if cached is not None:
+                return self._record_render_cache_hit(cached, identity)
+        return None
+
+    def _store_instagram_transcript_output(
+        self,
+        identity: _YtDlpIdentity,
+        *,
+        text: str,
+        source: str,
+    ) -> None:
+        if not self.use_cache:
+            return
+
+        from .cache import store_transcript
+
+        for base_identity in self._instagram_transcript_base_identities(identity):
+            store_transcript(
+                _render_cache_identity(
+                    _instagram_transcript_render_base_identity(base_identity),
+                    self.plugin_overrides,
+                ),
+                text,
+                source=source,
+            )
+
     def _cached_tiktok_image_post_output(self, base_identity: str) -> str | None:
         if not self.use_cache or self.refresh_cache or _should_refresh_tiktok_images():
             return None
@@ -1365,12 +1847,45 @@ class YtDlpReference:
             source="image-post",
         )
 
-    def _describe_tiktok_image(
+    def _cached_instagram_image_post_output(self, base_identity: str) -> str | None:
+        if not self.use_cache or self.refresh_cache or _should_refresh_social_images():
+            return None
+
+        from .cache import get_cached_transcript
+
+        cached = get_cached_transcript(
+            _instagram_image_post_render_cache_identity(base_identity),
+            self.cache_ttl,
+        )
+        if cached is None:
+            return None
+        _log(f"Instagram image post render cache hit for {base_identity}")
+        self.original_file_content = cached
+        self.file_content = cached
+        return self._render_output_text(cached)
+
+    def _store_instagram_image_post_output(
+        self, base_identity: str, text: str
+    ) -> None:
+        if not self.use_cache:
+            return
+
+        from .cache import store_transcript
+
+        store_transcript(
+            _instagram_image_post_render_cache_identity(base_identity),
+            text,
+            source="image-post",
+        )
+
+    def _describe_social_image(
         self,
         image: dict[str, Any],
         *,
         metadata: dict[str, Any],
         total_images: int,
+        platform: str,
+        headers: dict[str, str],
     ) -> str:
         native_alt = image.get("alt")
         if isinstance(native_alt, str) and native_alt.strip():
@@ -1384,12 +1899,12 @@ class YtDlpReference:
         if not url:
             return ""
         identity = self._get_identity()
-        refresh_images = _should_refresh_tiktok_images()
+        refresh_images = _should_refresh_social_images()
         tmp = download_cached_media_to_temp(
             url,
-            suffix=_tiktok_image_suffix(url),
-            headers=_TIKTOK_IMAGE_HEADERS,
-            cache_identity=_tiktok_image_cache_identity(identity.cache_identity, image),
+            suffix=_image_suffix(url),
+            headers=headers,
+            cache_identity=_image_cache_identity(identity.cache_identity, image),
             get_cached_media_bytes=get_cached_media_bytes,
             store_media_bytes=store_media_bytes,
             refresh_cache=refresh_images,
@@ -1407,7 +1922,7 @@ class YtDlpReference:
             )
         ]
         if isinstance(caption, str) and caption.strip():
-            prompt_parts.insert(0, f"TikTok image post caption: {caption.strip()}")
+            prompt_parts.insert(0, f"{platform} image post caption: {caption.strip()}")
         prompt_append = "\n".join(prompt_parts)
 
         try:
@@ -1419,10 +1934,40 @@ class YtDlpReference:
             )
             return _normalize_image_alttext(result.markdown or "")
         except Exception as exc:
-            _log(f"TikTok image description failed for {url}: {exc}")
+            _log(f"{platform} image description failed for {url}: {exc}")
             return ""
         finally:
             tmp.unlink(missing_ok=True)
+
+    def _describe_tiktok_image(
+        self,
+        image: dict[str, Any],
+        *,
+        metadata: dict[str, Any],
+        total_images: int,
+    ) -> str:
+        return self._describe_social_image(
+            image,
+            metadata=metadata,
+            total_images=total_images,
+            platform="TikTok",
+            headers=_TIKTOK_IMAGE_HEADERS,
+        )
+
+    def _describe_instagram_image(
+        self,
+        image: dict[str, Any],
+        *,
+        metadata: dict[str, Any],
+        total_images: int,
+    ) -> str:
+        return self._describe_social_image(
+            image,
+            metadata=metadata,
+            total_images=total_images,
+            platform="Instagram",
+            headers=_INSTAGRAM_IMAGE_HEADERS,
+        )
 
     def _format_tiktok_image_post_output(
         self,
@@ -1497,6 +2042,70 @@ class YtDlpReference:
         self._store_tiktok_image_post_output(identity.cache_identity, text)
         return self._render_output_text(text)
 
+    def _format_instagram_image_post_output(
+        self,
+        metadata: dict[str, Any],
+        media: dict[str, Any],
+    ) -> str:
+        entries = _instagram_image_entries(media)
+        title = metadata.get("title") or "Instagram image post"
+        channel = metadata.get("channel") or metadata.get("uploader")
+        description = metadata.get("description")
+        uploader = metadata.get("uploader")
+
+        lines = [
+            "---",
+            f"title: {_escape_yaml_string(str(title))}",
+            "kind: image",
+            f"image_count: {len(entries)}",
+        ]
+        if channel:
+            lines.append(f"channel: {_escape_yaml_string(str(channel))}")
+        if uploader:
+            lines.append(f"uploader: {_escape_yaml_string(str(uploader))}")
+        if description:
+            lines.append(f"description: {_escape_yaml_string(str(description))}")
+        lines.extend(["---", ""])
+        sound_lines = _format_instagram_sound_section(metadata, media)
+        if sound_lines:
+            lines.extend(sound_lines)
+            lines.append("")
+        lines.append("## Images")
+
+        total_images = len(entries)
+        for image in entries:
+            attrs = [f'index="{image["index"]}"']
+            if image.get("width") and image.get("height"):
+                attrs.append(f'width="{image["width"]}"')
+                attrs.append(f'height="{image["height"]}"')
+            lines.append("")
+            lines.append(f"<image {' '.join(attrs)}>")
+            alttext = self._describe_instagram_image(
+                image,
+                metadata=metadata,
+                total_images=total_images,
+            )
+            lines.extend((alttext or "Alt text unavailable.").splitlines())
+            lines.append("</image>")
+
+        return "\n".join(lines)
+
+    def _render_instagram_image_post(
+        self,
+        metadata: dict[str, Any],
+        media: dict[str, Any],
+    ) -> str:
+        identity = self._get_identity()
+        cached = self._cached_instagram_image_post_output(identity.cache_identity)
+        if cached is not None:
+            return cached
+
+        text = self._format_instagram_image_post_output(metadata, media)
+        self.original_file_content = text
+        self.file_content = text
+        self._store_instagram_image_post_output(identity.cache_identity, text)
+        return self._render_output_text(text)
+
     def _format_output(
         self,
         metadata: dict,
@@ -1504,6 +2113,7 @@ class YtDlpReference:
         source: str,
         *,
         tiktok_item: dict[str, Any] | None = None,
+        instagram_media: dict[str, Any] | None = None,
     ) -> str:
         title = metadata.get("title", "Untitled")
         channel = metadata.get("channel") or metadata.get("uploader")
@@ -1528,6 +2138,11 @@ class YtDlpReference:
             lines.append("")
 
         sound_lines = _format_tiktok_sound_section(metadata, tiktok_item)
+        if not sound_lines:
+            sound_lines = _format_instagram_sound_section(
+                metadata,
+                instagram_media,
+            )
         if sound_lines:
             lines.extend(sound_lines)
             lines.append("")
@@ -1587,6 +2202,49 @@ class YtDlpReference:
             self.original_file_content = text
             self.file_content = text
             self._store_tiktok_transcript_output(identity, text=text, source=source)
+            return self._render_output_text(text)
+
+        if _is_instagram_host(self._metadata_url()):
+            metadata = self._fetch_metadata()
+            identity = self._get_identity()
+            instagram_media = _instagram_media_from_metadata(metadata)
+            if instagram_media is not None and _instagram_image_entries(
+                instagram_media
+            ):
+                cached_image = self._cached_instagram_image_post_output(
+                    identity.cache_identity
+                )
+                if cached_image is not None:
+                    return cached_image
+                return self._render_instagram_image_post(metadata, instagram_media)
+
+            cached_instagram = self._cached_instagram_transcript_output(
+                identity,
+                whisper_available,
+            )
+            if cached_instagram is not None:
+                return cached_instagram
+
+            duration = int(metadata.get("duration", 0) or 0)
+            _log(
+                f"building transcript for {identity.display_name} "
+                f"(duration={duration}s, refresh_cache={self.refresh_cache})"
+            )
+            transcript, source = self._get_transcript(duration)
+            text = self._format_output(
+                metadata,
+                transcript,
+                source,
+                instagram_media=instagram_media,
+            )
+
+            self.original_file_content = text
+            self.file_content = text
+            self._store_instagram_transcript_output(
+                identity,
+                text=text,
+                source=source,
+            )
             return self._render_output_text(text)
 
         for base_identity in _candidate_render_base_identities(self.url):

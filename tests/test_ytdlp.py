@@ -17,6 +17,11 @@ SYNTHETIC_VIDEO_SOUND_ID = "7000000000000000003"
 SYNTHETIC_TIKTOK_HOST = "www.tiktok.com"
 SYNTHETIC_TIKTOK_USER = "synthetic-user"
 SYNTHETIC_TIKTOK_SHORT_CODE = "SYNTHETIC"
+SYNTHETIC_INSTAGRAM_SHORTCODE = "SYNTHETICIG"
+SYNTHETIC_INSTAGRAM_REEL_SHORTCODE = "SYNTHREEL"
+SYNTHETIC_INSTAGRAM_AUDIO_ID = "300000000000000"
+SYNTHETIC_INSTAGRAM_HOST = "www.instagram.com"
+SYNTHETIC_INSTAGRAM_USER = "synthetic-ig-user"
 SYNTHETIC_SUBSTACK_URL = (
     "https://synthetic-substack.substack.com/p/synthetic-post"
 )
@@ -31,6 +36,104 @@ def _synthetic_tiktok_url(kind: str) -> str:
 
 def _synthetic_tiktok_short_url() -> str:
     return f"https://{SYNTHETIC_TIKTOK_HOST}/t/{SYNTHETIC_TIKTOK_SHORT_CODE}/"
+
+
+def _synthetic_instagram_url(
+    kind: str = "p",
+    shortcode: str = SYNTHETIC_INSTAGRAM_SHORTCODE,
+) -> str:
+    return f"https://{SYNTHETIC_INSTAGRAM_HOST}/{kind}/{shortcode}/"
+
+
+def _synthetic_instagram_owner() -> dict[str, str]:
+    return {
+        "id": "300000000000001",
+        "username": SYNTHETIC_INSTAGRAM_USER,
+        "full_name": "Synthetic Instagram User",
+    }
+
+
+def _synthetic_instagram_caption(text: str) -> dict[str, object]:
+    return {"edges": [{"node": {"text": text}}]}
+
+
+def _synthetic_instagram_image_node(
+    *,
+    index: int,
+    alt: str | None = None,
+) -> dict[str, object]:
+    node: dict[str, object] = {
+        "__typename": "XDTGraphImage",
+        "is_video": False,
+        "display_url": f"https://cdn.example/instagram-image-{index}.jpg",
+        "dimensions": {"width": 1080 + index, "height": 1350 + index},
+    }
+    if alt is not None:
+        node["accessibility_caption"] = alt
+    return node
+
+
+def _synthetic_instagram_sidecar_media() -> dict[str, object]:
+    return {
+        "__typename": "XDTGraphSidecar",
+        "shortcode": SYNTHETIC_INSTAGRAM_SHORTCODE,
+        "is_video": False,
+        "owner": _synthetic_instagram_owner(),
+        "edge_media_to_caption": _synthetic_instagram_caption(
+            "Synthetic Instagram image caption"
+        ),
+        "edge_sidecar_to_children": {
+            "edges": [
+                {"node": _synthetic_instagram_image_node(index=1)},
+                {"node": _synthetic_instagram_image_node(index=2)},
+            ]
+        },
+        "clips_music_attribution_info": {
+            "artist_name": "Synthetic Instagram artist",
+            "song_name": "Synthetic Instagram sound",
+            "audio_id": SYNTHETIC_INSTAGRAM_AUDIO_ID,
+            "uses_original_audio": False,
+            "should_mute_audio": False,
+            "should_mute_audio_reason": "",
+        },
+    }
+
+
+def _synthetic_instagram_single_image_media() -> dict[str, object]:
+    return {
+        "__typename": "XDTGraphImage",
+        "shortcode": SYNTHETIC_INSTAGRAM_SHORTCODE,
+        "is_video": False,
+        "owner": _synthetic_instagram_owner(),
+        "edge_media_to_caption": _synthetic_instagram_caption(
+            "Synthetic single image caption"
+        ),
+        "display_url": "https://cdn.example/instagram-single.jpg",
+        "dimensions": {"width": 1080, "height": 1080},
+        "accessibility_caption": "Native synthetic Instagram alt text",
+    }
+
+
+def _synthetic_instagram_reel_media() -> dict[str, object]:
+    return {
+        "__typename": "XDTGraphVideo",
+        "shortcode": SYNTHETIC_INSTAGRAM_REEL_SHORTCODE,
+        "is_video": True,
+        "owner": _synthetic_instagram_owner(),
+        "edge_media_to_caption": _synthetic_instagram_caption(
+            "Synthetic Instagram reel caption"
+        ),
+        "video_duration": 12.5,
+        "display_url": "https://cdn.example/instagram-reel-cover.jpg",
+        "clips_music_attribution_info": {
+            "artist_name": "Synthetic reel artist",
+            "song_name": "Synthetic reel sound",
+            "audio_id": SYNTHETIC_INSTAGRAM_AUDIO_ID,
+            "uses_original_audio": False,
+            "should_mute_audio": False,
+            "should_mute_audio_reason": "",
+        },
+    }
 
 
 def test_ytdlp_priority_is_below_specialized_providers() -> None:
@@ -529,6 +632,38 @@ def test_classify_target_marks_tiktok_photomode_metadata_as_image(
     assert classified["group_key"] == "image"
 
 
+def test_probe_ytdlp_metadata_falls_back_to_instagram_graphql(
+    monkeypatch,
+) -> None:
+    target = _synthetic_instagram_url("p")
+    media = _synthetic_instagram_single_image_media()
+
+    monkeypatch.setattr(ytdlp, "_check_ytdlp", lambda: None)
+    monkeypatch.setattr(
+        ytdlp,
+        "_fetch_instagram_media",
+        lambda _url: media,
+    )
+
+    def _run(args: list[str], **kwargs):
+        return ytdlp.subprocess.CompletedProcess(
+            args,
+            1,
+            stdout="",
+            stderr="synthetic failure",
+        )
+
+    monkeypatch.setattr(ytdlp, "_run_ytdlp", _run)
+
+    metadata = ytdlp.probe_ytdlp_metadata(target, timeout_seconds=12)
+
+    assert metadata is not None
+    assert metadata["extractor_key"] == "Instagram"
+    assert metadata["id"] == SYNTHETIC_INSTAGRAM_SHORTCODE
+    assert metadata["channel"] == SYNTHETIC_INSTAGRAM_USER
+    assert ytdlp.kind_from_ytdlp_metadata(target, metadata) == "image"
+
+
 def test_classify_target_skips_probe_required_url_without_metadata(monkeypatch) -> None:
     monkeypatch.setattr(ytdlp, "looks_like_ytdlp_url", lambda _url: True)
     monkeypatch.setattr(ytdlp, "requires_ytdlp_probe_for_claim", lambda _url: True)
@@ -842,6 +977,131 @@ def test_tiktok_video_render_includes_sound_metadata(monkeypatch) -> None:
     assert stored
     assert stored[0][0].startswith(
         f"tiktok:{SYNTHETIC_TIKTOK_ITEM_ID}:tiktok-sound:v1:transcribe:"
+    )
+    assert stored[0][2] == "transcription"
+
+
+def test_instagram_image_post_render_describes_each_image(monkeypatch) -> None:
+    ref = _render_ref(_synthetic_instagram_url("p"))
+    media = _synthetic_instagram_sidecar_media()
+    ref._metadata = ytdlp._instagram_metadata_from_media(ref.url, media)
+    ref._identity = ytdlp._build_identity(ref.url, ref._metadata)  # noqa: SLF001
+    stored: list[tuple[str, str, str]] = []
+
+    def _get_transcript(*_args, **_kwargs):
+        raise AssertionError("image posts should not be transcribed")
+
+    def _describe(self, image, *, metadata, total_images):
+        assert metadata is ref._metadata
+        assert total_images == 2
+        return f"Instagram alt text {image['index']}"
+
+    monkeypatch.setattr(ytdlp.YtDlpReference, "_get_transcript", _get_transcript)
+    monkeypatch.setattr(
+        ytdlp.YtDlpReference,
+        "_describe_instagram_image",
+        _describe,
+    )
+    monkeypatch.setattr(
+        "cx_plugins.providers.ytdlp.cache.get_cached_transcript",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "cx_plugins.providers.ytdlp.cache.store_transcript",
+        lambda identity, content, source="unknown": stored.append(
+            (identity, content, source)
+        ),
+    )
+
+    output = ytdlp.YtDlpReference._get_contents(ref)
+
+    assert 'kind: image' in output
+    assert 'image_count: 2' in output
+    assert "## Sound" in output
+    assert "- title: Synthetic Instagram sound" in output
+    assert "- artist: Synthetic Instagram artist" in output
+    instagram_sound_url = ytdlp._instagram_audio_url(SYNTHETIC_INSTAGRAM_AUDIO_ID)
+    assert f"- url: {instagram_sound_url}" in output
+    assert "\n- id:" not in output
+    assert "- original: false" in output
+    assert "- muted:" not in output
+    assert '<image index="1" width="1081" height="1351">' in output
+    assert "Instagram alt text 1" in output
+    assert '<image index="2" width="1082" height="1352">' in output
+    assert "Instagram alt text 2" in output
+    assert stored
+    assert (
+        stored[0][0]
+        == f"instagram:{SYNTHETIC_INSTAGRAM_SHORTCODE}:instagram-image-post:v1"
+    )
+    assert stored[0][2] == "image-post"
+
+
+def test_instagram_image_post_uses_native_alt_text(monkeypatch) -> None:
+    ref = _render_ref(_synthetic_instagram_url("p"))
+    media = _synthetic_instagram_single_image_media()
+    ref._metadata = ytdlp._instagram_metadata_from_media(ref.url, media)
+    ref._identity = ytdlp._build_identity(ref.url, ref._metadata)  # noqa: SLF001
+
+    def _convert(*_args, **_kwargs):
+        raise AssertionError("native alt text should avoid image conversion")
+
+    monkeypatch.setattr(
+        "contextualize.render.markitdown.convert_path_to_markdown",
+        _convert,
+    )
+
+    entry = ytdlp._instagram_image_entries(media)[0]
+    alttext = ytdlp.YtDlpReference._describe_instagram_image(
+        ref,
+        entry,
+        metadata=ref._metadata,
+        total_images=1,
+    )
+
+    assert alttext == "Native synthetic Instagram alt text"
+
+
+def test_instagram_reel_render_includes_sound_metadata(monkeypatch) -> None:
+    ref = _render_ref(
+        _synthetic_instagram_url("reel", SYNTHETIC_INSTAGRAM_REEL_SHORTCODE)
+    )
+    media = _synthetic_instagram_reel_media()
+    ref._metadata = ytdlp._instagram_metadata_from_media(ref.url, media)
+    ref._identity = ytdlp._build_identity(ref.url, ref._metadata)  # noqa: SLF001
+    stored: list[tuple[str, str, str]] = []
+
+    monkeypatch.setattr(
+        "cx_plugins.providers.ytdlp.cache.get_cached_transcript",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "cx_plugins.providers.ytdlp.cache.store_transcript",
+        lambda identity, content, source="unknown": stored.append(
+            (identity, content, source)
+        ),
+    )
+    monkeypatch.setattr(
+        ytdlp.YtDlpReference,
+        "_get_transcript",
+        lambda _self, _duration: ("Instagram transcript.", "transcription"),
+    )
+
+    output = ytdlp.YtDlpReference._get_contents(ref)
+
+    assert "## Sound" in output
+    assert "- title: Synthetic reel sound" in output
+    assert "- artist: Synthetic reel artist" in output
+    instagram_sound_url = ytdlp._instagram_audio_url(SYNTHETIC_INSTAGRAM_AUDIO_ID)
+    assert f"- url: {instagram_sound_url}" in output
+    assert "\n- id:" not in output
+    assert "- original: false" in output
+    assert "- muted:" not in output
+    assert "Instagram transcript." in output
+    assert stored
+    assert stored[0][0].startswith(
+        f"instagram:{SYNTHETIC_INSTAGRAM_REEL_SHORTCODE}:"
+        "instagram-sound:v1:transcribe:"
     )
     assert stored[0][2] == "transcription"
 
