@@ -261,6 +261,23 @@ def test_twitter_urls_are_excluded_without_probe(monkeypatch) -> None:
         assert ytdlp_plugin.classify_target(target, {}) is None
 
 
+def test_tiktok_photo_urls_are_claimed_without_ytdlp_probe(monkeypatch) -> None:
+    target = "https://www.tiktok.com/@exampleuser/photo/7312345678901234567"
+
+    def _probe(*_args, **_kwargs):
+        raise AssertionError("photo urls should not need a ytdlp probe")
+
+    monkeypatch.setattr(ytdlp, "probe_ytdlp_metadata", _probe)
+
+    assert ytdlp.is_tiktok_photo_url(target) is True
+    assert ytdlp.looks_like_ytdlp_url(target) is True
+    assert ytdlp_plugin.can_resolve(target, {}) is True
+    classified = ytdlp_plugin.classify_target(target, {})
+    assert classified is not None
+    assert classified["kind"] == "image"
+    assert classified["group_key"] == "image"
+
+
 def test_ytdlp_command_prefers_bundled_python_module(monkeypatch) -> None:
     monkeypatch.setattr(ytdlp, "_yt_dlp_module_available", lambda: True)
     monkeypatch.setattr(ytdlp.shutil, "which", lambda _name: "/usr/bin/yt-dlp")
@@ -403,6 +420,30 @@ def test_classify_target_uses_probe_metadata(monkeypatch) -> None:
     classified = ytdlp_plugin.classify_target("https://example.com/none", {})
     assert classified is not None
     assert classified["kind"] == "video"
+
+
+def test_classify_target_marks_tiktok_photomode_metadata_as_image(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        ytdlp,
+        "probe_ytdlp_metadata",
+        lambda _url, timeout_seconds=10: {
+            "extractor_key": "TikTok",
+            "id": "7312345678901234567",
+            "duration": 278,
+            "thumbnail": "https://example.com/tplv-photomode-image.jpeg",
+        },
+    )
+
+    classified = ytdlp_plugin.classify_target(
+        "https://www.tiktok.com/@exampleuser/video/7312345678901234567",
+        {},
+    )
+
+    assert classified is not None
+    assert classified["kind"] == "image"
+    assert classified["group_key"] == "image"
 
 
 def test_classify_target_skips_probe_required_url_without_metadata(monkeypatch) -> None:
@@ -574,6 +615,70 @@ def test_build_identity_uses_extractor_and_id_or_url_hash() -> None:
     assert without_id.display_name.startswith("url:")
     assert without_id.slug.startswith("url-")
     assert without_id.cache_identity == without_id_dupe.cache_identity
+
+
+def test_tiktok_image_post_render_describes_each_image(monkeypatch) -> None:
+    ref = _render_ref("https://www.tiktok.com/@exampleuser/photo/7312345678901234567")
+    ref._metadata = {
+        "extractor_key": "TikTok",
+        "id": "7312345678901234567",
+        "title": "Textile art",
+        "description": "textile and computer graphics",
+        "channel": "alyssa",
+        "uploader": "exampleuser",
+        "thumbnail": "https://example.com/tplv-photomode-image.jpeg",
+    }
+    ref._identity = ytdlp._build_identity(ref.url, ref._metadata)  # noqa: SLF001
+    image_post = {
+        "images": [
+            {
+                "imageWidth": 2160,
+                "imageHeight": 3240,
+                "imageURL": {"urlList": ["https://cdn.example/first.jpeg"]},
+            },
+            {
+                "imageWidth": 1080,
+                "imageHeight": 1920,
+                "imageURL": {"urlList": ["https://cdn.example/second.jpeg"]},
+            },
+        ]
+    }
+    stored: list[tuple[str, str, str]] = []
+
+    def _get_transcript(*_args, **_kwargs):
+        raise AssertionError("image posts should not be transcribed")
+
+    def _describe(self, image, *, metadata, total_images):
+        assert metadata is ref._metadata
+        assert total_images == 2
+        return f"Alt text {image['index']}"
+
+    monkeypatch.setattr(ytdlp, "_fetch_tiktok_image_post", lambda _metadata: image_post)
+    monkeypatch.setattr(ytdlp, "_should_refresh_tiktok_images", lambda: False)
+    monkeypatch.setattr(ytdlp.YtDlpReference, "_get_transcript", _get_transcript)
+    monkeypatch.setattr(ytdlp.YtDlpReference, "_describe_tiktok_image", _describe)
+    monkeypatch.setattr(
+        "cx_plugins.providers.ytdlp.cache.get_cached_transcript",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "cx_plugins.providers.ytdlp.cache.store_transcript",
+        lambda identity, content, source="unknown": stored.append(
+            (identity, content, source)
+        ),
+    )
+
+    output = ytdlp.YtDlpReference._get_contents(ref)
+
+    assert 'kind: image' in output
+    assert 'image_count: 2' in output
+    assert '<image index="1" width="2160" height="3240">' in output
+    assert "Alt text 1" in output
+    assert '<image index="2" width="1080" height="1920">' in output
+    assert "Alt text 2" in output
+    assert stored
+    assert stored[0][0] == "tiktok:7312345678901234567:image-post:v1"
+    assert stored[0][2] == "image-post"
 
 
 def test_get_transcript_passes_transcription_cache_flags(

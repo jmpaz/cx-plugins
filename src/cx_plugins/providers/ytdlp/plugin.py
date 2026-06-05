@@ -23,6 +23,7 @@ def normalize_manifest_config(
 def can_resolve(target: str, context: dict[str, Any]) -> bool:
     from .ytdlp import (
         is_excluded_ytdlp_url,
+        is_tiktok_photo_url,
         looks_like_ytdlp_url,
         probe_ytdlp_metadata,
         requires_ytdlp_probe_for_claim,
@@ -32,6 +33,8 @@ def can_resolve(target: str, context: dict[str, Any]) -> bool:
         return False
     if not looks_like_ytdlp_url(target):
         return False
+    if is_tiktok_photo_url(target):
+        return True
     if requires_ytdlp_probe_for_claim(target):
         return probe_ytdlp_metadata(target, timeout_seconds=5) is not None
     return True
@@ -40,6 +43,8 @@ def can_resolve(target: str, context: dict[str, Any]) -> bool:
 def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | None:
     from .ytdlp import (
         is_excluded_ytdlp_url,
+        is_tiktok_photo_url,
+        kind_from_ytdlp_metadata,
         looks_like_ytdlp_url,
         probe_ytdlp_metadata,
         requires_ytdlp_probe_for_claim,
@@ -47,6 +52,13 @@ def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | No
 
     if is_excluded_ytdlp_url(target):
         return None
+    if is_tiktok_photo_url(target):
+        return {
+            "provider": PLUGIN_NAME,
+            "kind": "image",
+            "is_external": True,
+            "group_key": "image",
+        }
     metadata = probe_ytdlp_metadata(target, timeout_seconds=5)
     if metadata is None:
         if not looks_like_ytdlp_url(target) or requires_ytdlp_probe_for_claim(target):
@@ -57,10 +69,7 @@ def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | No
             "is_external": True,
             "group_key": "video",
         }
-    duration = metadata.get("duration")
-    kind = (
-        "video" if isinstance(duration, (int, float)) and duration > 0 else "resource"
-    )
+    kind = kind_from_ytdlp_metadata(target, metadata)
     return {
         "provider": PLUGIN_NAME,
         "kind": kind,

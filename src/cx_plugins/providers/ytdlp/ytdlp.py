@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import re
 import selectors
 import shutil
+import string
 import subprocess
 import sys
 import tempfile
@@ -30,6 +32,36 @@ def _normalized_host(url: str) -> str:
     if host.startswith("www."):
         host = host[4:]
     return host
+
+
+_TIKTOK_PHOTO_PATH_RE = re.compile(
+    r"^/@(?P<user_id>[\w.-]+)/photo/(?P<id>\d+)(?:/)?$"
+)
+
+
+def _is_tiktok_host(url: str) -> bool:
+    host = _normalized_host(url)
+    return host == "tiktok.com" or host.endswith(".tiktok.com")
+
+
+def _tiktok_photo_match(url: str) -> re.Match[str] | None:
+    if not _is_tiktok_host(url):
+        return None
+    parsed = urlparse(url.strip())
+    return _TIKTOK_PHOTO_PATH_RE.match(parsed.path)
+
+
+def is_tiktok_photo_url(url: str) -> bool:
+    return _tiktok_photo_match(url) is not None
+
+
+def _tiktok_photo_as_video_url(url: str) -> str:
+    match = _tiktok_photo_match(url)
+    if match is None:
+        return url
+    parsed = urlparse(url.strip())
+    video_path = f"/@{match.group('user_id')}/video/{match.group('id')}"
+    return urlunparse(parsed._replace(path=video_path))
 
 
 def is_excluded_ytdlp_url(url: str) -> bool:
@@ -76,6 +108,8 @@ def requires_ytdlp_probe_for_claim(url: str) -> bool:
 
 @lru_cache(maxsize=512)
 def looks_like_ytdlp_url(url: str) -> bool:
+    if is_tiktok_photo_url(url):
+        return True
     return bool(matching_ytdlp_extractors(url))
 
 
@@ -295,6 +329,7 @@ def probe_ytdlp_metadata(
 ) -> dict[str, Any] | None:
     if not is_url_target(url):
         return None
+    ytdlp_url = _tiktok_photo_as_video_url(url)
     try:
         _check_ytdlp()
         result = _run_ytdlp(
@@ -305,7 +340,7 @@ def probe_ytdlp_metadata(
                 "--socket-timeout",
                 str(timeout_seconds),
                 "--",
-                url,
+                ytdlp_url,
             ],
             timeout_seconds=timeout_seconds,
         )
@@ -535,6 +570,244 @@ def _source_ref(url: str, metadata: dict[str, Any], extractor: str | None) -> st
     return "ytdlp"
 
 
+def _is_tiktok_metadata(metadata: dict[str, Any]) -> bool:
+    extractor = str(
+        metadata.get("extractor_key") or metadata.get("extractor") or ""
+    ).lower()
+    if extractor == "tiktok":
+        return True
+    webpage_url = metadata.get("webpage_url") or metadata.get("original_url")
+    return isinstance(webpage_url, str) and _is_tiktok_host(webpage_url)
+
+
+def _metadata_has_tiktok_image_post(metadata: dict[str, Any]) -> bool:
+    if isinstance(metadata.get("imagePost"), dict):
+        return True
+    if not _is_tiktok_metadata(metadata):
+        return False
+    for thumbnail in metadata.get("thumbnails") or ():
+        if not isinstance(thumbnail, dict):
+            continue
+        url = thumbnail.get("url")
+        if isinstance(url, str) and "photomode" in url.lower():
+            return True
+    thumbnail = metadata.get("thumbnail")
+    return isinstance(thumbnail, str) and "photomode" in thumbnail.lower()
+
+
+def kind_from_ytdlp_metadata(url: str, metadata: dict[str, Any]) -> str:
+    if is_tiktok_photo_url(url) or _metadata_has_tiktok_image_post(metadata):
+        return "image"
+    duration = metadata.get("duration")
+    if isinstance(duration, (int, float)) and duration > 0:
+        return "video"
+    return "resource"
+
+
+def _first_image_url(value: Any) -> str | None:
+    if isinstance(value, str) and value.startswith(("http://", "https://")):
+        return value
+    if not isinstance(value, dict):
+        return None
+    for key in ("urlList", "url_list", "urls"):
+        urls = value.get(key)
+        if isinstance(urls, list):
+            for url in urls:
+                if isinstance(url, str) and url.startswith(("http://", "https://")):
+                    return url
+    for key in ("url", "src"):
+        url = value.get(key)
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            return url
+    return None
+
+
+def _tiktok_image_entries(image_post: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_images = image_post.get("images")
+    if not isinstance(raw_images, list):
+        raw_images = []
+    entries: list[dict[str, Any]] = []
+    for index, image in enumerate(raw_images, start=1):
+        if not isinstance(image, dict):
+            continue
+        url = _first_image_url(image.get("imageURL") or image.get("image_url"))
+        if not url:
+            continue
+        width = image.get("imageWidth") or image.get("width")
+        height = image.get("imageHeight") or image.get("height")
+        alt = (
+            image.get("alt")
+            or image.get("altText")
+            or image.get("description")
+            or image.get("desc")
+        )
+        entries.append(
+            {
+                "index": index,
+                "url": url,
+                "width": width if isinstance(width, int) else None,
+                "height": height if isinstance(height, int) else None,
+                "alt": alt.strip() if isinstance(alt, str) and alt.strip() else None,
+            }
+        )
+    return entries
+
+
+def _normalize_image_alttext(markdown: str) -> str:
+    text = markdown.strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if lines and lines[0].strip().startswith("ImageSize:"):
+        lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines = lines[1:]
+    if lines:
+        first = lines[0].strip().lower()
+        if first in {
+            "# description (auto-generated):",
+            "## description (auto-generated):",
+            "# description:",
+            "## description:",
+        }:
+            lines = lines[1:]
+            while lines and not lines[0].strip():
+                lines = lines[1:]
+    return "\n".join(line.rstrip() for line in lines).strip()
+
+
+def _tiktok_image_post_render_cache_identity(base_identity: str) -> str:
+    return f"{base_identity}:image-post:v1"
+
+
+def _tiktok_image_cache_identity(base_identity: str, image: dict[str, Any]) -> str:
+    url = str(image.get("url") or "")
+    index = image.get("index")
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    return f"image:{base_identity}:{index}:{digest}"
+
+
+def _tiktok_image_suffix(url: str) -> str:
+    suffix = Path(urlparse(url).path).suffix
+    return suffix if suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
+
+
+def _should_refresh_tiktok_images() -> bool:
+    try:
+        from contextualize.runtime import get_refresh_images, get_refresh_media
+
+        return get_refresh_images() or get_refresh_media()
+    except Exception:
+        return False
+
+
+_TIKTOK_API_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.tiktok.com/",
+}
+
+_TIKTOK_IMAGE_HEADERS = {
+    "User-Agent": _TIKTOK_API_HEADERS["User-Agent"],
+    "Accept": "image/*,*/*;q=0.8",
+    "Referer": "https://www.tiktok.com/",
+}
+
+
+def _tiktok_item_list_params(sec_uid: str, cursor_ms: int) -> dict[str, str]:
+    return {
+        "aid": "1988",
+        "app_language": "en",
+        "app_name": "tiktok_web",
+        "browser_language": "en-US",
+        "browser_name": "Mozilla",
+        "browser_online": "true",
+        "browser_platform": "Win32",
+        "browser_version": "5.0 (Windows)",
+        "channel": "tiktok_web",
+        "cookie_enabled": "true",
+        "count": "15",
+        "cursor": str(cursor_ms),
+        "device_id": str(random.randint(7250000000000000000, 7325099899999994577)),
+        "device_platform": "web_pc",
+        "focus_state": "true",
+        "from_page": "user",
+        "history_len": "2",
+        "is_fullscreen": "false",
+        "is_page_visible": "true",
+        "language": "en",
+        "os": "windows",
+        "priority_region": "",
+        "referer": "",
+        "region": "US",
+        "screen_height": "1080",
+        "screen_width": "1920",
+        "secUid": sec_uid,
+        "type": "1",
+        "tz_name": "America/New_York",
+        "verifyFp": f"verify_{''.join(random.choices(string.hexdigits, k=7))}",
+        "webcast_language": "en",
+    }
+
+
+def _tiktok_item_list_cursors(metadata: dict[str, Any]) -> tuple[int, ...]:
+    timestamp = metadata.get("timestamp")
+    cursors: list[int] = []
+    if isinstance(timestamp, (int, float)) and timestamp > 0:
+        base = int(timestamp * 1000)
+        cursors.extend(
+            [
+                base + 1000,
+                base + 86_400_000,
+                base + 7 * 86_400_000,
+            ]
+        )
+    cursors.append(int(time.time() * 1000))
+    return tuple(dict.fromkeys(cursors))
+
+
+def _fetch_tiktok_image_post(metadata: dict[str, Any]) -> dict[str, Any] | None:
+    image_post = metadata.get("imagePost")
+    if isinstance(image_post, dict) and _tiktok_image_entries(image_post):
+        return image_post
+
+    if not _is_tiktok_metadata(metadata):
+        return None
+    sec_uid = metadata.get("channel_id")
+    item_id = metadata.get("id")
+    if not isinstance(sec_uid, str) or not sec_uid:
+        return None
+    if not isinstance(item_id, str) or not item_id:
+        return None
+
+    import requests
+
+    for cursor_ms in _tiktok_item_list_cursors(metadata):
+        try:
+            response = requests.get(
+                "https://www.tiktok.com/api/creator/item_list/",
+                headers=_TIKTOK_API_HEADERS,
+                params=_tiktok_item_list_params(sec_uid, cursor_ms),
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            _log(f"TikTok image post lookup failed for {item_id}: {exc}")
+            continue
+        for item in payload.get("itemList") or ():
+            if not isinstance(item, dict) or item.get("id") != item_id:
+                continue
+            image_post = item.get("imagePost")
+            if isinstance(image_post, dict) and _tiktok_image_entries(image_post):
+                return image_post
+            return None
+    return None
+
+
 @dataclass
 class YtDlpReference:
     url: str
@@ -564,6 +837,9 @@ class YtDlpReference:
     @property
     def path(self) -> str:
         return self.url
+
+    def _metadata_url(self) -> str:
+        return _tiktok_photo_as_video_url(self.url)
 
     def read(self) -> str:
         return self.original_file_content
@@ -607,10 +883,7 @@ class YtDlpReference:
         if self._metadata is None and self._identity is not None:
             return "video"
         metadata = self._fetch_metadata()
-        duration = metadata.get("duration")
-        if isinstance(duration, (int, float)) and duration > 0:
-            return "video"
-        return "resource"
+        return kind_from_ytdlp_metadata(self.url, metadata)
 
     def _fetch_metadata(self) -> dict[str, Any]:
         if self._metadata is not None:
@@ -623,7 +896,7 @@ class YtDlpReference:
                 "--no-download",
                 "--no-playlist",
                 "--",
-                self.url,
+                self._metadata_url(),
             ],
             timeout_seconds=60,
         )
@@ -688,7 +961,7 @@ class YtDlpReference:
                 "-o",
                 output_template,
                 "--",
-                self.url,
+                self._metadata_url(),
             ],
             timeout_seconds=None,
             idle_timeout_seconds=180,
@@ -846,6 +1119,156 @@ class YtDlpReference:
                 source=source,
             )
 
+    def _cached_tiktok_image_post_output(self, base_identity: str) -> str | None:
+        if not self.use_cache or self.refresh_cache or _should_refresh_tiktok_images():
+            return None
+
+        from .cache import get_cached_transcript
+
+        cached = get_cached_transcript(
+            _tiktok_image_post_render_cache_identity(base_identity),
+            self.cache_ttl,
+        )
+        if cached is None:
+            return None
+        _log(f"image post render cache hit for {base_identity}")
+        self.original_file_content = cached
+        self.file_content = cached
+        return self._render_output_text(cached)
+
+    def _store_tiktok_image_post_output(self, base_identity: str, text: str) -> None:
+        if not self.use_cache:
+            return
+
+        from .cache import store_transcript
+
+        store_transcript(
+            _tiktok_image_post_render_cache_identity(base_identity),
+            text,
+            source="image-post",
+        )
+
+    def _describe_tiktok_image(
+        self,
+        image: dict[str, Any],
+        *,
+        metadata: dict[str, Any],
+        total_images: int,
+    ) -> str:
+        native_alt = image.get("alt")
+        if isinstance(native_alt, str) and native_alt.strip():
+            return native_alt.strip()
+
+        from .cache import get_cached_media_bytes, store_media_bytes
+        from contextualize.render.markitdown import convert_path_to_markdown
+        from ..shared.media import download_cached_media_to_temp
+
+        url = str(image.get("url") or "")
+        if not url:
+            return ""
+        identity = self._get_identity()
+        refresh_images = _should_refresh_tiktok_images()
+        tmp = download_cached_media_to_temp(
+            url,
+            suffix=_tiktok_image_suffix(url),
+            headers=_TIKTOK_IMAGE_HEADERS,
+            cache_identity=_tiktok_image_cache_identity(identity.cache_identity, image),
+            get_cached_media_bytes=get_cached_media_bytes,
+            store_media_bytes=store_media_bytes,
+            refresh_cache=refresh_images,
+        )
+        if tmp is None:
+            return ""
+
+        caption = metadata.get("description")
+        if not isinstance(caption, str) or not caption.strip():
+            caption = metadata.get("title")
+        prompt_parts = [
+            (
+                f"Image {image.get('index')} of {total_images}. "
+                "Write concise alt text for this image."
+            )
+        ]
+        if isinstance(caption, str) and caption.strip():
+            prompt_parts.insert(0, f"TikTok image post caption: {caption.strip()}")
+        prompt_append = "\n".join(prompt_parts)
+
+        try:
+            result = convert_path_to_markdown(
+                str(tmp),
+                refresh_images=refresh_images,
+                prompt_append=prompt_append,
+                source_url=url,
+            )
+            return _normalize_image_alttext(result.markdown or "")
+        except Exception as exc:
+            _log(f"TikTok image description failed for {url}: {exc}")
+            return ""
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _format_tiktok_image_post_output(
+        self,
+        metadata: dict[str, Any],
+        image_post: dict[str, Any],
+    ) -> str:
+        entries = _tiktok_image_entries(image_post)
+        title = metadata.get("title") or "TikTok image post"
+        channel = metadata.get("channel") or metadata.get("uploader")
+        description = metadata.get("description")
+        uploader = metadata.get("uploader")
+        track = metadata.get("track")
+
+        lines = [
+            "---",
+            f"title: {_escape_yaml_string(str(title))}",
+            "kind: image",
+            f"image_count: {len(entries)}",
+        ]
+        if channel:
+            lines.append(f"channel: {_escape_yaml_string(str(channel))}")
+        if uploader:
+            lines.append(f"uploader: {_escape_yaml_string(str(uploader))}")
+        if track:
+            lines.append(f"track: {_escape_yaml_string(str(track))}")
+        if description:
+            lines.append(f"description: {_escape_yaml_string(str(description))}")
+        lines.extend(["---", "", "## Images"])
+
+        total_images = len(entries)
+        for image in entries:
+            attrs = [f'index="{image["index"]}"']
+            if image.get("width") and image.get("height"):
+                attrs.append(f'width="{image["width"]}"')
+                attrs.append(f'height="{image["height"]}"')
+            lines.append("")
+            lines.append(f"<image {' '.join(attrs)}>")
+            alttext = self._describe_tiktok_image(
+                image,
+                metadata=metadata,
+                total_images=total_images,
+            )
+            lines.extend((alttext or "Alt text unavailable.").splitlines())
+            lines.append("</image>")
+
+        return "\n".join(lines)
+
+    def _render_tiktok_image_post(
+        self,
+        metadata: dict[str, Any],
+        image_post: dict[str, Any],
+    ) -> str:
+        identity = self._get_identity()
+        cached = self._cached_tiktok_image_post_output(identity.cache_identity)
+        if cached is not None:
+            return cached
+
+        text = self._format_tiktok_image_post_output(metadata, image_post)
+        self.original_file_content = text
+        self.file_content = text
+        self._store_tiktok_image_post_output(identity.cache_identity, text)
+        return self._render_output_text(text)
+
     def _format_output(self, metadata: dict, transcript: str, source: str) -> str:
         title = metadata.get("title", "Untitled")
         channel = metadata.get("channel") or metadata.get("uploader")
@@ -879,6 +1302,15 @@ class YtDlpReference:
 
     def _get_contents(self) -> str:
         whisper_available = True
+
+        if _is_tiktok_host(self._metadata_url()):
+            metadata = self._fetch_metadata()
+            if is_tiktok_photo_url(self.url) or _metadata_has_tiktok_image_post(
+                metadata
+            ):
+                image_post = _fetch_tiktok_image_post(metadata)
+                if image_post is not None:
+                    return self._render_tiktok_image_post(metadata, image_post)
 
         for base_identity in _candidate_render_base_identities(self.url):
             cached_output = self._cached_render_output(
