@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 
 from contextualize import transcription
+from contextualize.plugins.api import TranscriptionResult
 from contextualize.runtime import reset_verbose_logging, set_verbose_logging
 from cx_plugins.providers.atproto import plugin as atproto_plugin
 from cx_plugins.providers.soundcloud import plugin as soundcloud_plugin
@@ -155,7 +156,10 @@ def _render_ref(url: str):
     ref.use_cache = True
     ref.cache_ttl = None
     ref.refresh_cache = False
-    ref.plugin_overrides = {"transcribe": {"diarize": True, "speakers": 2}}
+    ref.plugin_overrides = {
+        "transcribe": {"diarize": True, "speakers": 2},
+        "video": {"frames": False},
+    }
     ref._metadata = None
     ref._identity = None
     ref.file_content = ""
@@ -216,6 +220,26 @@ def test_render_cache_identity_varies_by_effective_transcription_routing(
     )
 
     assert cohere_identity != mistral_identity
+
+
+def test_render_cache_identity_varies_by_video_overrides(monkeypatch) -> None:
+    base = "youtube:abc123"
+    monkeypatch.setattr(
+        transcription,
+        "transcription_routing_identity",
+        lambda **_kwargs: {"model": "cohere"},
+    )
+
+    duration_identity = ytdlp._render_cache_identity(
+        base,
+        {"video": {"frame-mode": "duration"}},
+    )
+    speech_identity = ytdlp._render_cache_identity(
+        base,
+        {"video": {"frame-mode": "speech"}},
+    )
+
+    assert duration_identity != speech_identity
 
 
 def test_render_cache_hit_records_transcription_routing_without_changing_output(
@@ -291,6 +315,71 @@ def test_youtube_render_cache_hit_does_not_fetch_metadata(monkeypatch) -> None:
     assert ref.source_path() == "youtube:abc123"
     assert ref.context_subpath() == "ytdlp-youtube-abc123.md"
     assert ref.get_kind() == "video"
+
+
+def test_format_output_includes_video_frames_before_transcript() -> None:
+    ref = object.__new__(ytdlp.YtDlpReference)
+    rendered = ytdlp.YtDlpReference._format_output(
+        ref,
+        {"title": "Synthetic video", "duration": 12},
+        "Transcript body.",
+        "transcription",
+        frames='## Video Frames\n\n<image frame="1" timestamp="00:01.000" />',
+    )
+
+    assert "## Video Frames" in rendered
+    assert rendered.index("## Video Frames") < rendered.index("Transcript body.")
+
+
+def test_transcription_failure_still_renders_video_frames(monkeypatch) -> None:
+    ref = object.__new__(ytdlp.YtDlpReference)
+    ref.url = "https://example.com/watch"
+    ref._identity = ytdlp._identity_from_cache_identity("youtube:abc123")
+
+    def _get_transcript_result(_self, _duration):
+        raise RuntimeError("missing transcription provider")
+
+    monkeypatch.setattr(
+        ytdlp.YtDlpReference,
+        "_get_transcript_result",
+        _get_transcript_result,
+    )
+    monkeypatch.setattr(
+        ytdlp.YtDlpReference,
+        "_render_video_frames",
+        lambda _self, transcript_result: (
+            '## Video Frames\n\n<image frame="1" timestamp="00:01.000" />'
+            if transcript_result is None
+            else ""
+        ),
+    )
+
+    transcript, source, frames = ytdlp.YtDlpReference._get_transcript_and_frames(ref, 12)
+
+    assert transcript == ""
+    assert source == "none"
+    assert "## Video Frames" in frames
+
+
+def test_render_cache_aliases_skip_missing_transcript_source(monkeypatch) -> None:
+    ref = object.__new__(ytdlp.YtDlpReference)
+    ref.use_cache = True
+    ref.plugin_overrides = None
+
+    def _store(*_args, **_kwargs):
+        raise AssertionError("missing-transcript output should not be cached")
+
+    monkeypatch.setattr(
+        "cx_plugins.providers.ytdlp.cache.store_transcript",
+        _store,
+    )
+
+    ytdlp.YtDlpReference._store_render_cache_aliases(
+        ref,
+        primary_base_identity="youtube:abc123",
+        text="*No transcript available.*",
+        source="none",
+    )
 
 
 def test_legacy_metadata_cache_hit_backfills_url_cache(monkeypatch) -> None:
@@ -957,8 +1046,15 @@ def test_tiktok_video_render_includes_sound_metadata(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         ytdlp.YtDlpReference,
-        "_get_transcript",
-        lambda _self, _duration: ("Transcript body.", "transcription"),
+        "_get_transcript_result",
+        lambda _self, _duration: (
+            TranscriptionResult(
+                text="Transcript body.",
+                model="test",
+                provider="test",
+            ),
+            "transcription",
+        ),
     )
 
     output = ytdlp.YtDlpReference._get_contents(ref)
@@ -1083,8 +1179,15 @@ def test_instagram_reel_render_includes_sound_metadata(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         ytdlp.YtDlpReference,
-        "_get_transcript",
-        lambda _self, _duration: ("Instagram transcript.", "transcription"),
+        "_get_transcript_result",
+        lambda _self, _duration: (
+            TranscriptionResult(
+                text="Instagram transcript.",
+                model="test",
+                provider="test",
+            ),
+            "transcription",
+        ),
     )
 
     output = ytdlp.YtDlpReference._get_contents(ref)
@@ -1117,7 +1220,10 @@ def test_get_transcript_passes_transcription_cache_flags(
     ref = object.__new__(ytdlp.YtDlpReference)
     ref.use_cache = False
     ref.refresh_cache = True
-    ref.plugin_overrides = {"transcribe": {"provider": "mistral"}}
+    ref.plugin_overrides = {
+        "transcribe": {"provider": "mistral"},
+        "video": {"frames": False},
+    }
 
     def _extract_audio(self: ytdlp.YtDlpReference) -> Path:
         return audio_path
@@ -1131,17 +1237,21 @@ def test_get_transcript_passes_transcription_cache_flags(
         refresh_cache: bool | None = None,
         timeout: float | None = None,
         plugin_overrides=None,
-    ) -> str:
+    ) -> TranscriptionResult:
         captured["path"] = path
         captured["use_cache"] = use_cache
         captured["refresh_cache"] = refresh_cache
         captured["timeout"] = timeout
         captured["plugin_overrides"] = plugin_overrides
-        return "transcript"
+        return TranscriptionResult(
+            text="transcript",
+            model="test",
+            provider="test",
+        )
 
     monkeypatch.setattr(ytdlp.YtDlpReference, "_extract_audio", _extract_audio)
     monkeypatch.setattr(
-        "contextualize.transcription.transcribe_media_file",
+        "contextualize.transcription.transcribe_media_file_result",
         _transcribe,
     )
 
@@ -1154,9 +1264,61 @@ def test_get_transcript_passes_transcription_cache_flags(
         "use_cache": False,
         "refresh_cache": True,
         "timeout": None,
-        "plugin_overrides": {"transcribe": {"provider": "mistral"}},
+        "plugin_overrides": {
+            "transcribe": {"provider": "mistral"},
+            "video": {"frames": False},
+        },
     }
     assert not audio_dir.exists()
+
+
+def test_get_transcript_requests_segment_timestamps_for_speech_frames(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    audio_dir = tmp_path / "audio"
+    audio_dir.mkdir()
+    audio_path = audio_dir / "clip.mp3"
+    audio_path.write_bytes(b"audio")
+
+    ref = object.__new__(ytdlp.YtDlpReference)
+    ref.use_cache = True
+    ref.refresh_cache = False
+    ref.plugin_overrides = {"video": {"frame-mode": "speech"}}
+
+    monkeypatch.setattr(
+        ytdlp.YtDlpReference,
+        "_extract_audio",
+        lambda _self: audio_path,
+    )
+    captured: dict[str, object] = {}
+
+    def _transcribe(
+        _path: Path,
+        *,
+        use_cache: bool = True,
+        refresh_cache: bool | None = None,
+        timeout: float | None = None,
+        plugin_overrides=None,
+    ) -> TranscriptionResult:
+        captured["plugin_overrides"] = plugin_overrides
+        return TranscriptionResult(
+            text="transcript",
+            model="test",
+            provider="test",
+        )
+
+    monkeypatch.setattr(
+        "contextualize.transcription.transcribe_media_file_result",
+        _transcribe,
+    )
+
+    ytdlp.YtDlpReference._get_transcript(ref, 0)
+
+    assert captured["plugin_overrides"] == {
+        "video": {"frame-mode": "speech"},
+        "transcribe": {"timestamp_granularities": ["segment"]},
+    }
 
 
 def test_extract_audio_uses_cached_media_bytes(tmp_path: Path, monkeypatch) -> None:
@@ -1236,3 +1398,86 @@ def test_extract_audio_requests_audio_only_format(monkeypatch) -> None:
     assert calls
     assert calls[0][0:2] == ["-f", "bestaudio/best"]
     assert calls[0][2:4] == ["--concurrent-fragments", "16"]
+
+
+def test_extract_video_uses_cached_media_bytes(monkeypatch) -> None:
+    ref = object.__new__(ytdlp.YtDlpReference)
+    ref.url = "https://example.com/watch"
+    ref.use_cache = True
+    ref.refresh_cache = False
+    ref.plugin_overrides = None
+    ref._metadata = {"extractor_key": "YouTube", "id": "abc123"}
+    ref._identity = ytdlp._build_identity(ref.url, ref._metadata)  # noqa: SLF001
+
+    monkeypatch.setattr(
+        "cx_plugins.providers.ytdlp.cache.get_cached_media_bytes",
+        lambda identity: (
+            b"cached-video" if identity == "video:youtube:abc123" else None
+        ),
+    )
+    monkeypatch.setattr(
+        "contextualize.runtime.get_refresh_videos",
+        lambda: False,
+    )
+
+    calls: list[list[str]] = []
+
+    def _run(*args, **kwargs):
+        calls.append(args[0])
+
+        class _Result:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        return _Result()
+
+    monkeypatch.setattr(ytdlp, "_run_ytdlp", _run)
+
+    video_path = ytdlp.YtDlpReference._extract_video(ref)
+
+    assert video_path.read_bytes() == b"cached-video"
+    assert calls == []
+    video_path.unlink(missing_ok=True)
+    video_path.parent.rmdir()
+
+
+def test_extract_video_requests_bounded_video_format(monkeypatch) -> None:
+    ref = object.__new__(ytdlp.YtDlpReference)
+    ref.url = "https://example.com/watch"
+    ref.use_cache = False
+    ref.refresh_cache = False
+    ref.plugin_overrides = None
+    ref._metadata = {"extractor_key": "YouTube", "id": "abc123"}
+    ref._identity = ytdlp._build_identity(ref.url, ref._metadata)  # noqa: SLF001
+
+    monkeypatch.setattr(
+        "contextualize.runtime.get_refresh_videos",
+        lambda: False,
+    )
+    calls: list[list[str]] = []
+
+    def _run(args, **kwargs):
+        calls.append(args)
+        output_template = args[args.index("-o") + 1]
+        output_path = Path(output_template.replace("%(ext)s", "mp4"))
+        output_path.write_bytes(b"video")
+
+        class _Result:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+
+        return _Result()
+
+    monkeypatch.setattr(ytdlp, "_run_ytdlp", _run)
+
+    video_path = ytdlp.YtDlpReference._extract_video(ref)
+
+    assert video_path.read_bytes() == b"video"
+    assert calls
+    assert calls[0][0:2] == [
+        "-f",
+        "bv*[height<=720][ext=mp4]/bv*[height<=720]/best[height<=720]/best",
+    ]
+    assert calls[0][2:4] == ["--merge-output-format", "mp4"]

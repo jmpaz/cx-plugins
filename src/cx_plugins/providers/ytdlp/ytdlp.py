@@ -595,13 +595,21 @@ def _render_cache_identity(
     base_identity: str, plugin_overrides: dict[str, Any] | None
 ) -> str:
     transcribe_overrides = None
+    video_overrides = None
     if isinstance(plugin_overrides, dict):
         value = plugin_overrides.get("transcribe")
         if isinstance(value, dict):
             transcribe_overrides = dict(value)
+        value = plugin_overrides.get("video")
+        if isinstance(value, dict):
+            video_overrides = dict(value)
     payload = {
-        "overrides": transcribe_overrides or {},
-        "routing": _transcription_routing_identity(plugin_overrides),
+        "version": "video-frames-v2",
+        "transcribe_overrides": transcribe_overrides or {},
+        "video_overrides": video_overrides or {},
+        "routing": _transcription_routing_identity(
+            _effective_video_transcription_overrides(plugin_overrides)
+        ),
     }
     payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()[:16]
@@ -612,17 +620,34 @@ def _fast_render_cache_identity(
     base_identity: str, plugin_overrides: dict[str, Any] | None
 ) -> str:
     transcribe_overrides = None
+    video_overrides = None
     if isinstance(plugin_overrides, dict):
         value = plugin_overrides.get("transcribe")
         if isinstance(value, dict):
             transcribe_overrides = dict(value)
+        value = plugin_overrides.get("video")
+        if isinstance(value, dict):
+            video_overrides = dict(value)
     payload = {
-        "overrides": transcribe_overrides or {},
+        "version": "video-frames-v2",
+        "transcribe_overrides": transcribe_overrides or {},
+        "video_overrides": video_overrides or {},
         "routing": "fast-v1",
     }
     payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()[:16]
     return f"{base_identity}:transcribe-fast:{digest}"
+
+
+def _effective_video_transcription_overrides(
+    plugin_overrides: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    try:
+        from contextualize.references.video_context import video_transcription_overrides
+
+        return video_transcription_overrides(plugin_overrides)
+    except Exception:
+        return plugin_overrides
 
 
 def _source_ref(url: str, metadata: dict[str, Any], extractor: str | None) -> str:
@@ -1520,12 +1545,10 @@ class YtDlpReference:
             cached = get_cached_media_bytes(cache_identity)
             if cached:
                 _log(f"audio cache hit for {identity.display_name}")
-                fd, path = tempfile.mkstemp(prefix="ytdlp-audio-", suffix=".mp3")
-                try:
-                    os.write(fd, cached)
-                finally:
-                    os.close(fd)
-                return Path(path)
+                tmpdir = Path(tempfile.mkdtemp(prefix="ytdlp-audio-cache-"))
+                path = tmpdir / "audio.mp3"
+                path.write_bytes(cached)
+                return path
         _log(f"extracting audio with yt-dlp for {identity.display_name}")
         tmpdir = tempfile.mkdtemp(prefix="ytdlp-")
         output_template = os.path.join(tmpdir, f"{identity.slug}.%(ext)s")
@@ -1573,28 +1596,141 @@ class YtDlpReference:
                 pass
         return audio_files[0]
 
-    def _get_transcript(self, _duration: int) -> tuple[str, str]:
+    def _extract_video(self) -> Path:
+        from .cache import (
+            get_cached_media_bytes,
+            store_media_bytes,
+        )
+        from contextualize.runtime import get_refresh_videos
+
+        identity = self._get_identity()
+        cache_identity = f"video:{identity.cache_identity}"
+        if self.use_cache and not get_refresh_videos():
+            cached = get_cached_media_bytes(cache_identity)
+            if cached:
+                _log(f"video cache hit for {identity.display_name}")
+                tmpdir = Path(tempfile.mkdtemp(prefix="ytdlp-video-cache-"))
+                path = tmpdir / "video.mp4"
+                path.write_bytes(cached)
+                return path
+        _log(f"extracting video with yt-dlp for {identity.display_name}")
+        tmpdir = tempfile.mkdtemp(prefix="ytdlp-video-")
+        output_template = os.path.join(tmpdir, f"{identity.slug}.%(ext)s")
+
+        result = _run_ytdlp(
+            [
+                "-f",
+                "bv*[height<=720][ext=mp4]/bv*[height<=720]/best[height<=720]/best",
+                "--merge-output-format",
+                "mp4",
+                "--concurrent-fragments",
+                "16",
+                "--newline",
+                "--progress",
+                "--socket-timeout",
+                "30",
+                "--no-playlist",
+                "-o",
+                output_template,
+                "--",
+                self._metadata_url(),
+            ],
+            timeout_seconds=None,
+            idle_timeout_seconds=180,
+            stream_progress=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"yt-dlp video extraction failed: {result.stderr}")
+
+        video_dir = Path(tmpdir)
+        video_files = sorted(video_dir.glob("*.mp4"))
+        if not video_files:
+            video_files = sorted(path for path in video_dir.iterdir() if path.is_file())
+        if not video_files:
+            raise RuntimeError("yt-dlp video extraction produced no video file")
+        _log(f"video extraction finished for {identity.display_name}")
+        if self.use_cache:
+            try:
+                store_media_bytes(cache_identity, video_files[0].read_bytes())
+                _log(f"stored extracted video cache for {identity.display_name}")
+            except OSError:
+                pass
+        return video_files[0]
+
+    def _get_transcript_result(self, _duration: int):
         audio_path = None
         try:
             audio_path = self._extract_audio()
             from contextualize.transcription import (
-                transcribe_media_file,
+                transcribe_media_file_result,
             )
 
             identity = getattr(self, "_identity", None)
             display_name = getattr(identity, "display_name", audio_path.name)
             _log(f"transcribing extracted audio for {display_name}")
-            transcript = transcribe_media_file(
+            result = transcribe_media_file_result(
                 audio_path,
                 use_cache=self.use_cache,
                 refresh_cache=self.refresh_cache,
-                plugin_overrides=self.plugin_overrides,
+                plugin_overrides=_effective_video_transcription_overrides(
+                    self.plugin_overrides
+                ),
             )
             _log(f"transcription finished for {display_name}")
-            return transcript, "transcription"
+            return result, "transcription"
         finally:
             if audio_path and audio_path.exists():
                 shutil.rmtree(audio_path.parent, ignore_errors=True)
+
+    def _get_transcript(self, _duration: int) -> tuple[str, str]:
+        result, source = self._get_transcript_result(_duration)
+        return result.text, source
+
+    def _render_video_frames(self, transcript_result) -> str:
+        try:
+            from contextualize.references.video_context import (
+                render_video_frame_section,
+                resolve_video_frame_settings,
+            )
+            from contextualize.runtime import get_skip_media
+
+            if get_skip_media():
+                return ""
+            if not resolve_video_frame_settings(self.plugin_overrides).frames:
+                return ""
+
+            video_path = None
+            try:
+                video_path = self._extract_video()
+                return render_video_frame_section(
+                    video_path,
+                    transcript_result=transcript_result,
+                    use_cache=self.use_cache,
+                    refresh_cache=self.refresh_cache,
+                    plugin_overrides=self.plugin_overrides,
+                    source_url=self.url,
+                )
+            finally:
+                if video_path and video_path.exists():
+                    shutil.rmtree(video_path.parent, ignore_errors=True)
+        except Exception as exc:
+            identity = getattr(self, "_identity", None)
+            display_name = getattr(identity, "display_name", self.url)
+            _log(f"video frame rendering failed for {display_name}: {exc}")
+            return ""
+
+    def _get_transcript_and_frames(self, duration: int) -> tuple[str, str, str]:
+        transcript_result = None
+        transcript = ""
+        source = "none"
+        try:
+            transcript_result, source = self._get_transcript_result(duration)
+            transcript = transcript_result.text
+        except Exception as exc:
+            identity = getattr(self, "_identity", None)
+            display_name = getattr(identity, "display_name", self.url)
+            _log(f"transcription unavailable for {display_name}: {exc}")
+        return transcript, source, self._render_video_frames(transcript_result)
 
     def _render_output_text(self, text: str) -> str:
         from contextualize.render.text import process_text
@@ -1682,7 +1818,7 @@ class YtDlpReference:
         text: str,
         source: str,
     ) -> None:
-        if not self.use_cache:
+        if not self.use_cache or source == "none":
             return
 
         from .cache import store_transcript
@@ -1749,7 +1885,7 @@ class YtDlpReference:
         text: str,
         source: str,
     ) -> None:
-        if not self.use_cache:
+        if not self.use_cache or source == "none":
             return
 
         from .cache import store_transcript
@@ -1803,7 +1939,7 @@ class YtDlpReference:
         text: str,
         source: str,
     ) -> None:
-        if not self.use_cache:
+        if not self.use_cache or source == "none":
             return
 
         from .cache import store_transcript
@@ -2112,6 +2248,7 @@ class YtDlpReference:
         transcript: str,
         source: str,
         *,
+        frames: str = "",
         tiktok_item: dict[str, Any] | None = None,
         instagram_media: dict[str, Any] | None = None,
     ) -> str:
@@ -2145,6 +2282,10 @@ class YtDlpReference:
             )
         if sound_lines:
             lines.extend(sound_lines)
+            lines.append("")
+
+        if frames:
+            lines.append(frames)
             lines.append("")
 
         if transcript:
@@ -2191,11 +2332,12 @@ class YtDlpReference:
                 f"building transcript for {identity.display_name} "
                 f"(duration={duration}s, refresh_cache={self.refresh_cache})"
             )
-            transcript, source = self._get_transcript(duration)
+            transcript, source, frames = self._get_transcript_and_frames(duration)
             text = self._format_output(
                 metadata,
                 transcript,
                 source,
+                frames=frames,
                 tiktok_item=tiktok_item,
             )
 
@@ -2230,11 +2372,12 @@ class YtDlpReference:
                 f"building transcript for {identity.display_name} "
                 f"(duration={duration}s, refresh_cache={self.refresh_cache})"
             )
-            transcript, source = self._get_transcript(duration)
+            transcript, source, frames = self._get_transcript_and_frames(duration)
             text = self._format_output(
                 metadata,
                 transcript,
                 source,
+                frames=frames,
                 instagram_media=instagram_media,
             )
 
@@ -2292,8 +2435,13 @@ class YtDlpReference:
             f"building transcript for {identity.display_name} "
             f"(duration={duration}s, refresh_cache={self.refresh_cache})"
         )
-        transcript, source = self._get_transcript(duration)
-        text = self._format_output(metadata, transcript, source)
+        transcript, source, frames = self._get_transcript_and_frames(duration)
+        text = self._format_output(
+            metadata,
+            transcript,
+            source,
+            frames=frames,
+        )
 
         self.original_file_content = text
         self.file_content = text
