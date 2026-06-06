@@ -1295,6 +1295,15 @@ def _fetch_block_connections_page(block_id: int, page: int, per: int = 100) -> d
     )
 
 
+def _fetch_channel_connections_page(
+    channel_id: int, page: int, per: int = 100
+) -> dict:
+    return _api_get(
+        f"/channels/{channel_id}/connections",
+        {"page": page, "per": per, "sort": "created_at_desc"},
+    )
+
+
 def _fetch_all_block_comments(block_id: int) -> list[dict]:
     first_page = _fetch_block_comments_page(block_id, 1)
     comments = list(first_page.get("data", first_page.get("comments", [])))
@@ -1338,6 +1347,46 @@ def _fetch_block_connections(
 
     while True:
         page_data = _fetch_block_connections_page(block_id, page, per=per_page)
+        page_channels = list(page_data.get("data", page_data.get("channels", [])))
+        for channel in page_channels:
+            if _channel_matches_source_context(channel, source_context):
+                continue
+            channels.append(channel)
+            if requested_count is not None and len(channels) >= requested_count:
+                return channels[:max_items], True
+
+        meta = page_data.get("meta") or {}
+        next_page = meta.get("next_page")
+        if isinstance(next_page, int):
+            page = next_page
+            continue
+        total_pages = meta.get("total_pages")
+        if isinstance(total_pages, int) and page < total_pages:
+            page += 1
+            continue
+        if meta.get("has_more_pages"):
+            page += 1
+            continue
+        break
+
+    if max_items is None:
+        return channels, False
+    return channels[:max_items], len(channels) > max_items
+
+
+def _fetch_channel_connections(
+    channel_id: int,
+    *,
+    max_items: int | None,
+    source_context: dict | None,
+) -> tuple[list[dict], bool]:
+    requested_count = None if max_items is None else max_items + 1
+    per_page = 100 if requested_count is None else max(1, min(100, requested_count))
+    channels: list[dict] = []
+    page = 1
+
+    while True:
+        page_data = _fetch_channel_connections_page(channel_id, page, per=per_page)
         page_channels = list(page_data.get("data", page_data.get("channels", [])))
         for channel in page_channels:
             if _channel_matches_source_context(channel, source_context):

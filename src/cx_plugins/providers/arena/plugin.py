@@ -720,6 +720,148 @@ def _block_list_label(block: dict[str, Any], fallback: str) -> str:
     return fallback
 
 
+def _entity_summary(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    summary: dict[str, Any] = {}
+    for key in ("id", "slug", "name"):
+        item = value.get(key)
+        if item is not None:
+            summary[key] = item
+    return summary or None
+
+
+def _block_connection_metadata(block: dict[str, Any]) -> dict[str, Any]:
+    connection = block.get("connection")
+    if not isinstance(connection, dict):
+        connection = {}
+
+    connected_by = connection.get("connected_by") or block.get("connected_by")
+    metadata: dict[str, Any] = {}
+    connection_id = connection.get("id")
+    if connection_id is not None:
+        metadata["connection_id"] = connection_id
+    position = connection.get("position") or block.get("position")
+    if position is not None:
+        metadata["position"] = position
+    connected_at = connection.get("connected_at") or block.get("connected_at")
+    if connected_at is not None:
+        metadata["connected_at"] = connected_at
+    connected_by_summary = _entity_summary(connected_by)
+    if connected_by_summary is not None:
+        metadata["connected_by"] = connected_by_summary
+    return metadata
+
+
+def _block_source_metadata(block: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    source = block.get("source")
+    if isinstance(source, dict):
+        source_url = source.get("url")
+        source_title = source.get("title")
+        if isinstance(source_url, str) and source_url.strip():
+            metadata["source_url"] = source_url.strip()
+        if isinstance(source_title, str) and source_title.strip():
+            metadata["source_title"] = source_title.strip()
+    return metadata
+
+
+def _nested_depth(channel_path: str) -> int:
+    parts = [part for part in channel_path.split("/") if part]
+    return max(0, len(parts) - 1)
+
+
+def _target_metadata_for_block(
+    block: dict[str, Any],
+    *,
+    channel_path: str,
+    source_channel: str,
+    relation: str,
+) -> dict[str, Any]:
+    block_type = str(block.get("type") or block.get("base_type") or "block")
+    metadata: dict[str, Any] = {
+        "relation": relation,
+        "block_id": block.get("id"),
+        "block_type": block_type,
+        "channel_path": channel_path,
+        "source_channel": source_channel,
+        "nested_depth": _nested_depth(channel_path),
+    }
+    slug = block.get("slug")
+    if block_type == "Channel" and isinstance(slug, str) and slug.strip():
+        metadata["channel_slug"] = slug.strip()
+    owner = _entity_summary(block.get("owner") or block.get("user"))
+    if owner is not None:
+        metadata["owner"] = owner
+    metadata.update(_block_connection_metadata(block))
+    metadata.update(_block_source_metadata(block))
+    return metadata
+
+
+def _channel_summary(channel: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for key in ("id", "slug", "title", "status", "created_at", "updated_at"):
+        value = channel.get(key)
+        if value is not None:
+            summary[key] = value
+    counts = channel.get("counts")
+    if isinstance(counts, dict):
+        summary["counts"] = counts
+    owner = _entity_summary(channel.get("owner") or channel.get("user"))
+    if owner is not None:
+        summary["owner"] = owner
+    return summary
+
+
+def _type_breakdown(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    counts: dict[str, int] = {}
+    for block in blocks:
+        block_type = str(block.get("type") or block.get("base_type") or "block")
+        counts[block_type] = counts.get(block_type, 0) + 1
+    return [
+        {"type": block_type, "count": count}
+        for block_type, count in sorted(counts.items(), key=lambda item: item[0].lower())
+    ]
+
+
+def _block_target_summary(
+    block: dict[str, Any],
+    *,
+    channel_path: str,
+    source_channel: str,
+    relation: str = "contains",
+) -> dict[str, Any] | None:
+    target = _block_target(block)
+    if target is None:
+        return None
+    block_type = str(block.get("type") or block.get("base_type") or "block")
+    return {
+        "target": target,
+        "label": _block_list_label(block, target),
+        "kind": "channel"
+        if block_type == "Channel" or block.get("base_type") == "Channel"
+        else "block",
+        "metadata": _target_metadata_for_block(
+            block,
+            channel_path=channel_path,
+            source_channel=source_channel,
+            relation=relation,
+        ),
+    }
+
+
+def _positive_int(value: object, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def _owner_profile_document(
     *,
     target: str,
@@ -825,6 +967,11 @@ def _channel_documents(
                 "context_subpath": _join_context_path(
                     context_prefix, f"{slug}/_channel.md"
                 ),
+                "block_id": channel_id,
+                "block_type": "Channel",
+                "channel_path": _join_context_path(context_prefix, slug),
+                "source_channel": target,
+                "nested_depth": 0,
                 "source_created": channel_block.get("created_at"),
                 "source_modified": channel_block.get("updated_at"),
                 "dir_created": channel_block.get("created_at"),
@@ -854,16 +1001,12 @@ def _channel_documents(
         )
         ref_label = ref.get_label()
         label = ref_label or str(block_id or "block")
+        label_path = label if "/" in label else f"{slug}/{label}"
         channel_parts = [part for part in channel_path.split("/") if part]
         if channel_parts and channel_parts[0] == slug:
             channel_parts = channel_parts[1:]
-        channel_subdir = "/".join(channel_parts)
-        context_subpath = (
-            f"{slug}/{channel_subdir}/{label}.md"
-            if channel_subdir
-            else f"{slug}/{label}.md"
-        )
-        source_path = f"{slug}/{label}"
+        context_subpath = f"{label_path}.md"
+        source_path = label_path
         dedupe = None
         if is_channel and block_id is not None:
             dedupe = {
@@ -899,6 +1042,13 @@ def _channel_documents(
                     "dir_modified": channel_meta.get("updated_at")
                     if isinstance(channel_meta, dict)
                     else None,
+                    "block_id": block_id,
+                    "block_type": block_type or block.get("base_type"),
+                    "channel_path": _join_context_path(context_prefix, channel_path),
+                    "source_channel": target,
+                    "nested_depth": len(channel_parts),
+                    **_block_connection_metadata(block),
+                    **_block_source_metadata(block),
                     "settings_key": settings_key,
                     "hydrate_dedupe": dedupe,
                 },
@@ -945,27 +1095,16 @@ def list_targets(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
         )
         items: list[dict[str, Any]] = []
         for channel_path, block in flat_blocks:
-            child_target = _block_target(block)
-            if child_target is None:
-                continue
-            _remember_listed_block(child_target, block)
-            block_type = str(block.get("type") or block.get("base_type") or "block")
-            block_id = block.get("id")
-            items.append(
-                {
-                    "target": child_target,
-                    "label": _block_list_label(block, child_target),
-                    "kind": "channel"
-                    if block_type == "Channel" or block.get("base_type") == "Channel"
-                    else "block",
-                    "metadata": {
-                        "block_id": block_id,
-                        "block_type": block_type,
-                        "channel_path": channel_path,
-                        "source_channel": target,
-                    },
-                }
+            item = _block_target_summary(
+                block,
+                channel_path=channel_path,
+                source_channel=target,
             )
+            if item is None:
+                continue
+            child_target = item["target"]
+            _remember_listed_block(child_target, block)
+            items.append(item)
         return items
     if is_arena_block_url(target):
         block_id = extract_block_id(target)
@@ -998,6 +1137,308 @@ def list_targets(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
         for channel in channels
         if isinstance((channel_slug := channel.get("slug")), str) and channel_slug
     ]
+
+
+def _progressive_channel_settings(
+    settings: Any,
+    arena_overrides: dict[str, Any] | None,
+    *,
+    default_depth: int,
+    max_blocks: int | None = None,
+) -> Any:
+    changes: dict[str, Any] = {}
+    if not arena_overrides or "max_depth" not in arena_overrides:
+        changes["max_depth"] = default_depth
+    if max_blocks is not None:
+        changes["max_blocks_per_channel"] = max_blocks
+    return replace(settings, **changes) if changes else settings
+
+
+def _digest_sample_size(context: dict[str, Any]) -> int:
+    return _positive_int(context.get("sample_size") or context.get("sampleSize"), 24)
+
+
+def _containing_channel_targets(
+    block: dict[str, Any],
+    *,
+    source_target: str,
+    settings: Any,
+) -> list[dict[str, Any]]:
+    from .arena import _fetch_block_connections, _fetch_channel_connections
+
+    block_id = block.get("id")
+    if not isinstance(block_id, int):
+        return []
+
+    block_type = str(block.get("type") or block.get("base_type") or "block")
+    source_context = block.get("_contextualize_channel_context")
+    if not isinstance(source_context, dict):
+        source_context = None
+
+    if block_type == "Channel" or block.get("base_type") == "Channel":
+        channels, cap_hit = _fetch_channel_connections(
+            block_id,
+            max_items=settings.connections_max_items,
+            source_context=source_context,
+        )
+    else:
+        channels, cap_hit = _fetch_block_connections(
+            block_id,
+            max_items=settings.connections_max_items,
+            source_context=source_context,
+        )
+
+    items: list[dict[str, Any]] = []
+    for channel in channels:
+        slug = channel.get("slug")
+        if not isinstance(slug, str) or not slug.strip():
+            continue
+        metadata: dict[str, Any] = {
+            "relation": "contained_by",
+            "source_target": source_target,
+            "source_block_id": block_id,
+            "source_block_type": block_type,
+            "channel_id": channel.get("id"),
+            "channel_slug": slug.strip(),
+        }
+        owner = _entity_summary(channel.get("owner") or channel.get("user"))
+        if owner is not None:
+            metadata["owner"] = owner
+        metadata.update(_block_connection_metadata(channel))
+        items.append(
+            {
+                "target": _channel_target(slug.strip()),
+                "label": channel.get("title") or slug.strip(),
+                "kind": "channel",
+                "metadata": metadata,
+            }
+        )
+    if cap_hit:
+        items.append(
+            {
+                "target": source_target,
+                "label": "More containing channels available",
+                "kind": "pagination",
+                "metadata": {
+                    "relation": "contained_by",
+                    "truncated": True,
+                    "max_items": settings.connections_max_items,
+                },
+            }
+        )
+    return items
+
+
+def arena_digest(target: str, context: dict[str, Any]) -> dict[str, Any]:
+    from .arena import (
+        build_arena_settings,
+        extract_channel_slug,
+        is_arena_channel_url,
+        resolve_channel,
+        warmup_arena_network_stack,
+    )
+
+    if not is_arena_channel_url(target):
+        raise ValueError("arena_digest requires an Are.na channel URL")
+
+    slug = extract_channel_slug(target)
+    if not slug:
+        raise ValueError("arena_digest could not determine channel slug")
+
+    arena_overrides = _arena_overrides(context)
+    settings = build_arena_settings(arena_overrides)
+    sample_size = _digest_sample_size(context)
+    settings = _progressive_channel_settings(
+        settings,
+        arena_overrides,
+        default_depth=0,
+        max_blocks=sample_size,
+    )
+    settings = _apply_channel_safety_defaults(settings, arena_overrides)
+
+    use_cache = bool(context.get("use_cache", True))
+    cache_ttl = context.get("cache_ttl")
+    refresh_cache = bool(context.get("refresh_cache", False))
+
+    warmup_arena_network_stack()
+    channel_meta, flat_blocks = resolve_channel(
+        slug,
+        use_cache=use_cache,
+        cache_ttl=cache_ttl,
+        refresh_cache=refresh_cache,
+        settings=settings,
+    )
+    blocks = [block for _channel_path, block in flat_blocks]
+    total_count = (channel_meta.get("counts") or {}).get("contents")
+    sampled_items = [
+        item
+        for channel_path, block in flat_blocks
+        if (
+            item := _block_target_summary(
+                block,
+                channel_path=channel_path,
+                source_channel=target,
+            )
+        )
+        is not None
+    ]
+
+    collaborators = channel_meta.get("collaborators") or channel_meta.get("users") or []
+    if not isinstance(collaborators, list):
+        collaborators = []
+
+    return {
+        "target": _channel_target(slug),
+        "channel": _channel_summary(channel_meta),
+        "typeBreakdown": _type_breakdown(blocks),
+        "sampledItems": sampled_items,
+        "collaborators": [
+            summary
+            for value in collaborators
+            if (summary := _entity_summary(value)) is not None
+        ],
+        "pagination": {
+            "sampleSize": len(sampled_items),
+            "requestedSampleSize": sample_size,
+            "totalCount": total_count if isinstance(total_count, int) else None,
+            "hasMore": bool(isinstance(total_count, int) and total_count > len(sampled_items)),
+        },
+        "settings": {
+            "blockSort": settings.sort_order,
+            "recurseDepth": settings.max_depth,
+            "maxBlocksPerChannel": settings.max_blocks_per_channel,
+        },
+    }
+
+
+def arena_targets(target: str, context: dict[str, Any]) -> dict[str, Any]:
+    from .arena import (
+        _fetch_block,
+        build_arena_settings,
+        extract_block_id,
+        extract_channel_slug,
+        is_arena_block_url,
+        is_arena_channel_url,
+        list_arena_block_targets,
+        resolve_channel,
+        warmup_arena_network_stack,
+    )
+
+    arena_overrides = _arena_overrides(context)
+    settings = build_arena_settings(arena_overrides)
+    settings = _progressive_channel_settings(
+        settings,
+        arena_overrides,
+        default_depth=0,
+    )
+    settings = _apply_channel_safety_defaults(settings, arena_overrides)
+    include_containing = bool(context.get("include_containing", True))
+    use_cache = bool(context.get("use_cache", True))
+    cache_ttl = context.get("cache_ttl")
+    refresh_cache = bool(context.get("refresh_cache", False))
+
+    if is_arena_channel_url(target):
+        slug = extract_channel_slug(target)
+        if not slug:
+            return {"target": target, "targets": [], "pagination": None}
+        warmup_arena_network_stack()
+        channel_meta, flat_blocks = resolve_channel(
+            slug,
+            use_cache=use_cache,
+            cache_ttl=cache_ttl,
+            refresh_cache=refresh_cache,
+            settings=settings,
+        )
+        targets: list[dict[str, Any]] = []
+        channel_block = dict(channel_meta) if isinstance(channel_meta, dict) else {}
+        channel_block.setdefault("type", "Channel")
+        channel_block.setdefault("base_type", "Channel")
+        channel_block.setdefault("slug", slug)
+        if include_containing:
+            targets.extend(
+                _containing_channel_targets(
+                    channel_block,
+                    source_target=_channel_target(slug),
+                    settings=settings,
+                )
+            )
+        for channel_path, block in flat_blocks:
+            item = _block_target_summary(
+                block,
+                channel_path=channel_path,
+                source_channel=target,
+            )
+            if item is None:
+                continue
+            _remember_listed_block(item["target"], block)
+            targets.append(item)
+        total_count = (channel_meta.get("counts") or {}).get("contents")
+        return {
+            "target": _channel_target(slug),
+            "channel": _channel_summary(channel_meta),
+            "targets": targets,
+            "pagination": {
+                "returned": len(targets),
+                "totalCount": total_count if isinstance(total_count, int) else None,
+                "hasMore": bool(
+                    isinstance(total_count, int)
+                    and settings.max_blocks_per_channel is not None
+                    and total_count > settings.max_blocks_per_channel
+                ),
+            },
+            "settings": {
+                "blockSort": settings.sort_order,
+                "recurseDepth": settings.max_depth,
+                "maxBlocksPerChannel": settings.max_blocks_per_channel,
+            },
+        }
+
+    if is_arena_block_url(target):
+        block_id = extract_block_id(target)
+        if block_id is None:
+            return {"target": target, "targets": [], "pagination": None}
+        block = _cached_block_for_target(target) or _fetch_block(block_id)
+        targets = list_arena_block_targets(block, source_target=target)
+        for item in targets:
+            metadata = item.setdefault("metadata", {})
+            if isinstance(metadata, dict):
+                metadata.setdefault("relation", "resolves_to")
+                metadata.setdefault("source_target", target)
+        if include_containing:
+            targets.extend(
+                _containing_channel_targets(
+                    block,
+                    source_target=target,
+                    settings=settings,
+                )
+            )
+        return {
+            "target": target,
+            "block": _block_target_summary(
+                block,
+                channel_path="",
+                source_channel=target,
+                relation="self",
+            ),
+            "targets": targets,
+            "pagination": {"returned": len(targets), "totalCount": len(targets), "hasMore": False},
+            "settings": {
+                "blockSort": settings.sort_order,
+                "recurseDepth": settings.max_depth,
+                "maxBlocksPerChannel": settings.max_blocks_per_channel,
+            },
+        }
+
+    return {
+        "target": target,
+        "targets": list_targets(target, context),
+        "pagination": None,
+        "settings": {
+            "blockSort": settings.sort_order,
+            "recurseDepth": settings.max_depth,
+            "maxBlocksPerChannel": settings.max_blocks_per_channel,
+        },
+    }
 
 
 def materialize(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1146,6 +1587,12 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
                     "source_ref": "are.na",
                     "source_path": str(block_id),
                     "context_subpath": f"arena-block-{block_id}.md",
+                    "block_id": block_id,
+                    "block_type": block.get("type") or block.get("base_type"),
+                    "source_channel": target,
+                    "nested_depth": 0,
+                    **_block_connection_metadata(block),
+                    **_block_source_metadata(block),
                     "source_created": block.get("connected_at")
                     or block.get("created_at"),
                     "source_modified": block.get("updated_at"),

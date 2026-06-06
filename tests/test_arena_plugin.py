@@ -474,6 +474,28 @@ def test_resolve_channel_multiline_description_has_no_spacer_line(monkeypatch) -
     assert "Description:\n\nFirst paragraph." not in docs[0]["content"]
 
 
+def test_resolve_channel_block_paths_do_not_double_prefix_slug(monkeypatch) -> None:
+    channel = _channel("root", 1, "Root", 1)
+
+    monkeypatch.setattr(arena, "_fetch_channel", lambda slug: channel)
+    monkeypatch.setattr(
+        arena,
+        "_fetch_channel_page",
+        lambda slug, page, per=100: {
+            "contents": [_text_block(100)],
+            "meta": {"total_pages": 1},
+        },
+    )
+
+    docs = arena_plugin.resolve(
+        "https://www.are.na/owner/root",
+        {"use_cache": False},
+    )
+
+    assert docs[1]["metadata"]["source_path"] == "root/100"
+    assert docs[1]["metadata"]["context_subpath"] == "root/100.md"
+
+
 def test_resolve_channel_preserves_block_connection_context(monkeypatch) -> None:
     channel = _channel("root", 1, "Root", 1)
     block = {
@@ -570,10 +592,12 @@ def test_list_targets_channel_exposes_child_blocks(monkeypatch) -> None:
             "label": "Block 100",
             "kind": "block",
             "metadata": {
+                "relation": "contains",
                 "block_id": 100,
                 "block_type": "Text",
                 "channel_path": "root",
                 "source_channel": "https://www.are.na/channel/root",
+                "nested_depth": 0,
             },
         },
         {
@@ -581,10 +605,115 @@ def test_list_targets_channel_exposes_child_blocks(monkeypatch) -> None:
             "label": "Nested",
             "kind": "channel",
             "metadata": {
+                "relation": "contains",
                 "block_id": 200,
                 "block_type": "Channel",
                 "channel_path": "root",
                 "source_channel": "https://www.are.na/channel/root",
+                "nested_depth": 0,
+                "channel_slug": "nested",
+                "owner": {"id": 1, "slug": "owner", "name": "Owner"},
+            },
+        },
+    ]
+
+
+def test_arena_digest_returns_channel_overview(monkeypatch) -> None:
+    monkeypatch.setattr(
+        arena,
+        "resolve_channel",
+        lambda slug, **_kwargs: (
+            _channel(slug, 1, "Root", 4),
+            [
+                ("root", _text_block(100)),
+                ("root", _channel("nested", 200, "Nested", 0)),
+            ],
+        ),
+    )
+
+    digest = arena_plugin.arena_digest(
+        "https://www.are.na/channel/root",
+        {"use_cache": False, "sample_size": 2},
+    )
+
+    assert digest["channel"]["slug"] == "root"
+    assert digest["pagination"] == {
+        "sampleSize": 2,
+        "requestedSampleSize": 2,
+        "totalCount": 4,
+        "hasMore": True,
+    }
+    assert digest["typeBreakdown"] == [
+        {"type": "Channel", "count": 1},
+        {"type": "Text", "count": 1},
+    ]
+    assert digest["sampledItems"][0]["target"] == "https://www.are.na/block/100"
+
+
+def test_arena_targets_includes_containing_channel_for_block(monkeypatch) -> None:
+    monkeypatch.setattr(
+        arena,
+        "_fetch_block",
+        lambda block_id: {
+            **_text_block(block_id),
+            "source": {"url": "https://example.com/source", "title": "Source"},
+        },
+    )
+    monkeypatch.setattr(
+        arena,
+        "_fetch_block_connections",
+        lambda block_id, **_kwargs: (
+            [
+                {
+                    "id": 5,
+                    "slug": "container",
+                    "title": "Container",
+                    "owner": {"id": 2, "slug": "bob", "name": "Bob"},
+                    "connection": {
+                        "id": 44,
+                        "position": 7,
+                        "connected_at": "2026-06-01T00:00:00Z",
+                        "connected_by": {"id": 3, "slug": "adder", "name": "Adder"},
+                    },
+                }
+            ],
+            False,
+        ),
+    )
+
+    graph = arena_plugin.arena_targets(
+        "https://www.are.na/block/335",
+        {"use_cache": False},
+    )
+
+    assert graph["targets"] == [
+        {
+            "target": "https://example.com/source",
+            "label": "Source",
+            "kind": "link",
+            "metadata": {
+                "source": "source",
+                "block_id": 335,
+                "relation": "resolves_to",
+                "source_target": "https://www.are.na/block/335",
+            },
+        },
+        {
+            "target": "https://www.are.na/channel/container",
+            "label": "Container",
+            "kind": "channel",
+            "metadata": {
+                "relation": "contained_by",
+                "source_target": "https://www.are.na/block/335",
+                "source_block_id": 335,
+                "source_block_type": "Text",
+                "channel_id": 5,
+                "channel_slug": "container",
+                "owner": {"id": 2, "slug": "bob", "name": "Bob"},
+                "connection_id": 44,
+                "position": 7,
+                "connected_at": "2026-06-01T00:00:00Z",
+                "connected_by": {"id": 3, "slug": "adder", "name": "Adder"},
             },
         },
     ]
