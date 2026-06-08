@@ -43,10 +43,12 @@ def test_discord_message_listing_exposes_attachments_and_links(monkeypatch) -> N
         },
     )
 
-    items = discord_plugin.list_targets(
+    listing = discord_plugin.list_targets(
         "https://discord.com/channels/1/2/3",
         {"use_cache": False, "refresh_cache": True},
     )
+    assert isinstance(listing, dict)
+    items = listing["targets"]
 
     assert items == [
         {
@@ -76,6 +78,17 @@ def test_discord_message_listing_exposes_attachments_and_links(monkeypatch) -> N
             "metadata": {"source": "embed", "embed_index": 0},
         },
     ]
+    assert listing["summary"] == {
+        "message": {
+            "kind": "message",
+            "guild_id": "1",
+            "channel_id": "2",
+            "message_id": "3",
+        },
+        "targetCount": 3,
+    }
+    assert listing["pagination"] == {"returned": 3, "totalCount": 3, "hasMore": False}
+    assert listing["metadata"]["provider"] == "discord"
 
 
 def test_discord_attachment_materialize_downloads_bytes(monkeypatch, tmp_path: Path) -> None:

@@ -277,7 +277,8 @@ def test_plugin_listing_and_cli_overrides(tmp_path: Path) -> None:
         "[5/12/26, 9:31:21\u202fPM] Josh: would-have-pinned",
     )
 
-    items = whatsapp_plugin.list_targets(str(archive), {})
+    listing = whatsapp_plugin.list_targets(str(archive), {})
+    items = listing["targets"]
     assert items == [
         {
             "target": f"whatsapp:zip:{str(archive).replace(' ', '%20')}?chat=manu",
@@ -290,6 +291,9 @@ def test_plugin_listing_and_cli_overrides(tmp_path: Path) -> None:
             },
         }
     ]
+    assert listing["summary"] == {"targetCount": 1}
+    assert listing["pagination"] == {"returned": 1, "totalCount": 1, "hasMore": False}
+    assert listing["metadata"] == {"provider": "whatsapp", "target": str(archive)}
 
     overrides = whatsapp_plugin.collect_cli_overrides(
         "cat",

@@ -19,6 +19,14 @@ _ARENA_SORT_CHOICES = (
     "position-desc",
 )
 _LISTED_BLOCK_CACHE: dict[str, dict[str, Any]] = {}
+_RESOLUTION_MODE_ALIASES = {
+    "digest": "digest",
+    "richtoplevel": "richTopLevel",
+    "rich-top-level": "richTopLevel",
+    "rich_top_level": "richTopLevel",
+    "richTopLevel": "richTopLevel",
+    "recursive": "recursive",
+}
 
 
 def normalize_manifest_config(
@@ -84,6 +92,26 @@ def _arena_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
         result["recurse_blocks"] = raw.get("recurse-blocks")
     if "exclude-channels" in raw:
         result["exclude_channels"] = raw.get("exclude-channels")
+
+    resolution_mode = (
+        raw.get("resolution-mode")
+        if "resolution-mode" in raw
+        else raw.get("resolutionMode", raw.get("resolution_mode"))
+    )
+    if resolution_mode is not None:
+        if not isinstance(resolution_mode, str):
+            raise ValueError("arena resolution-mode must be a string")
+        normalized_resolution_mode = resolution_mode.strip()
+        alias_key = (
+            normalized_resolution_mode
+            if normalized_resolution_mode in _RESOLUTION_MODE_ALIASES
+            else normalized_resolution_mode.lower()
+        )
+        if alias_key not in _RESOLUTION_MODE_ALIASES:
+            raise ValueError(
+                "arena resolution-mode must be one of: digest, richTopLevel, recursive"
+            )
+        result["resolution_mode"] = _RESOLUTION_MODE_ALIASES[alias_key]
 
     for config_key, result_key in (
         ("connected-after", "connected_after"),
@@ -835,12 +863,11 @@ def _block_target_summary(
     if target is None:
         return None
     block_type = str(block.get("type") or block.get("base_type") or "block")
-    return {
+    is_channel = block_type == "Channel" or block.get("base_type") == "Channel"
+    item = {
         "target": target,
         "label": _block_list_label(block, target),
-        "kind": "channel"
-        if block_type == "Channel" or block.get("base_type") == "Channel"
-        else "block",
+        "kind": "channel" if is_channel else "block",
         "metadata": _target_metadata_for_block(
             block,
             channel_path=channel_path,
@@ -848,6 +875,9 @@ def _block_target_summary(
             relation=relation,
         ),
     }
+    if is_channel:
+        item["traverse"] = False
+    return item
 
 
 def _positive_int(value: object, default: int) -> int:
@@ -860,6 +890,13 @@ def _positive_int(value: object, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed > 0 else default
+
+
+def _arena_resolution_mode(arena_overrides: dict[str, Any] | None) -> str | None:
+    if not arena_overrides:
+        return None
+    value = arena_overrides.get("resolution_mode")
+    return value if isinstance(value, str) else None
 
 
 def _owner_profile_document(
@@ -1057,7 +1094,45 @@ def _channel_documents(
     return out
 
 
-def list_targets(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+def _arena_listing_settings(settings: Any) -> dict[str, Any]:
+    return {
+        "blockSort": settings.sort_order,
+        "recurseDepth": settings.max_depth,
+        "maxBlocksPerChannel": settings.max_blocks_per_channel,
+    }
+
+
+def _arena_listing_envelope(
+    *,
+    target: str,
+    kind: str,
+    targets: list[dict[str, Any]],
+    settings: Any,
+    summary: dict[str, Any] | None = None,
+    pagination: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+    capabilities: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    envelope_metadata: dict[str, Any] = {
+        "provider": PLUGIN_NAME,
+        "kind": kind,
+        "target": target,
+        "settings": _arena_listing_settings(settings),
+    }
+    if metadata:
+        envelope_metadata.update(metadata)
+    return {
+        "targets": targets,
+        "summary": summary or {},
+        "pagination": pagination
+        or {"returned": len(targets), "totalCount": len(targets), "hasMore": False},
+        "metadata": envelope_metadata,
+        "capabilities": capabilities
+        or {"resolve": True, "listTargets": True, "materialize": False},
+    }
+
+
+def list_targets(target: str, context: dict[str, Any]) -> dict[str, Any]:
     from .arena import (
         _fetch_block,
         build_arena_settings,
@@ -1071,19 +1146,31 @@ def list_targets(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
         warmup_arena_network_stack,
     )
 
-    if parse_arena_block_attachment_target(target) is not None:
-        return []
-
     arena_overrides = _arena_overrides(context)
     settings = build_arena_settings(arena_overrides)
     use_cache = bool(context.get("use_cache", True))
     cache_ttl = context.get("cache_ttl")
     refresh_cache = bool(context.get("refresh_cache", False))
 
+    if parse_arena_block_attachment_target(target) is not None:
+        return _arena_listing_envelope(
+            target=target,
+            kind="attachment",
+            targets=[],
+            settings=settings,
+            capabilities={"resolve": True, "listTargets": False, "materialize": True},
+        )
+
     if is_arena_channel_url(target):
         slug = extract_channel_slug(target)
         if not slug:
-            return []
+            return _arena_listing_envelope(
+                target=target,
+                kind="channel",
+                targets=[],
+                settings=settings,
+                capabilities={"resolve": False, "listTargets": True, "materialize": False},
+            )
         settings = _apply_channel_safety_defaults(settings, arena_overrides)
         warmup_arena_network_stack()
         _channel_meta, flat_blocks = resolve_channel(
@@ -1105,17 +1192,108 @@ def list_targets(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
             child_target = item["target"]
             _remember_listed_block(child_target, block)
             items.append(item)
-        return items
+        channel_block = dict(_channel_meta) if isinstance(_channel_meta, dict) else {}
+        channel_block.setdefault("type", "Channel")
+        channel_block.setdefault("base_type", "Channel")
+        channel_block.setdefault("slug", slug)
+        if bool(context.get("include_containing", False)):
+            items = [
+                *_containing_channel_targets(
+                    channel_block,
+                    source_target=_channel_target(slug),
+                    settings=settings,
+                ),
+                *items,
+            ]
+        blocks = [block for _channel_path, block in flat_blocks]
+        total_count = (_channel_meta.get("counts") or {}).get("contents")
+        collaborators = _channel_meta.get("collaborators") or _channel_meta.get("users") or []
+        if not isinstance(collaborators, list):
+            collaborators = []
+        return _arena_listing_envelope(
+            target=_channel_target(slug),
+            kind="channel",
+            targets=items,
+            settings=settings,
+            summary={
+                "channel": _channel_summary(_channel_meta),
+                "typeBreakdown": _type_breakdown(blocks),
+                "sampledItems": items,
+                "collaborators": [
+                    summary
+                    for value in collaborators
+                    if (summary := _entity_summary(value)) is not None
+                ],
+            },
+            pagination={
+                "returned": len(items),
+                "totalCount": total_count if isinstance(total_count, int) else None,
+                "hasMore": bool(
+                    isinstance(total_count, int)
+                    and settings.max_blocks_per_channel is not None
+                    and total_count > settings.max_blocks_per_channel
+                ),
+            },
+            metadata={"channel_slug": slug},
+        )
     if is_arena_block_url(target):
         block_id = extract_block_id(target)
         if block_id is None:
-            return []
+            return _arena_listing_envelope(
+                target=target,
+                kind="block",
+                targets=[],
+                settings=settings,
+                capabilities={"resolve": False, "listTargets": True, "materialize": False},
+            )
         block = _cached_block_for_target(target) or _fetch_block(block_id)
-        return list_arena_block_targets(block, source_target=target)
+        items = list_arena_block_targets(block, source_target=target)
+        if bool(context.get("include_containing", False)):
+            items = [
+                *items,
+                *_containing_channel_targets(
+                    block,
+                    source_target=target,
+                    settings=settings,
+                ),
+            ]
+        return _arena_listing_envelope(
+            target=target,
+            kind="block",
+            targets=items,
+            settings=settings,
+            summary={
+                "block": _block_target_summary(
+                    block,
+                    channel_path="",
+                    source_channel=target,
+                    relation="self",
+                )
+            },
+            pagination={"returned": len(items), "totalCount": len(items), "hasMore": False},
+            metadata={
+                "block_id": block_id,
+                "block_type": block.get("type") or block.get("base_type"),
+            },
+            capabilities={
+                "resolve": True,
+                "listTargets": True,
+                "materialize": any(
+                    str(item.get("kind") or "").startswith("attachment:")
+                    for item in items
+                ),
+            },
+        )
 
     owners = _owner_targets(target)
     if not owners:
-        return []
+        return _arena_listing_envelope(
+            target=target,
+            kind="unknown",
+            targets=[],
+            settings=settings,
+            capabilities={"resolve": False, "listTargets": False, "materialize": False},
+        )
     warmup_arena_network_stack()
     owner_channels = _fetch_owner_channels_for_target(
         owners,
@@ -1125,18 +1303,33 @@ def list_targets(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
         settings=settings,
     )
     if owner_channels is None:
-        return []
+        return _arena_listing_envelope(
+            target=target,
+            kind="owner",
+            targets=[],
+            settings=settings,
+            capabilities={"resolve": False, "listTargets": True, "materialize": False},
+        )
     kind, slug, channels = owner_channels
-    return [
+    items = [
         {
             "target": _channel_target(channel_slug),
             "label": channel.get("title") or channel_slug,
             "kind": "channel",
+            "traverse": False,
             "metadata": {"owner_kind": kind, "owner_slug": slug},
         }
         for channel in channels
         if isinstance((channel_slug := channel.get("slug")), str) and channel_slug
     ]
+    return _arena_listing_envelope(
+        target=target,
+        kind=kind,
+        targets=items,
+        settings=settings,
+        summary={"owner": {"kind": kind, "slug": slug}, "channelCount": len(items)},
+        metadata={"owner_kind": kind, "owner_slug": slug},
+    )
 
 
 def _progressive_channel_settings(
@@ -1210,6 +1403,7 @@ def _containing_channel_targets(
                 "target": _channel_target(slug.strip()),
                 "label": channel.get("title") or slug.strip(),
                 "kind": "channel",
+                "traverse": False,
                 "metadata": metadata,
             }
         )
@@ -1307,6 +1501,97 @@ def arena_digest(target: str, context: dict[str, Any]) -> dict[str, Any]:
             "blockSort": settings.sort_order,
             "recurseDepth": settings.max_depth,
             "maxBlocksPerChannel": settings.max_blocks_per_channel,
+        },
+    }
+
+
+def _render_arena_digest_document(digest: dict[str, Any]) -> str:
+    channel = digest.get("channel") if isinstance(digest.get("channel"), dict) else {}
+    pagination = (
+        digest.get("pagination") if isinstance(digest.get("pagination"), dict) else {}
+    )
+    title = channel.get("title") or channel.get("slug") or digest.get("target")
+    lines = [f"# {title}", "", f"target: {digest.get('target')}"]
+    if channel.get("slug"):
+        lines.append(f"slug: {channel.get('slug')}")
+    counts = channel.get("counts") if isinstance(channel.get("counts"), dict) else {}
+    if "contents" in counts:
+        lines.append(f"contents: {counts.get('contents')}")
+    if pagination:
+        if pagination.get("sampleSize") is not None:
+            lines.append(f"sampled: {pagination.get('sampleSize')}")
+        if pagination.get("hasMore") is not None:
+            lines.append(f"has_more: {pagination.get('hasMore')}")
+    lines.append("")
+
+    type_breakdown = digest.get("typeBreakdown")
+    if isinstance(type_breakdown, list) and type_breakdown:
+        lines.append("## Type Breakdown")
+        for item in type_breakdown:
+            if not isinstance(item, dict):
+                continue
+            block_type = item.get("type")
+            count = item.get("count")
+            if block_type is not None and count is not None:
+                lines.append(f"- {block_type}: {count}")
+        lines.append("")
+
+    sampled_items = digest.get("sampledItems")
+    if isinstance(sampled_items, list) and sampled_items:
+        lines.append("## Sampled Targets")
+        for item in sampled_items:
+            if not isinstance(item, dict):
+                continue
+            item_target = item.get("target")
+            label = item.get("label") or item_target
+            kind = item.get("kind") or "target"
+            metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+            relation = metadata.get("relation")
+            relation_suffix = f" [{relation}]" if isinstance(relation, str) else ""
+            lines.append(f"- {kind}{relation_suffix}: {label} <{item_target}>")
+        lines.append("")
+
+    collaborators = digest.get("collaborators")
+    if isinstance(collaborators, list) and collaborators:
+        lines.append("## Collaborators")
+        for collaborator in collaborators:
+            if not isinstance(collaborator, dict):
+                continue
+            name = collaborator.get("name") or collaborator.get("slug") or collaborator.get("id")
+            if name is not None:
+                lines.append(f"- {name}")
+
+    return "\n".join(lines).strip()
+
+
+def _arena_digest_document(
+    *,
+    target: str,
+    context: dict[str, Any],
+    settings_key: tuple[Any, ...],
+) -> dict[str, Any]:
+    digest = arena_digest(target, context)
+    channel = digest.get("channel") if isinstance(digest.get("channel"), dict) else {}
+    slug = channel.get("slug") if isinstance(channel.get("slug"), str) else target
+    title = channel.get("title") if isinstance(channel.get("title"), str) else slug
+    return {
+        "source": target,
+        "label": f"{title} digest",
+        "content": _render_arena_digest_document(digest),
+        "metadata": {
+            "trace_path": f"{slug}/_digest",
+            "provider": PLUGIN_NAME,
+            "source_ref": "are.na",
+            "source_path": slug,
+            "context_subpath": f"{slug}/_digest.md",
+            "block_id": channel.get("id"),
+            "block_type": "Channel",
+            "channel_path": slug,
+            "source_channel": target,
+            "nested_depth": 0,
+            "resolution_mode": "digest",
+            "settings_key": settings_key,
+            "digest": digest,
         },
     }
 
@@ -1429,10 +1714,15 @@ def arena_targets(target: str, context: dict[str, Any]) -> dict[str, Any]:
             },
         }
 
+    listed = list_targets(target, context)
+    listed_targets = listed.get("targets")
+    listed_pagination = listed.get("pagination")
+    if not isinstance(listed_targets, list):
+        listed_targets = []
     return {
         "target": target,
-        "targets": list_targets(target, context),
-        "pagination": None,
+        "targets": listed_targets,
+        "pagination": listed_pagination if isinstance(listed_pagination, dict) else None,
         "settings": {
             "blockSort": settings.sort_order,
             "recurseDepth": settings.max_depth,
@@ -1543,6 +1833,20 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
         return out
 
     if is_arena_channel_url(target):
+        if resolution_mode == "digest":
+            return [
+                _arena_digest_document(
+                    target=target,
+                    context=context,
+                    settings_key=settings_key,
+                )
+            ]
+        if resolution_mode == "richTopLevel":
+            settings = _progressive_channel_settings(
+                settings,
+                arena_overrides,
+                default_depth=0,
+            )
         settings = _apply_channel_safety_defaults(settings, arena_overrides)
         settings_key = _settings_key(settings)
         slug = extract_channel_slug(target)

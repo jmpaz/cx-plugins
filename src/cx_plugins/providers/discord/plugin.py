@@ -76,18 +76,69 @@ def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | No
     }
 
 
-def list_targets(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+def _discord_listing_envelope(
+    *,
+    target: str,
+    kind: str,
+    targets: list[dict[str, Any]],
+    parsed: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "provider": PLUGIN_NAME,
+        "kind": kind,
+        "target": target,
+    }
+    if parsed:
+        for key in ("guild_id", "channel_id", "message_id"):
+            value = parsed.get(key)
+            if value is not None:
+                metadata[key] = value
+    return {
+        "targets": targets,
+        "summary": {kind: dict(parsed or {}), "targetCount": len(targets)},
+        "pagination": {"returned": len(targets), "totalCount": len(targets), "hasMore": False},
+        "metadata": metadata,
+        "capabilities": {
+            "resolve": True,
+            "listTargets": True,
+            "materialize": any(
+                str(item.get("kind") or "").startswith("attachment:")
+                for item in targets
+            ),
+        },
+    }
+
+
+def list_targets(target: str, context: dict[str, Any]) -> dict[str, Any]:
     from .discord import list_discord_message_targets, parse_discord_url
 
     parsed = parse_discord_url(target)
     if not isinstance(parsed, dict):
-        return []
-    return list_discord_message_targets(
+        return _discord_listing_envelope(
+            target=target,
+            kind="unknown",
+            targets=[],
+            parsed=None,
+        )
+    items = list_discord_message_targets(
         target,
         parsed,
         use_cache=bool(context.get("use_cache", True)),
         cache_ttl=context.get("cache_ttl"),
         refresh_cache=bool(context.get("refresh_cache", False)),
+    )
+    if parsed.get("kind") != "message":
+        return _discord_listing_envelope(
+            target=target,
+            kind=str(parsed.get("kind") or "target"),
+            targets=items,
+            parsed=parsed,
+        )
+    return _discord_listing_envelope(
+        target=target,
+        kind="message",
+        targets=items,
+        parsed=parsed,
     )
 
 

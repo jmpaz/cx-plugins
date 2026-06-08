@@ -135,10 +135,21 @@ def collect_cli_overrides(
     return {"media": media} if media else None
 
 
-def list_targets(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
+def list_targets(target: str, context: dict[str, Any]) -> dict[str, Any]:
     from .whatsapp import list_whatsapp_targets
 
-    return list_whatsapp_targets(target)
+    items = list_whatsapp_targets(target)
+    return {
+        "targets": items,
+        "summary": {"targetCount": len(items)},
+        "pagination": {"returned": len(items), "totalCount": len(items), "hasMore": False},
+        "metadata": {"provider": PLUGIN_NAME, "target": target},
+        "capabilities": {
+            "resolve": True,
+            "listTargets": True,
+            "materialize": False,
+        },
+    }
 
 
 def _render_documents(

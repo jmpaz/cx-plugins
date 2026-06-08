@@ -21,6 +21,12 @@ from cx_plugins.providers.arena.plugin import (
 )
 
 
+def _listed_targets(result: dict) -> list[dict]:
+    assert isinstance(result, dict)
+    assert isinstance(result.get("targets"), list)
+    return result["targets"]
+
+
 def test_apply_channel_safety_defaults_caps_explicit_rich_media_channel() -> None:
     overrides = _arena_runtime_overrides({"block": {"pdf-content": True}})
     settings = ArenaSettings(include_pdf_content=True)
@@ -136,6 +142,15 @@ def test_collect_cli_overrides_builds_arena_mapping() -> None:
             "123",
             "https://www.are.na/channel/skip-two",
         ],
+    }
+
+
+def test_arena_runtime_overrides_accepts_resolution_mode_aliases() -> None:
+    assert _arena_runtime_overrides({"resolution-mode": "digest"}) == {
+        "resolution_mode": "digest"
+    }
+    assert _arena_runtime_overrides({"resolutionMode": "rich-top-level"}) == {
+        "resolution_mode": "richTopLevel"
     }
 
 
@@ -550,22 +565,29 @@ def test_list_targets_expands_user_channels_and_applies_exclusions(monkeypatch) 
 
     monkeypatch.setattr(arena, "_fetch_owner_channel_page", _fetch_owner_channel_page)
 
-    items = arena_plugin.list_targets(
+    listing = arena_plugin.list_targets(
         "arena:user:alice",
         {
             "use_cache": False,
             "overrides": {"arena": {"exclude-channels": ["skip"]}},
         },
     )
+    items = _listed_targets(listing)
 
     assert items == [
         {
             "target": "https://www.are.na/channel/keep",
             "label": "Keep",
             "kind": "channel",
+            "traverse": False,
             "metadata": {"owner_kind": "user", "owner_slug": "alice"},
         }
     ]
+    assert listing["summary"] == {
+        "owner": {"kind": "user", "slug": "alice"},
+        "channelCount": 1,
+    }
+    assert listing["metadata"]["provider"] == "arena"
 
 
 def test_list_targets_channel_exposes_child_blocks(monkeypatch) -> None:
@@ -581,10 +603,11 @@ def test_list_targets_channel_exposes_child_blocks(monkeypatch) -> None:
         ),
     )
 
-    items = arena_plugin.list_targets(
+    listing = arena_plugin.list_targets(
         "https://www.are.na/channel/root",
         {"use_cache": False},
     )
+    items = _listed_targets(listing)
 
     assert items == [
         {
@@ -604,6 +627,7 @@ def test_list_targets_channel_exposes_child_blocks(monkeypatch) -> None:
             "target": "https://www.are.na/channel/nested",
             "label": "Nested",
             "kind": "channel",
+            "traverse": False,
             "metadata": {
                 "relation": "contains",
                 "block_id": 200,
@@ -616,6 +640,12 @@ def test_list_targets_channel_exposes_child_blocks(monkeypatch) -> None:
             },
         },
     ]
+    assert listing["summary"]["channel"]["slug"] == "root"
+    assert listing["summary"]["typeBreakdown"] == [
+        {"type": "Channel", "count": 1},
+        {"type": "Text", "count": 1},
+    ]
+    assert listing["pagination"] == {"returned": 2, "totalCount": 2, "hasMore": False}
 
 
 def test_arena_digest_returns_channel_overview(monkeypatch) -> None:
@@ -648,6 +678,56 @@ def test_arena_digest_returns_channel_overview(monkeypatch) -> None:
         {"type": "Text", "count": 1},
     ]
     assert digest["sampledItems"][0]["target"] == "https://www.are.na/block/100"
+
+
+def test_resolve_channel_digest_mode_returns_overview_document(monkeypatch) -> None:
+    monkeypatch.setattr(
+        arena,
+        "resolve_channel",
+        lambda slug, **_kwargs: (
+            _channel(slug, 1, "Root", 4),
+            [
+                ("root", _text_block(100)),
+                ("root", _channel("nested", 200, "Nested", 0)),
+            ],
+        ),
+    )
+
+    docs = arena_plugin.resolve(
+        "https://www.are.na/channel/root",
+        {
+            "use_cache": False,
+            "overrides": {"arena": {"resolution-mode": "digest"}},
+        },
+    )
+
+    assert len(docs) == 1
+    assert docs[0]["label"] == "Root digest"
+    assert docs[0]["metadata"]["resolution_mode"] == "digest"
+    assert "# Root" in docs[0]["content"]
+    assert "## Sampled Targets" in docs[0]["content"]
+    assert "https://www.are.na/block/100" in docs[0]["content"]
+
+
+def test_resolve_channel_rich_top_level_mode_sets_depth_zero(monkeypatch) -> None:
+    captured: dict[str, ArenaSettings] = {}
+
+    def _resolve_channel(slug, **kwargs):
+        captured["settings"] = kwargs["settings"]
+        return _channel(slug, 1, "Root", 0), []
+
+    monkeypatch.setattr(arena, "resolve_channel", _resolve_channel)
+
+    docs = arena_plugin.resolve(
+        "https://www.are.na/channel/root",
+        {
+            "use_cache": False,
+            "overrides": {"arena": {"resolution-mode": "richTopLevel"}},
+        },
+    )
+
+    assert docs
+    assert captured["settings"].max_depth == 0
 
 
 def test_arena_targets_includes_containing_channel_for_block(monkeypatch) -> None:
@@ -702,6 +782,7 @@ def test_arena_targets_includes_containing_channel_for_block(monkeypatch) -> Non
             "target": "https://www.are.na/channel/container",
             "label": "Container",
             "kind": "channel",
+            "traverse": False,
             "metadata": {
                 "relation": "contained_by",
                 "source_target": "https://www.are.na/block/335",
@@ -740,10 +821,11 @@ def test_list_targets_block_exposes_structured_children(monkeypatch) -> None:
         },
     )
 
-    items = arena_plugin.list_targets(
+    listing = arena_plugin.list_targets(
         "https://www.are.na/block/335",
         {"use_cache": False},
     )
+    items = _listed_targets(listing)
 
     assert items == [
         {
@@ -782,6 +864,13 @@ def test_list_targets_block_exposes_structured_children(monkeypatch) -> None:
             },
         },
     ]
+    assert listing["summary"]["block"]["target"] == "https://www.are.na/block/335"
+    assert listing["pagination"] == {"returned": 4, "totalCount": 4, "hasMore": False}
+    assert listing["capabilities"] == {
+        "resolve": True,
+        "listTargets": True,
+        "materialize": True,
+    }
 
 
 def test_list_targets_reuses_channel_block_for_structured_children(monkeypatch) -> None:
@@ -809,14 +898,14 @@ def test_list_targets_reuses_channel_block_for_structured_children(monkeypatch) 
         lambda block_id: pytest.fail(f"unexpected block fetch: {block_id}"),
     )
 
-    channel_items = arena_plugin.list_targets(
+    channel_items = _listed_targets(arena_plugin.list_targets(
         "https://www.are.na/channel/root",
         {"use_cache": False},
-    )
-    block_items = arena_plugin.list_targets(
+    ))
+    block_items = _listed_targets(arena_plugin.list_targets(
         "https://www.are.na/block/335",
         {"use_cache": False},
-    )
+    ))
 
     assert channel_items[0]["target"] == "https://www.are.na/block/335"
     assert block_items[0]["target"] == "https://www.are.na/block/335?attachment=paper.pdf"
@@ -861,14 +950,14 @@ def test_channel_listed_attachment_materialize_reuses_cached_block(
         _download,
     )
 
-    channel_items = arena_plugin.list_targets(
+    channel_items = _listed_targets(arena_plugin.list_targets(
         "https://www.are.na/channel/root",
         {"use_cache": False},
-    )
-    block_items = arena_plugin.list_targets(
+    ))
+    block_items = _listed_targets(arena_plugin.list_targets(
         channel_items[0]["target"],
         {"use_cache": False},
-    )
+    ))
     files = arena_plugin.materialize(block_items[0]["target"], {"use_cache": False})
 
     assert files[0]["content"] == b"cached attachment text"
@@ -1427,10 +1516,11 @@ def test_list_targets_bare_profile_url_falls_back_to_group(monkeypatch) -> None:
 
     monkeypatch.setattr(arena, "_fetch_owner_channel_page", _fetch_owner_channel_page)
 
-    items = arena_plugin.list_targets(
+    listing = arena_plugin.list_targets(
         "https://www.are.na/media-working-group",
         {"use_cache": False},
     )
+    items = _listed_targets(listing)
 
     assert calls == ["user", "group"]
     assert items == [
@@ -1438,12 +1528,17 @@ def test_list_targets_bare_profile_url_falls_back_to_group(monkeypatch) -> None:
             "target": "https://www.are.na/channel/root",
             "label": "Root",
             "kind": "channel",
+            "traverse": False,
             "metadata": {
                 "owner_kind": "group",
                 "owner_slug": "media-working-group",
             },
         }
     ]
+    assert listing["summary"] == {
+        "owner": {"kind": "group", "slug": "media-working-group"},
+        "channelCount": 1,
+    }
 
 
 def test_explicit_user_target_does_not_fallback_to_group(monkeypatch) -> None:
