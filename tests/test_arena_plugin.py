@@ -800,6 +800,51 @@ def test_arena_targets_includes_containing_channel_for_block(monkeypatch) -> Non
     ]
 
 
+def test_arena_inspect_block_exposes_containing_channels(monkeypatch) -> None:
+    monkeypatch.setattr(arena, "_fetch_block", lambda block_id: _text_block(block_id))
+    monkeypatch.setattr(
+        arena,
+        "_fetch_block_connections",
+        lambda block_id, **_kwargs: (
+            [
+                {
+                    "id": 5,
+                    "slug": "container",
+                    "title": "Container",
+                    "owner": {"id": 2, "slug": "bob", "name": "Bob"},
+                }
+            ],
+            False,
+        ),
+    )
+
+    descriptor = arena_plugin.classify_target(
+        "https://www.are.na/block/335",
+        {"use_cache": False},
+    )
+
+    assert descriptor is not None
+    assert descriptor["kind"] == "block"
+    assert descriptor["metadata"]["block_id"] == 335
+    assert descriptor["relations"] == [
+        {
+            "target": "https://www.are.na/channel/container",
+            "label": "Container",
+            "kind": "channel",
+            "traverse": False,
+            "metadata": {
+                "relation": "contained_by",
+                "source_target": "https://www.are.na/block/335",
+                "source_block_id": 335,
+                "source_block_type": "Text",
+                "channel_id": 5,
+                "channel_slug": "container",
+                "owner": {"id": 2, "slug": "bob", "name": "Bob"},
+            },
+        }
+    ]
+
+
 def test_list_targets_block_exposes_structured_children(monkeypatch) -> None:
     monkeypatch.setattr(
         arena,

@@ -23,6 +23,175 @@ def test_parse_discord_url_supports_attachment_selectors() -> None:
     assert parsed["attachment_name"] == "notes.json"
 
 
+def test_discord_inspect_classifies_thread_and_container_relations(monkeypatch) -> None:
+    channels = {
+        "20": {"id": "20", "type": 11, "name": "in-game music", "parent_id": "10"},
+        "10": {"id": "10", "type": 0, "name": "music", "parent_id": "5"},
+        "5": {"id": "5", "type": 4, "name": "Projects"},
+    }
+    monkeypatch.setattr(
+        discord,
+        "_fetch_channel",
+        lambda channel_id, **_kwargs: channels[channel_id],
+    )
+    monkeypatch.setattr(
+        discord,
+        "_fetch_guild",
+        lambda guild_id, **_kwargs: {"id": guild_id, "name": "deep"},
+    )
+
+    descriptor = discord_plugin.classify_target(
+        "https://discord.com/channels/1/20",
+        {"use_cache": False},
+    )
+
+    assert descriptor is not None
+    assert descriptor["kind"] == "thread"
+    assert descriptor["metadata"]["channel_name"] == "in-game music"
+    assert [item["metadata"]["relation"] for item in descriptor["relations"]] == [
+        "contained_by",
+        "contained_by",
+        "contained_by",
+    ]
+    assert descriptor["relations"][0]["kind"] == "guild"
+    assert descriptor["relations"][0]["label"] == "deep"
+    assert descriptor["relations"][1]["target"] == "https://discord.com/channels/1/10"
+    assert descriptor["relations"][1]["label"] == "#music"
+    assert descriptor["relations"][2]["kind"] == "category"
+    assert descriptor["relations"][2]["label"] == "Projects"
+
+
+def test_discord_inspect_message_exposes_started_thread(monkeypatch) -> None:
+    monkeypatch.setattr(
+        discord,
+        "_fetch_channel",
+        lambda channel_id, **_kwargs: {
+            "id": channel_id,
+            "type": 0,
+            "name": "projects",
+        },
+    )
+    monkeypatch.setattr(
+        discord,
+        "_fetch_guild",
+        lambda guild_id, **_kwargs: {"id": guild_id, "name": "deep"},
+    )
+    monkeypatch.setattr(
+        discord,
+        "_fetch_message",
+        lambda *_args, **_kwargs: {
+            "id": "3",
+            "thread": {"id": "30", "name": "untitled godot game(s)"},
+        },
+    )
+
+    descriptor = discord_plugin.classify_target(
+        "https://discord.com/channels/1/2/3",
+        {"use_cache": False},
+    )
+
+    assert descriptor is not None
+    started = [
+        item
+        for item in descriptor["relations"]
+        if item["metadata"]["relation"] == "starts_thread"
+    ]
+    assert started == [
+        {
+            "target": "https://discord.com/channels/1/30",
+            "label": "untitled godot game(s)",
+            "kind": "thread",
+            "traverse": True,
+            "metadata": {
+                "relation": "starts_thread",
+                "source_target": "https://discord.com/channels/1/2/3",
+                "guild_id": "1",
+                "channel_id": "30",
+                "parent_channel_id": "2",
+                "thread_name": "untitled godot game(s)",
+            },
+        }
+    ]
+
+
+def test_discord_guild_listing_exposes_categories_and_channels(monkeypatch) -> None:
+    monkeypatch.setattr(
+        discord,
+        "_fetch_guild_channels",
+        lambda guild_id, **_kwargs: [
+            {"id": "5", "type": 4, "name": "Projects", "position": 1},
+            {
+                "id": "10",
+                "type": 0,
+                "name": "music",
+                "parent_id": "5",
+                "position": 2,
+            },
+            {"id": "11", "type": 15, "name": "ideas", "position": 3},
+            {"id": "12", "type": 2, "name": "voice", "position": 4},
+        ],
+    )
+
+    listing = discord_plugin.list_targets(
+        "https://discord.com/channels/1",
+        {"use_cache": False},
+    )
+
+    assert listing["targets"] == [
+        {
+            "target": "https://discord.com/channels/1/5",
+            "label": "Projects",
+            "kind": "category",
+            "traverse": False,
+            "metadata": {
+                "relation": "contains",
+                "source_target": "https://discord.com/channels/1",
+                "guild_id": "1",
+                "category_id": "5",
+                "category_name": "Projects",
+                "position": 1,
+            },
+        },
+        {
+            "target": "https://discord.com/channels/1/10",
+            "label": "#music",
+            "kind": "channel",
+            "traverse": False,
+            "metadata": {
+                "relation": "contains",
+                "source_target": "https://discord.com/channels/1",
+                "guild_id": "1",
+                "channel_id": "10",
+                "channel_name": "music",
+                "channel_type": 0,
+                "parent_channel_id": "5",
+                "position": 2,
+                "category_id": "5",
+                "category_name": "Projects",
+            },
+        },
+        {
+            "target": "https://discord.com/channels/1/11",
+            "label": "#ideas",
+            "kind": "forum",
+            "traverse": False,
+            "metadata": {
+                "relation": "contains",
+                "source_target": "https://discord.com/channels/1",
+                "guild_id": "1",
+                "channel_id": "11",
+                "channel_name": "ideas",
+                "channel_type": 15,
+                "position": 3,
+                "category_id": None,
+                "category_name": None,
+            },
+        },
+    ]
+    assert listing["summary"]["categoryCount"] == 1
+    assert listing["summary"]["channelCount"] == 2
+
+
 def test_discord_message_listing_exposes_attachments_and_links(monkeypatch) -> None:
     monkeypatch.setattr(
         discord,

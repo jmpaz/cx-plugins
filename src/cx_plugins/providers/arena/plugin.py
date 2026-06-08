@@ -442,12 +442,24 @@ def can_resolve(target: str, context: dict[str, Any]) -> bool:
 
 def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | None:
     from .arena import (
+        _fetch_block,
+        build_arena_settings,
+        extract_block_id,
+        extract_channel_slug,
         is_arena_block_attachment_url,
         is_arena_block_url,
         is_arena_channel_url,
         is_arena_group_target,
         is_arena_user_target,
+        resolve_channel,
+        warmup_arena_network_stack,
     )
+
+    arena_overrides = _arena_overrides(context)
+    settings = build_arena_settings(arena_overrides)
+    use_cache = bool(context.get("use_cache", True))
+    cache_ttl = context.get("cache_ttl")
+    refresh_cache = bool(context.get("refresh_cache", False))
 
     if is_arena_block_attachment_url(target):
         return {
@@ -455,27 +467,76 @@ def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | No
             "kind": "attachment",
             "is_external": True,
             "group_key": "attachment",
+            "capabilities": {"resolve": True, "listTargets": False, "materialize": True},
         }
     if is_arena_channel_url(target):
-        return {
+        descriptor: dict[str, Any] = {
             "provider": PLUGIN_NAME,
             "kind": "channel",
             "is_external": True,
             "group_key": "channel",
+            "capabilities": {"resolve": True, "listTargets": True, "materialize": False},
         }
+        slug = extract_channel_slug(target)
+        if slug:
+            descriptor["metadata"] = {"channel_slug": slug}
+            try:
+                settings = _apply_channel_safety_defaults(settings, arena_overrides)
+                warmup_arena_network_stack()
+                channel_meta, _flat_blocks = resolve_channel(
+                    slug,
+                    use_cache=use_cache,
+                    cache_ttl=cache_ttl,
+                    refresh_cache=refresh_cache,
+                    settings=settings,
+                )
+                descriptor["metadata"]["channel"] = _channel_summary(channel_meta)
+                channel_block = dict(channel_meta) if isinstance(channel_meta, dict) else {}
+                channel_block.setdefault("type", "Channel")
+                channel_block.setdefault("base_type", "Channel")
+                channel_block.setdefault("slug", slug)
+                descriptor["relations"] = _containing_channel_targets(
+                    channel_block,
+                    source_target=_channel_target(slug),
+                    settings=settings,
+                )
+            except Exception as exc:
+                descriptor["error"] = f"{exc.__class__.__name__}: {exc}"
+        return descriptor
     if is_arena_block_url(target):
-        return {
+        descriptor = {
             "provider": PLUGIN_NAME,
             "kind": "block",
             "is_external": True,
             "group_key": "block",
+            "capabilities": {"resolve": True, "listTargets": True, "materialize": False},
         }
+        block_id = extract_block_id(target)
+        if block_id is not None:
+            descriptor["metadata"] = {"block_id": block_id}
+            try:
+                block = _cached_block_for_target(target) or _fetch_block(block_id)
+                descriptor["metadata"]["block"] = _block_target_summary(
+                    block,
+                    channel_path="",
+                    source_channel=target,
+                    relation="self",
+                )
+                descriptor["relations"] = _containing_channel_targets(
+                    block,
+                    source_target=target,
+                    settings=settings,
+                )
+            except Exception as exc:
+                descriptor["error"] = f"{exc.__class__.__name__}: {exc}"
+        return descriptor
     if is_arena_user_target(target):
         return {
             "provider": PLUGIN_NAME,
             "kind": "user",
             "is_external": True,
             "group_key": "user",
+            "capabilities": {"resolve": True, "listTargets": True, "materialize": False},
         }
     if is_arena_group_target(target):
         return {
@@ -483,6 +544,7 @@ def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | No
             "kind": "group",
             "is_external": True,
             "group_key": "group",
+            "capabilities": {"resolve": True, "listTargets": True, "materialize": False},
         }
     return None
 
