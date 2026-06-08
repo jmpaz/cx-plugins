@@ -1767,6 +1767,7 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
     )
 
     arena_overrides = _arena_overrides(context)
+    resolution_mode = _arena_resolution_mode(arena_overrides)
     settings = build_arena_settings(arena_overrides)
     settings_key = _settings_key(settings)
     use_cache = bool(context.get("use_cache", True))
