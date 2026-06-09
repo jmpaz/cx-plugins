@@ -19,6 +19,7 @@ This package provides the following plugins:
 | `atproto` | [AT Protocol](https://atproto.com/docs) | posts, profiles, lists, starter packs |
 | `discord` | Discord | messages, threads, channels |
 | `googledocs` | Google Docs public export | public documents |
+| `itchio` | [itch.io](https://itch.io/) | game/software pages, profiles, collections |
 | `soundcloud` | SoundCloud | tracks, playlists, profiles |
 | `snipd` | Snipd | public shared snips |
 | `wikipedia` | Wikipedia | article pages |

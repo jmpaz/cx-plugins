@@ -1,0 +1,1 @@
+"""itch.io provider plugin."""
