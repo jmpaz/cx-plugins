@@ -15,6 +15,8 @@ from contextualize.render.text import process_text
 from contextualize.references.helpers import parse_timestamp_or_duration
 from contextualize.utils import count_tokens
 
+from ..shared.progress import record_progress
+
 _AT_URI_RE = re.compile(
     r"^at://(?P<repo>[^/?#]+)"
     r"(?:/(?P<collection>[^/?#]+)"
@@ -3518,7 +3520,15 @@ def resolve_atproto_url(
         cached_docs = _documents_from_cached_payload(cached_payload)
         if cached_docs is not None:
             _log(f"  atproto resolution cache hit: {url}")
+            record_progress(
+                "atproto",
+                "resolution",
+                "cache_hit",
+                target=url,
+                count=len(cached_docs),
+            )
             return cached_docs
+        record_progress("atproto", "resolution", "cache_miss", target=url)
 
     target = _canonicalize_target(
         parsed,
@@ -3578,6 +3588,13 @@ def resolve_atproto_url(
 
     if use_cache:
         store_api_json(cache_identity, [asdict(document) for document in documents])
+    record_progress(
+        "atproto",
+        "resolution",
+        "processed",
+        target=url,
+        count=len(documents),
+    )
     return documents
 
 

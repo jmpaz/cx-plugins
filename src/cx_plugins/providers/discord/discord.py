@@ -21,6 +21,8 @@ from contextualize.references.helpers import (
 from contextualize.render.text import process_text
 from contextualize.utils import count_tokens
 
+from ..shared.progress import record_progress
+
 _DISCORD_MESSAGE_RE = re.compile(
     r"^https?://(?:ptb\.|canary\.)?discord(?:app)?\.com/channels/"
     r"(?P<guild_id>[^/]+)/(?P<channel_id>\d+)/(?P<message_id>\d+)"
@@ -3981,6 +3983,13 @@ def resolve_discord_url(
         cached_documents = _documents_from_cached_payload(cached_payload)
         if cached_documents is not None:
             _log(f"  Discord resolution cache hit: {url}")
+            record_progress(
+                "discord",
+                "resolution",
+                "cache_hit",
+                target=url,
+                count=len(cached_documents),
+            )
             expected_trace_path = _document_trace_path(
                 guild_id=parsed.get("guild_id", ""),
                 channel_id=parsed.get("channel_id", ""),
@@ -3994,6 +4003,7 @@ def resolve_discord_url(
                 else doc
                 for doc in cached_documents
             ]
+        record_progress("discord", "resolution", "cache_miss", target=url)
 
     if parsed["kind"] == "message":
         documents = _resolve_message_url(
@@ -4019,6 +4029,13 @@ def resolve_discord_url(
             resolution_cache_identity,
             [asdict(document) for document in documents],
         )
+    record_progress(
+        "discord",
+        "resolution",
+        "processed",
+        target=url,
+        count=len(documents),
+    )
     return documents
 
 
@@ -4563,6 +4580,24 @@ def materialize_discord_attachment_target(
     if cache_only:
         content = get_cached_media_bytes(media_cache_identity)
     else:
+        def on_media_cache_hit(_identity: str) -> None:
+            _log(f"  discord media cache hit: {cache_label}")
+            record_progress(
+                "discord",
+                "media",
+                "cache_hit",
+                target=cache_label,
+            )
+
+        def on_media_cache_miss(_identity: str) -> None:
+            _log(f"  discord media cache miss: {cache_label}")
+            record_progress(
+                "discord",
+                "media",
+                "cache_miss",
+                target=cache_label,
+            )
+
         tmp = download_cached_media_to_temp(
             attachment_url,
             suffix=suffix,
@@ -4571,12 +4606,8 @@ def materialize_discord_attachment_target(
             get_cached_media_bytes=get_cached_media_bytes,
             store_media_bytes=store_media_bytes,
             refresh_cache=refresh_cache or get_refresh_media(),
-            on_cache_hit=lambda _identity: _log(
-                f"  discord media cache hit: {cache_label}"
-            ),
-            on_cache_miss=lambda _identity: _log(
-                f"  discord media cache miss: {cache_label}"
-            ),
+            on_cache_hit=on_media_cache_hit,
+            on_cache_miss=on_media_cache_miss,
         )
         if tmp is not None:
             try:

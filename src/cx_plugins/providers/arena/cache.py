@@ -19,6 +19,7 @@ from ..shared.cache import (
     write_mtime_text,
     write_text_entry,
 )
+from ..shared.progress import record_progress
 
 ARENA_CACHE_ROOT = provider_cache_root("CONTEXTUALIZE_ARENA_CACHE", "arena")
 BLOCK_CACHE_ROOT = ARENA_CACHE_ROOT / "blocks"
@@ -73,10 +74,17 @@ def get_cached_block_render(
     updated_at: str,
     render_variant: str | None = None,
 ) -> str | None:
-    return read_keyed_text(
+    cached = read_keyed_text(
         BLOCK_CACHE_ROOT,
         _block_render_identity(block_id, updated_at, render_variant),
     )
+    record_progress(
+        "arena",
+        "block-render",
+        "cache_hit" if cached is not None else "cache_miss",
+        target=str(block_id),
+    )
+    return cached
 
 
 def store_block_render(
@@ -90,44 +98,68 @@ def store_block_render(
         _block_render_identity(block_id, updated_at, render_variant),
         rendered,
     )
+    record_progress("arena", "block-render", "processed", target=str(block_id))
 
 
 def get_cached_block_comments(
     block_id: int,
     ttl: timedelta | None = None,
 ) -> str | None:
-    return read_mtime_text(
+    cached = read_mtime_text(
         COMMENTS_CACHE_ROOT,
         str(block_id),
         ttl=DEFAULT_TTL if ttl is None else ttl,
     )
+    record_progress(
+        "arena",
+        "block-comments",
+        "cache_hit" if cached is not None else "cache_miss",
+        target=str(block_id),
+    )
+    return cached
 
 
 def store_block_comments(block_id: int, rendered: str) -> None:
     write_mtime_text(COMMENTS_CACHE_ROOT, str(block_id), rendered)
+    record_progress("arena", "block-comments", "processed", target=str(block_id))
 
 
 def get_cached_block_connections(
     identity: str,
     ttl: timedelta | None = None,
 ) -> str | None:
-    return read_mtime_text(
+    cached = read_mtime_text(
         CONNECTIONS_CACHE_ROOT,
         cache_key(identity),
         ttl=DEFAULT_TTL if ttl is None else ttl,
     )
+    record_progress(
+        "arena",
+        "block-connections",
+        "cache_hit" if cached is not None else "cache_miss",
+    )
+    return cached
 
 
 def store_block_connections(identity: str, rendered: str) -> None:
     write_mtime_text(CONNECTIONS_CACHE_ROOT, cache_key(identity), rendered)
+    record_progress("arena", "block-connections", "processed")
 
 
 def get_cached_media_bytes(identity: str) -> bytes | None:
-    return _get_cached_media_bytes(MEDIA_CACHE_ROOT, identity)
+    cached = _get_cached_media_bytes(MEDIA_CACHE_ROOT, identity)
+    record_progress(
+        "arena",
+        "media",
+        "cache_hit" if cached is not None else "cache_miss",
+        size_bytes=len(cached) if cached is not None else None,
+    )
+    return cached
 
 
 def store_media_bytes(identity: str, content: bytes) -> None:
     _store_media_bytes(MEDIA_CACHE_ROOT, identity, content)
+    record_progress("arena", "media", "processed", size_bytes=len(content))
 
 
 def _read_user_token_payload() -> tuple[dict[str, Any], dict[str, Any]] | None:

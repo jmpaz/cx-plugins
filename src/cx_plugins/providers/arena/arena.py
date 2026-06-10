@@ -17,6 +17,8 @@ from contextualize.references.helpers import parse_timestamp_or_duration
 from contextualize.render.text import process_text
 from contextualize.utils import count_tokens
 
+from ..shared.progress import record_progress
+
 _ARENA_CHANNEL_RE = re.compile(
     r"^https?://(?:www\.)?are\.na/"
     r"(?:channel/(?P<slug1>[^/?#]+)"
@@ -3179,7 +3181,15 @@ def resolve_channel(
             flat = _limit_flat_blocks(flat, settings)
             channel_title = metadata.get("title") or slug
             _log(f"  using cached channel: {channel_title} ({len(flat)} items)")
+            record_progress(
+                "arena",
+                "channel",
+                "cache_hit",
+                target=str(channel_title),
+                count=len(flat),
+            )
             return metadata, flat
+        record_progress("arena", "channel", "cache_miss", target=slug)
 
     metadata, contents = _fetch_all_channel_contents(
         slug,
@@ -3207,6 +3217,13 @@ def resolve_channel(
         )
         block_count = len([b for _, b in flat_unsorted if b.get("type") != "Channel"])
         store_channel(cache_key, data, block_count)
+    record_progress(
+        "arena",
+        "channel",
+        "processed",
+        target=str(metadata.get("title") or slug),
+        count=len(flat),
+    )
 
     return metadata, flat
 

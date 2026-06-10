@@ -19,6 +19,7 @@ from cx_plugins.providers.arena.plugin import (
     collect_cli_overrides,
     register_cli_options,
 )
+from contextualize.progress import progress_summary_lines, reset_progress
 
 
 def _listed_targets(result: dict) -> list[dict]:
@@ -72,6 +73,22 @@ def test_apply_channel_safety_defaults_ignores_implicit_media_default() -> None:
 
     assert unchanged is settings
     assert unchanged.max_blocks_per_channel is None
+
+
+def test_resolve_channel_records_cached_channel_progress(monkeypatch) -> None:
+    reset_progress()
+    payload = '{"metadata":{"title":"Cached Channel"},"blocks":[]}'
+    monkeypatch.setattr(
+        "cx_plugins.providers.arena.cache.get_cached_channel",
+        lambda *_args, **_kwargs: payload,
+    )
+
+    metadata, flat = resolve_channel("cached-channel")
+
+    assert metadata == {"title": "Cached Channel"}
+    assert flat == []
+    assert "  arena channel: cache_hit=1" in progress_summary_lines()
+    reset_progress()
 
 
 def test_register_cli_options_exposes_arena_controls() -> None:
