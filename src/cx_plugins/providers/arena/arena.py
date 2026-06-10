@@ -1261,8 +1261,7 @@ def _fetch_all_channel_contents(
     effective_max_blocks = _stricter_limit(max_blocks_per_channel, recurse_block_count)
 
     indent = "  " * (_depth + 1)
-    total_count = (metadata.get("counts") or {}).get("contents") or "?"
-    _log(f"{indent}fetching channel: {channel_title} ({total_count} items)")
+    _log(f"{indent}fetching channel: {channel_title}")
 
     all_contents: list[dict] = []
     first_page = _fetch_channel_page(slug, 1)
@@ -3290,7 +3289,7 @@ def resolve_channel(
             flat = _filter_flat_blocks(flat, settings)
             flat = _limit_flat_blocks(flat, settings)
             channel_title = metadata.get("title") or slug
-            _log(f"  using cached channel: {channel_title} ({len(flat)} items)")
+            _log(f"  using cached channel: {channel_title}")
             record_progress(
                 "arena",
                 "channel",
