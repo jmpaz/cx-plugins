@@ -41,6 +41,76 @@ _OEMBED_LINK_PAYLOAD = {
     "provider_url": "https://x.com",
 }
 
+_QUOTE_PARENT_PAYLOAD = {
+    "url": "https://x.com/jack/status/20",
+    "author_name": "jack",
+    "author_url": "https://x.com/jack",
+    "html": (
+        '<blockquote class="twitter-tweet">'
+        '<p lang="en" dir="ltr">'
+        'look at this <a href="https://t.co/quote">https://t.co/quote</a>'
+        "</p>"
+        '&mdash; jack (@jack) '
+        '<a href="https://x.com/jack/status/20?ref_src=twsrc%5Etfw">'
+        "March 21, 2006</a>"
+        "</blockquote>"
+    ),
+    "provider_name": "X",
+    "provider_url": "https://x.com",
+}
+
+_QUOTE_CHILD_PAYLOAD = {
+    "url": "https://x.com/quoted/status/222",
+    "author_name": "quoted",
+    "author_url": "https://x.com/quoted",
+    "html": (
+        '<blockquote class="twitter-tweet">'
+        '<p lang="en" dir="ltr">quoted tweet body</p>'
+        '&mdash; quoted (@quoted) '
+        '<a href="https://x.com/quoted/status/222?ref_src=twsrc%5Etfw">'
+        "March 20, 2006</a>"
+        "</blockquote>"
+    ),
+    "provider_name": "X",
+    "provider_url": "https://x.com",
+}
+
+_CYCLE_PARENT_PAYLOAD = {
+    "url": "https://x.com/jack/status/30",
+    "author_name": "jack",
+    "author_url": "https://x.com/jack",
+    "html": (
+        '<blockquote class="twitter-tweet">'
+        '<p lang="en" dir="ltr">'
+        'parent <a href="https://t.co/to-child">https://t.co/to-child</a>'
+        "</p>"
+        '&mdash; jack (@jack) '
+        '<a href="https://x.com/jack/status/30?ref_src=twsrc%5Etfw">'
+        "March 21, 2006</a>"
+        "</blockquote>"
+    ),
+    "provider_name": "X",
+    "provider_url": "https://x.com",
+}
+
+_CYCLE_CHILD_PAYLOAD = {
+    "url": "https://x.com/quoted/status/40",
+    "author_name": "quoted",
+    "author_url": "https://x.com/quoted",
+    "html": (
+        '<blockquote class="twitter-tweet">'
+        '<p lang="en" dir="ltr">'
+        'child <a href="https://t.co/to-parent">https://t.co/to-parent</a>'
+        "</p>"
+        '&mdash; quoted (@quoted) '
+        '<a href="https://x.com/quoted/status/40?ref_src=twsrc%5Etfw">'
+        "March 20, 2006</a>"
+        "</blockquote>"
+    ),
+    "provider_name": "X",
+    "provider_url": "https://x.com",
+}
+
 _ALIAS_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -62,6 +132,39 @@ _ALIAS_HTML = """
   <body></body>
 </html>
 """
+
+
+def _frontmatter(rendered: str) -> dict[str, object]:
+    import yaml
+
+    end = rendered.find("\n---\n", 4)
+    assert end != -1
+    parsed = yaml.safe_load(rendered[4:end])
+    assert isinstance(parsed, dict)
+    return parsed
+
+
+def _body(rendered: str) -> str:
+    return rendered.split("\n---\n", 1)[1].split("\n***", 1)[0].strip()
+
+
+def _patch_oembed_payloads(
+    monkeypatch,
+    payloads: dict[str, dict[str, object]],
+) -> None:
+    def _fake_http_get_json(_url: str, *, params, timeout: int):
+        assert timeout == 30
+        return dict(payloads[params["url"]])
+
+    monkeypatch.setattr(xwitter, "_http_get_json", _fake_http_get_json)
+
+
+def _patch_redirects(monkeypatch, redirects: dict[str, str]) -> None:
+    def _fake_resolve_redirect(url: str, *, timeout: int) -> str:
+        assert timeout == 30
+        return redirects[url]
+
+    monkeypatch.setattr(xwitter, "_http_resolve_redirect", _fake_resolve_redirect)
 
 
 @pytest.mark.parametrize(
@@ -177,8 +280,128 @@ def test_resolve_xwitter_url_expands_tco_links_in_body_and_link_text(
     assert "- [https://trueurl.com/article](https://t.co/abc123)" in docs[0].rendered
 
 
+def test_resolve_xwitter_url_emits_nested_quote_documents(monkeypatch) -> None:
+    _patch_oembed_payloads(
+        monkeypatch,
+        {
+            "https://x.com/jack/status/20": _QUOTE_PARENT_PAYLOAD,
+            "https://x.com/quoted/status/222": _QUOTE_CHILD_PAYLOAD,
+        },
+    )
+    _patch_redirects(
+        monkeypatch,
+        {"https://t.co/quote": "https://twitter.com/quoted/status/222"},
+    )
+
+    docs = xwitter.resolve_xwitter_url(
+        "https://x.com/jack/status/20",
+        use_cache=False,
+    )
+
+    assert [doc.tweet_id for doc in docs] == ["20", "222"]
+    assert docs[0].label == "xwitter/jack/status/20"
+    assert docs[1].label == "xwitter/quoted/status/222"
+    frontmatter = _frontmatter(docs[0].rendered)
+    assert frontmatter["quoted_tweet_url"] == "https://x.com/quoted/status/222"
+    assert frontmatter["quoted_tweet_id"] == "222"
+    assert "look at this" in _body(docs[0].rendered)
+    assert "https://t.co/quote" not in _body(docs[0].rendered)
+    assert "https://x.com/quoted/status/222" not in _body(docs[0].rendered)
+    assert "## Links" not in docs[0].rendered
+    assert "quoted tweet body" in docs[1].rendered
+
+
+def test_quote_depth_zero_keeps_quote_as_normal_link(monkeypatch) -> None:
+    _patch_oembed_payloads(
+        monkeypatch,
+        {"https://x.com/jack/status/20": _QUOTE_PARENT_PAYLOAD},
+    )
+    _patch_redirects(
+        monkeypatch,
+        {"https://t.co/quote": "https://twitter.com/quoted/status/222"},
+    )
+
+    docs = xwitter.resolve_xwitter_url(
+        "https://x.com/jack/status/20",
+        settings=xwitter.build_xwitter_settings({"quote_depth": 0}),
+        use_cache=False,
+    )
+
+    assert [doc.tweet_id for doc in docs] == ["20"]
+    assert "quoted_tweet_id" not in _frontmatter(docs[0].rendered)
+    assert (
+        "look at this https://x.com/quoted/status/222"
+        in _body(docs[0].rendered)
+    )
+    assert (
+        "- [https://x.com/quoted/status/222](https://t.co/quote)"
+        in docs[0].rendered
+    )
+
+
+def test_failed_quote_fetch_falls_back_to_normal_link(monkeypatch) -> None:
+    def _fake_http_get_json(_url: str, *, params, timeout: int):
+        assert timeout == 30
+        if params["url"] == "https://x.com/jack/status/20":
+            return dict(_QUOTE_PARENT_PAYLOAD)
+        raise RuntimeError("quoted tweet unavailable")
+
+    monkeypatch.setattr(xwitter, "_http_get_json", _fake_http_get_json)
+    _patch_redirects(
+        monkeypatch,
+        {"https://t.co/quote": "https://twitter.com/quoted/status/222"},
+    )
+
+    docs = xwitter.resolve_xwitter_url(
+        "https://x.com/jack/status/20",
+        use_cache=False,
+    )
+
+    assert [doc.tweet_id for doc in docs] == ["20"]
+    assert "quoted_tweet_id" not in _frontmatter(docs[0].rendered)
+    assert (
+        "look at this https://x.com/quoted/status/222"
+        in _body(docs[0].rendered)
+    )
+    assert (
+        "- [https://x.com/quoted/status/222](https://t.co/quote)"
+        in docs[0].rendered
+    )
+
+
+def test_cyclic_quote_references_do_not_duplicate_documents(monkeypatch) -> None:
+    _patch_oembed_payloads(
+        monkeypatch,
+        {
+            "https://x.com/jack/status/30": _CYCLE_PARENT_PAYLOAD,
+            "https://x.com/quoted/status/40": _CYCLE_CHILD_PAYLOAD,
+        },
+    )
+    _patch_redirects(
+        monkeypatch,
+        {
+            "https://t.co/to-child": "https://twitter.com/quoted/status/40",
+            "https://t.co/to-parent": "https://twitter.com/jack/status/30",
+        },
+    )
+
+    docs = xwitter.resolve_xwitter_url(
+        "https://x.com/jack/status/30",
+        settings=xwitter.build_xwitter_settings({"quote_depth": 2}),
+        use_cache=False,
+    )
+
+    assert [doc.tweet_id for doc in docs] == ["30", "40"]
+    assert _frontmatter(docs[0].rendered)["quoted_tweet_id"] == "40"
+    assert _frontmatter(docs[1].rendered)["quoted_tweet_id"] == "30"
+
+
 def test_xwitter_plugin_emits_canonical_dedupe_metadata(monkeypatch) -> None:
-    monkeypatch.setattr(xwitter, "_http_get_json", lambda *_args, **_kwargs: _OEMBED_PAYLOAD)
+    monkeypatch.setattr(
+        xwitter,
+        "_http_get_json",
+        lambda *_args, **_kwargs: _OEMBED_PAYLOAD,
+    )
 
     result = xwitter_plugin.resolve(
         "https://fixupx.com/jack/status/20",

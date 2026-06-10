@@ -21,7 +21,12 @@ def normalize_manifest_config(
 
 def _xwitter_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
     result: dict[str, Any] = {}
-    for key in ("include_html", "use_alias_fallback", "resolve_tco_links"):
+    for key in (
+        "include_html",
+        "use_alias_fallback",
+        "resolve_tco_links",
+        "quote_depth",
+    ):
         if key in raw:
             result[key] = raw[key]
     for config_key, result_key in (
@@ -29,6 +34,7 @@ def _xwitter_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
         ("alias-fallback", "use_alias_fallback"),
         ("use-alias-fallback", "use_alias_fallback"),
         ("resolve-tco-links", "resolve_tco_links"),
+        ("quote-depth", "quote_depth"),
     ):
         if config_key in raw:
             result[result_key] = raw.get(config_key)

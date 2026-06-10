@@ -4,7 +4,7 @@ import json
 import os
 import re
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 from html import unescape
 from html.parser import HTMLParser
@@ -36,6 +36,7 @@ class XwitterSettings:
     include_html: bool = False
     use_alias_fallback: bool = True
     resolve_tco_links: bool = True
+    quote_depth: int = 1
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ class _TweetLink:
     href: str
     text: str | None
     resolved_url: str | None = None
+    quote_target: XwitterTarget | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +104,38 @@ def _normalize_bool_override(value: Any, *, field: str) -> bool:
     raise ValueError(f"{field} must be a boolean")
 
 
+def _parse_non_negative_int(value: str, *, default: int) -> int:
+    cleaned = value.strip()
+    if not cleaned:
+        return default
+    try:
+        parsed = int(cleaned)
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _normalize_non_negative_int_override(value: Any, *, field: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a non-negative integer")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"{field} must be >= 0")
+        return value
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned:
+            return 0
+        try:
+            parsed = int(cleaned)
+        except ValueError as exc:
+            raise ValueError(f"{field} must be a non-negative integer") from exc
+        if parsed < 0:
+            raise ValueError(f"{field} must be >= 0")
+        return parsed
+    raise ValueError(f"{field} must be a non-negative integer")
+
+
 def _xwitter_settings_from_env() -> XwitterSettings:
     return XwitterSettings(
         include_html=_parse_bool(
@@ -115,6 +149,10 @@ def _xwitter_settings_from_env() -> XwitterSettings:
         resolve_tco_links=_parse_bool(
             os.environ.get("XWITTER_RESOLVE_TCO_LINKS", ""),
             default=True,
+        ),
+        quote_depth=_parse_non_negative_int(
+            os.environ.get("XWITTER_QUOTE_DEPTH", ""),
+            default=1,
         ),
     )
 
@@ -141,19 +179,27 @@ def build_xwitter_settings(overrides: dict[str, Any] | None = None) -> XwitterSe
             overrides["resolve_tco_links"],
             field="resolve_tco_links",
         )
+    quote_depth = env.quote_depth
+    if "quote_depth" in overrides:
+        quote_depth = _normalize_non_negative_int_override(
+            overrides["quote_depth"],
+            field="quote_depth",
+        )
     return XwitterSettings(
         include_html=include_html,
         use_alias_fallback=use_alias_fallback,
         resolve_tco_links=resolve_tco_links,
+        quote_depth=quote_depth,
     )
 
 
 def xwitter_settings_cache_key(settings: XwitterSettings) -> tuple[Any, ...]:
     return (
-        "v2",
+        "v3",
         settings.include_html,
         settings.use_alias_fallback,
         settings.resolve_tco_links,
+        settings.quote_depth,
     )
 
 
@@ -241,11 +287,15 @@ def _documents_from_cached_payload(payload: Any) -> list[XwitterDocument] | None
 
 def _resolution_cache_identity(url: str, settings: XwitterSettings) -> str:
     payload = {
-        "v": 1,
+        "v": 2,
         "url": url,
         "settings": xwitter_settings_cache_key(settings),
     }
-    return "xwitter-resolve:" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return "xwitter-resolve:" + json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _http_get_json(url: str, *, params: dict[str, Any], timeout: int) -> dict[str, Any]:
@@ -459,9 +509,74 @@ def _resolve_tco_links(
                 href=link.href,
                 text=link.text,
                 resolved_url=final_url or link.resolved_url,
+                quote_target=link.quote_target,
             )
         )
     return tuple(resolved)
+
+
+def _xwitter_target_for_link(link: _TweetLink) -> XwitterTarget | None:
+    for candidate in (link.resolved_url, link.href):
+        if not candidate:
+            continue
+        parsed = parse_xwitter_target(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _annotate_quote_links(
+    links: tuple[_TweetLink, ...],
+    *,
+    current_tweet_id: str,
+    classify_quotes: bool,
+) -> tuple[_TweetLink, ...]:
+    annotated: list[_TweetLink] = []
+    for link in links:
+        target = _xwitter_target_for_link(link)
+        quote_target = None
+        if (
+            classify_quotes
+            and target is not None
+            and target.tweet_id != current_tweet_id
+        ):
+            quote_target = target
+        resolved_url = target.canonical_url if target is not None else link.resolved_url
+        annotated.append(
+            replace(
+                link,
+                resolved_url=resolved_url,
+                quote_target=quote_target,
+            )
+        )
+    return tuple(annotated)
+
+
+def _quote_targets_from_links(links: tuple[_TweetLink, ...]) -> list[XwitterTarget]:
+    targets: list[XwitterTarget] = []
+    seen: set[str] = set()
+    for link in links:
+        target = link.quote_target
+        if target is None or target.tweet_id in seen:
+            continue
+        seen.add(target.tweet_id)
+        targets.append(target)
+    return targets
+
+
+def _resolved_with_available_quotes(
+    resolved: _ResolvedTweet,
+    *,
+    available_tweet_ids: set[str],
+) -> _ResolvedTweet:
+    links: list[_TweetLink] = []
+    for link in resolved.links:
+        target = link.quote_target
+        if target is not None and target.tweet_id not in available_tweet_ids:
+            links.append(replace(link, quote_target=None))
+            continue
+        links.append(link)
+    return replace(resolved, links=tuple(links))
 
 
 def _tweet_text_with_resolved_links(
@@ -472,14 +587,20 @@ def _tweet_text_with_resolved_links(
         return tweet_text
     rendered = tweet_text
     for link in links:
+        candidates = [item for item in (link.text, link.href) if item]
+        if link.quote_target is not None:
+            for candidate in candidates:
+                if candidate in rendered:
+                    rendered = rendered.replace(candidate, "")
+                    break
+            continue
         if not link.resolved_url:
             continue
-        candidates = [item for item in (link.text, link.href) if item]
         for candidate in candidates:
             if candidate in rendered:
                 rendered = rendered.replace(candidate, link.resolved_url)
                 break
-    return rendered
+    return _clean_text(rendered)
 
 
 def _fetch_oembed(
@@ -489,6 +610,7 @@ def _fetch_oembed(
     use_cache: bool,
     cache_ttl: timedelta | None,
     refresh_cache: bool,
+    classify_quotes: bool,
 ) -> _ResolvedTweet:
     payload = _http_get_json(
         _OEMBED_ENDPOINT,
@@ -505,6 +627,11 @@ def _fetch_oembed(
         cache_ttl=cache_ttl,
         refresh_cache=refresh_cache,
     )
+    links = _annotate_quote_links(
+        links,
+        current_tweet_id=target.tweet_id,
+        classify_quotes=classify_quotes,
+    )
     canonical_url = payload.get("url")
     author_name = payload.get("author_name")
     author_url = payload.get("author_url")
@@ -516,7 +643,7 @@ def _fetch_oembed(
         else target.canonical_url,
         author_name=author_name if isinstance(author_name, str) else target.author,
         author_url=author_url if isinstance(author_url, str) else None,
-        tweet_text=_tweet_text_with_resolved_links(tweet_text, links),
+        tweet_text=tweet_text,
         posted_at_label=posted_at_label,
         html=html_text or None,
         provider_name=provider_name if isinstance(provider_name, str) else None,
@@ -603,6 +730,8 @@ def _render_markdown_frontmatter(payload: dict[str, Any]) -> str:
 def _render_links_section(links: tuple[_TweetLink, ...]) -> str | None:
     lines: list[str] = []
     for link in links:
+        if link.quote_target is not None:
+            continue
         text = link.resolved_url or link.text
         if text:
             lines.append(f"- [{text}]({link.href})")
@@ -617,6 +746,8 @@ def _render_tweet_document(
     resolved: _ResolvedTweet,
     settings: XwitterSettings,
 ) -> str:
+    quote_targets = _quote_targets_from_links(resolved.links)
+    quoted_tweet = quote_targets[0] if quote_targets else None
     metadata = {
         "url": resolved.canonical_url,
         "source_url": target.original,
@@ -628,6 +759,8 @@ def _render_tweet_document(
         "provider_name": resolved.provider_name,
         "provider_url": resolved.provider_url,
         "image_url": resolved.image_url,
+        "quoted_tweet_url": quoted_tweet.canonical_url if quoted_tweet else None,
+        "quoted_tweet_id": quoted_tweet.tweet_id if quoted_tweet else None,
     }
     sections: list[str] = []
     links_section = _render_links_section(resolved.links)
@@ -637,7 +770,8 @@ def _render_tweet_document(
         sections.append("## Embed HTML\n\n```html\n" + resolved.html.strip() + "\n```")
     lines = [
         _render_markdown_frontmatter(metadata),
-        resolved.tweet_text or "(empty)",
+        _tweet_text_with_resolved_links(resolved.tweet_text, resolved.links)
+        or "(empty)",
     ]
     if sections:
         lines.extend(["***", "\n\n".join(sections)])
@@ -684,6 +818,7 @@ def _fetch_resolved_tweet(
     use_cache: bool,
     cache_ttl: timedelta | None,
     refresh_cache: bool,
+    classify_quotes: bool,
 ) -> _ResolvedTweet:
     try:
         return _fetch_oembed(
@@ -692,6 +827,7 @@ def _fetch_resolved_tweet(
             use_cache=use_cache,
             cache_ttl=cache_ttl,
             refresh_cache=refresh_cache,
+            classify_quotes=classify_quotes,
         )
     except Exception as exc:
         if not settings.use_alias_fallback:
@@ -701,6 +837,76 @@ def _fetch_resolved_tweet(
             raise
         _log(f"  xwitter oEmbed failed; using alias metadata fallback: {exc}")
         return alias
+
+
+def _collect_xwitter_documents(
+    *,
+    target: XwitterTarget,
+    source_url: str,
+    settings: XwitterSettings,
+    use_cache: bool,
+    cache_ttl: timedelta | None,
+    refresh_cache: bool,
+    remaining_quote_depth: int,
+    emitted_tweet_ids: set[str],
+    visiting_tweet_ids: set[str],
+) -> list[XwitterDocument]:
+    if target.tweet_id in emitted_tweet_ids or target.tweet_id in visiting_tweet_ids:
+        return []
+    visiting_tweet_ids.add(target.tweet_id)
+    try:
+        resolved = _fetch_resolved_tweet(
+            target,
+            settings=settings,
+            use_cache=use_cache,
+            cache_ttl=cache_ttl,
+            refresh_cache=refresh_cache,
+            classify_quotes=remaining_quote_depth > 0,
+        )
+        nested_documents: list[XwitterDocument] = []
+        available_quote_ids: set[str] = set()
+        if remaining_quote_depth > 0:
+            for quote_target in _quote_targets_from_links(resolved.links):
+                if (
+                    quote_target.tweet_id in emitted_tweet_ids
+                    or quote_target.tweet_id in visiting_tweet_ids
+                ):
+                    available_quote_ids.add(quote_target.tweet_id)
+                    continue
+                try:
+                    quote_documents = _collect_xwitter_documents(
+                        target=quote_target,
+                        source_url=quote_target.canonical_url,
+                        settings=settings,
+                        use_cache=use_cache,
+                        cache_ttl=cache_ttl,
+                        refresh_cache=refresh_cache,
+                        remaining_quote_depth=remaining_quote_depth - 1,
+                        emitted_tweet_ids=emitted_tweet_ids,
+                        visiting_tweet_ids=visiting_tweet_ids,
+                    )
+                except Exception as exc:
+                    _log(
+                        "  xwitter quote fetch failed for "
+                        f"{quote_target.canonical_url}: {exc}"
+                    )
+                    continue
+                if quote_documents or quote_target.tweet_id in emitted_tweet_ids:
+                    available_quote_ids.add(quote_target.tweet_id)
+                    nested_documents.extend(quote_documents)
+        document = _document_from_resolved(
+            target=target,
+            source_url=source_url,
+            resolved=_resolved_with_available_quotes(
+                resolved,
+                available_tweet_ids=available_quote_ids,
+            ),
+            settings=settings,
+        )
+        emitted_tweet_ids.add(target.tweet_id)
+        return [document, *nested_documents]
+    finally:
+        visiting_tweet_ids.discard(target.tweet_id)
 
 
 def resolve_xwitter_url(
@@ -716,9 +922,14 @@ def resolve_xwitter_url(
     target = parse_xwitter_target(url)
     if target is None:
         raise ValueError(f"Not an X/Twitter tweet URL: {url}")
-    effective_settings = settings if settings is not None else _xwitter_settings_from_env()
+    effective_settings = (
+        settings if settings is not None else _xwitter_settings_from_env()
+    )
     _log(f"Resolving X/Twitter target: {url}")
-    cache_identity = _resolution_cache_identity(target.canonical_url, effective_settings)
+    cache_identity = _resolution_cache_identity(
+        target.canonical_url,
+        effective_settings,
+    )
     if use_cache and not refresh_cache:
         cached_docs = _documents_from_cached_payload(
             get_cached_api_json(cache_identity, ttl=cache_ttl)
@@ -734,21 +945,17 @@ def resolve_xwitter_url(
             return cached_docs
         record_progress("xwitter", "resolution", "cache_miss", target=url)
 
-    resolved = _fetch_resolved_tweet(
-        target,
+    documents = _collect_xwitter_documents(
+        target=target,
+        source_url=url,
         settings=effective_settings,
         use_cache=use_cache,
         cache_ttl=cache_ttl,
         refresh_cache=refresh_cache,
+        remaining_quote_depth=effective_settings.quote_depth,
+        emitted_tweet_ids=set(),
+        visiting_tweet_ids=set(),
     )
-    documents = [
-        _document_from_resolved(
-            target=target,
-            source_url=url,
-            resolved=resolved,
-            settings=effective_settings,
-        )
-    ]
     if use_cache:
         store_api_json(cache_identity, [asdict(document) for document in documents])
     record_progress(
