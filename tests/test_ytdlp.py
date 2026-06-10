@@ -1209,7 +1209,7 @@ def test_instagram_reel_render_includes_sound_metadata(monkeypatch) -> None:
     assert stored[0][2] == "transcription"
 
 
-def test_get_transcript_passes_transcription_cache_flags(
+def test_get_transcript_lets_media_refresh_flags_control_transcription_cache(
     tmp_path: Path, monkeypatch
 ) -> None:
     audio_dir = tmp_path / "audio"
@@ -1262,7 +1262,7 @@ def test_get_transcript_passes_transcription_cache_flags(
     assert captured == {
         "path": audio_path,
         "use_cache": False,
-        "refresh_cache": True,
+        "refresh_cache": None,
         "timeout": None,
         "plugin_overrides": {
             "transcribe": {"provider": "mistral"},
@@ -1270,6 +1270,77 @@ def test_get_transcript_passes_transcription_cache_flags(
         },
     }
     assert not audio_dir.exists()
+
+
+def test_render_video_frames_lets_media_refresh_flags_control_frame_cache(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    video_dir = tmp_path / "video"
+    video_dir.mkdir()
+    video_path = video_dir / "clip.mp4"
+    video_path.write_bytes(b"video")
+
+    ref = object.__new__(ytdlp.YtDlpReference)
+    ref.url = "https://example.com/watch"
+    ref.use_cache = True
+    ref.refresh_cache = True
+    ref.plugin_overrides = {"video": {"frames": True}}
+
+    monkeypatch.setattr(
+        ytdlp.YtDlpReference,
+        "_extract_video",
+        lambda _self: video_path,
+    )
+    captured: dict[str, object] = {}
+
+    def _render_frames(
+        path: Path,
+        *,
+        transcript_result=None,
+        use_cache: bool = True,
+        refresh_cache: bool | None = None,
+        plugin_overrides=None,
+        source_url: str | None = None,
+    ) -> str:
+        captured["path"] = path
+        captured["transcript_result"] = transcript_result
+        captured["use_cache"] = use_cache
+        captured["refresh_cache"] = refresh_cache
+        captured["plugin_overrides"] = plugin_overrides
+        captured["source_url"] = source_url
+        return "frames"
+
+    monkeypatch.setattr(
+        "contextualize.references.video_context.resolve_video_frame_settings",
+        lambda _overrides: type(
+            "Settings",
+            (),
+            {
+                "frames": True,
+                "frame_mode": "duration",
+                "frame_descriptions": True,
+                "frame_max": 10,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        "contextualize.references.video_context.render_video_frame_section",
+        _render_frames,
+    )
+
+    frames = ytdlp.YtDlpReference._render_video_frames(ref, None)
+
+    assert frames == "frames"
+    assert captured == {
+        "path": video_path,
+        "transcript_result": None,
+        "use_cache": True,
+        "refresh_cache": None,
+        "plugin_overrides": {"video": {"frames": True}},
+        "source_url": "https://example.com/watch",
+    }
+    assert not video_dir.exists()
 
 
 def test_get_transcript_requests_segment_timestamps_for_speech_frames(

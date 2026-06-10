@@ -1671,7 +1671,7 @@ class YtDlpReference:
             result = transcribe_media_file_result(
                 audio_path,
                 use_cache=self.use_cache,
-                refresh_cache=self.refresh_cache,
+                refresh_cache=None,
                 plugin_overrides=_effective_video_transcription_overrides(
                     self.plugin_overrides
                 ),
@@ -1706,7 +1706,7 @@ class YtDlpReference:
                     video_path,
                     transcript_result=transcript_result,
                     use_cache=self.use_cache,
-                    refresh_cache=self.refresh_cache,
+                    refresh_cache=None,
                     plugin_overrides=self.plugin_overrides,
                     source_url=self.url,
                 )
