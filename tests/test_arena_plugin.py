@@ -1,5 +1,7 @@
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import click
 import pytest
@@ -26,6 +28,52 @@ def _listed_targets(result: dict) -> list[dict]:
     assert isinstance(result, dict)
     assert isinstance(result.get("targets"), list)
     return result["targets"]
+
+
+class _FakeArenaResponse:
+    def __init__(
+        self,
+        status_code: int,
+        payload: dict[str, Any],
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.headers = headers or {}
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"status {self.status_code}")
+
+
+class _FakeArenaRequests:
+    class exceptions:
+        class RequestException(Exception):
+            pass
+
+    def __init__(self, responses: list[_FakeArenaResponse]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict[str, Any]] = []
+
+    def get(self, url: str, **kwargs: Any) -> _FakeArenaResponse:
+        self.calls.append({"url": url, **kwargs})
+        return self.responses.pop(0)
+
+
+def _install_fake_arena_clock(monkeypatch) -> tuple[list[float], list[float]]:
+    now = [1_000.0]
+    sleeps: list[float] = []
+
+    def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    monkeypatch.setattr(arena.time, "time", lambda: now[0])
+    monkeypatch.setattr(arena.time, "sleep", _sleep)
+    return now, sleeps
 
 
 def test_apply_channel_safety_defaults_caps_explicit_rich_media_channel() -> None:
@@ -89,6 +137,98 @@ def test_resolve_channel_records_cached_channel_progress(monkeypatch) -> None:
     assert flat == []
     assert "  arena channel: cache_hit=1" in progress_summary_lines()
     reset_progress()
+
+
+def test_api_get_paces_requests_from_rate_limit_headers(monkeypatch) -> None:
+    arena._ARENA_API_RATE_LIMITER.reset()
+    _now, sleeps = _install_fake_arena_clock(monkeypatch)
+    monkeypatch.setattr(
+        arena,
+        "_get_auth_headers",
+        lambda: {"Authorization": "Bearer test-token"},
+    )
+    fake_requests = _FakeArenaRequests(
+        [
+            _FakeArenaResponse(
+                200,
+                {"ok": 1},
+                {
+                    "X-RateLimit-Limit": "300",
+                    "X-RateLimit-Window": "60",
+                },
+            ),
+            _FakeArenaResponse(
+                200,
+                {"ok": 2},
+                {
+                    "X-RateLimit-Limit": "300",
+                    "X-RateLimit-Window": "60",
+                },
+            ),
+            _FakeArenaResponse(
+                200,
+                {"ok": 3},
+                {
+                    "X-RateLimit-Limit": "300",
+                    "X-RateLimit-Window": "60",
+                },
+            ),
+        ]
+    )
+    monkeypatch.setitem(sys.modules, "requests", fake_requests)
+
+    try:
+        assert arena._api_get("/one") == {"ok": 1}
+        assert arena._api_get("/two") == {"ok": 2}
+        assert arena._api_get("/three") == {"ok": 3}
+    finally:
+        arena._ARENA_API_RATE_LIMITER.reset()
+
+    assert len(fake_requests.calls) == 3
+    assert sleeps == [
+        pytest.approx(60.0 / (120.0 * 0.9)),
+        pytest.approx(60.0 / (300.0 * 0.9)),
+    ]
+
+
+def test_api_get_waits_until_rate_limit_reset_after_429(monkeypatch) -> None:
+    arena._ARENA_API_RATE_LIMITER.reset()
+    _now, sleeps = _install_fake_arena_clock(monkeypatch)
+    monkeypatch.setattr(
+        arena,
+        "_get_auth_headers",
+        lambda: {"Authorization": "Bearer test-token"},
+    )
+    fake_requests = _FakeArenaRequests(
+        [
+            _FakeArenaResponse(
+                429,
+                {"error": "too many requests"},
+                {
+                    "X-RateLimit-Limit": "300",
+                    "X-RateLimit-Window": "60",
+                    "X-RateLimit-Reset": "1025",
+                },
+            ),
+            _FakeArenaResponse(
+                200,
+                {"ok": True},
+                {
+                    "X-RateLimit-Limit": "300",
+                    "X-RateLimit-Window": "60",
+                },
+            ),
+        ]
+    )
+    monkeypatch.setitem(sys.modules, "requests", fake_requests)
+
+    try:
+        assert arena._api_get("/limited") == {"ok": True}
+    finally:
+        arena._ARENA_API_RATE_LIMITER.reset()
+
+    assert len(fake_requests.calls) == 2
+    assert sleeps == [pytest.approx(25.0)]
 
 
 def test_register_cli_options_exposes_arena_controls() -> None:

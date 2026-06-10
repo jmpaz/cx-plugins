@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
 import sys
-import hashlib
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -35,6 +37,11 @@ _ARENA_GROUP_URL_RE = re.compile(
 )
 
 _API_BASE = "https://api.are.na/v3"
+_DEFAULT_GUEST_REQUESTS_PER_MINUTE = 30
+_DEFAULT_AUTH_REQUESTS_PER_MINUTE = 120
+_DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60.0
+_DEFAULT_RATE_LIMIT_SAFETY = 0.9
+_DEFAULT_MIN_REQUEST_DELAY_SECONDS = 0.2
 
 
 def _log(msg: str) -> None:
@@ -250,6 +257,26 @@ def _api_max_attempts() -> int:
         return 6
 
 
+def _api_rate_limit_safety() -> float:
+    raw = (os.environ.get("ARENA_API_RATE_LIMIT_SAFETY") or "").strip()
+    if not raw:
+        return _DEFAULT_RATE_LIMIT_SAFETY
+    try:
+        return min(1.0, max(0.1, float(raw)))
+    except ValueError:
+        return _DEFAULT_RATE_LIMIT_SAFETY
+
+
+def _api_min_request_delay_seconds() -> float:
+    raw = (os.environ.get("ARENA_API_MIN_REQUEST_DELAY_SECONDS") or "").strip()
+    if not raw:
+        return _DEFAULT_MIN_REQUEST_DELAY_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _DEFAULT_MIN_REQUEST_DELAY_SECONDS
+
+
 def _retry_delay_seconds(attempt: int) -> float:
     import random
 
@@ -268,22 +295,93 @@ def _retry_after_seconds(resp: object) -> float | None:
     import time
 
     headers = getattr(resp, "headers", None) or {}
+    reset = headers.get("X-RateLimit-Reset")
+    if reset:
+        try:
+            value = float(reset)
+            return max(0.0, value - time.time())
+        except ValueError:
+            pass
     retry_after = headers.get("Retry-After")
     if retry_after:
         try:
             return max(0.0, float(retry_after))
         except ValueError:
             pass
-    reset = headers.get("X-RateLimit-Reset")
-    if reset:
-        try:
-            value = float(reset)
-            if value > 10_000_000:
-                return max(0.0, value - time.time())
-            return max(0.0, value)
-        except ValueError:
-            pass
     return None
+
+
+def _positive_float_header(headers: object, name: str) -> float | None:
+    if not hasattr(headers, "get"):
+        return None
+    raw = headers.get(name)
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+class _ArenaApiRateLimiter:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._limit_per_window: float | None = None
+        self._window_seconds = _DEFAULT_RATE_LIMIT_WINDOW_SECONDS
+        self._next_request_at = 0.0
+
+    def wait_for_slot(self, *, authenticated: bool) -> None:
+        while True:
+            with self._lock:
+                now = time.time()
+                if self._next_request_at <= now:
+                    self._next_request_at = now + self._request_interval(authenticated)
+                    return
+                wait = self._next_request_at - now
+            time.sleep(wait)
+
+    def update_from_response(self, resp: object, *, authenticated: bool) -> None:
+        headers = getattr(resp, "headers", None) or {}
+        limit = _positive_float_header(headers, "X-RateLimit-Limit")
+        window = _positive_float_header(headers, "X-RateLimit-Window")
+        with self._lock:
+            if limit is not None:
+                self._limit_per_window = limit
+            elif self._limit_per_window is None:
+                self._limit_per_window = self._default_limit(authenticated)
+            if window is not None:
+                self._window_seconds = window
+
+    def defer_for(self, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        until = time.time() + seconds
+        with self._lock:
+            self._next_request_at = max(self._next_request_at, until)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._limit_per_window = None
+            self._window_seconds = _DEFAULT_RATE_LIMIT_WINDOW_SECONDS
+            self._next_request_at = 0.0
+
+    def _request_interval(self, authenticated: bool) -> float:
+        limit = self._limit_per_window or self._default_limit(authenticated)
+        safety = _api_rate_limit_safety()
+        interval = self._window_seconds / max(1.0, limit * safety)
+        return max(_api_min_request_delay_seconds(), interval)
+
+    @staticmethod
+    def _default_limit(authenticated: bool) -> float:
+        if authenticated:
+            return float(_DEFAULT_AUTH_REQUESTS_PER_MINUTE)
+        return float(_DEFAULT_GUEST_REQUESTS_PER_MINUTE)
+
+
+_ARENA_API_RATE_LIMITER = _ArenaApiRateLimiter()
 
 
 def _requests_exception_type(requests_module: object) -> type[Exception]:
@@ -296,10 +394,10 @@ def _requests_exception_type(requests_module: object) -> type[Exception]:
 
 def _api_get(path: str, params: dict | None = None) -> dict:
     import requests
-    import time
 
     url = f"{_API_BASE}{path}"
     headers = {**_get_auth_headers(), "Accept": "application/json"}
+    authenticated = "Authorization" in headers
     timeout = _api_timeout_seconds()
     max_attempts = _api_max_attempts()
     transient_statuses = {429, 500, 502, 503, 504}
@@ -308,6 +406,7 @@ def _api_get(path: str, params: dict | None = None) -> dict:
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
+            _ARENA_API_RATE_LIMITER.wait_for_slot(authenticated=authenticated)
             resp = requests.get(url, headers=headers, params=params, timeout=timeout)
         except request_exception_type as exc:
             last_exc = exc
@@ -321,6 +420,10 @@ def _api_get(path: str, params: dict | None = None) -> dict:
             time.sleep(wait)
             continue
 
+        _ARENA_API_RATE_LIMITER.update_from_response(
+            resp,
+            authenticated=authenticated,
+        )
         if resp.status_code == 404:
             raise ValueError(f"Are.na resource not found: {path}")
 
@@ -329,12 +432,19 @@ def _api_get(path: str, params: dict | None = None) -> dict:
                 wait = _retry_after_seconds(resp)
                 if wait is None:
                     wait = _retry_delay_seconds(attempt)
+                _ARENA_API_RATE_LIMITER.defer_for(wait)
+                message = (
+                    "  Are.na API returned 429; waiting "
+                    f"{wait:.1f}s for rate-limit reset "
+                    f"(attempt {attempt}/{max_attempts})"
+                )
             else:
                 wait = _server_error_retry_delay_seconds(attempt)
-            _log(
-                f"  Are.na API returned {resp.status_code}; retrying in {wait:.1f}s "
-                f"(attempt {attempt}/{max_attempts})"
-            )
+                message = (
+                    f"  Are.na API returned {resp.status_code}; retrying in "
+                    f"{wait:.1f}s (attempt {attempt}/{max_attempts})"
+                )
+            _log(message)
             time.sleep(wait)
             continue
 
