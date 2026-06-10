@@ -668,6 +668,21 @@ def test_resolve_channel_block_paths_do_not_double_prefix_slug(monkeypatch) -> N
     assert docs[1]["metadata"]["context_subpath"] == "root/100.md"
 
 
+def test_resolve_block_marks_direct_path_as_traversal_duplicate(monkeypatch) -> None:
+    monkeypatch.setattr(arena, "_fetch_block", lambda block_id: _text_block(block_id))
+
+    docs = arena_plugin.resolve(
+        "https://www.are.na/block/100",
+        {"use_cache": False},
+    )
+
+    dedupe = docs[0]["metadata"]["hydrate_dedupe"]
+    assert docs[0]["metadata"]["context_subpath"] == "arena-block-100.md"
+    assert dedupe["key"][:16] == "arena-block:100:"
+    assert dedupe["rank"] == 10_000
+    assert dedupe["link"] is False
+
+
 def test_resolve_channel_preserves_block_connection_context(monkeypatch) -> None:
     channel = _channel("root", 1, "Root", 1)
     block = {

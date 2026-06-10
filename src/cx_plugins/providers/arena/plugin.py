@@ -1967,7 +1967,8 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
                     "hydrate_dedupe": {
                         "mode": "canonical_symlink",
                         "key": f"arena-block:{block_id}:{settings_key}",
-                        "rank": 0,
+                        "rank": 10_000,
+                        "link": False,
                     },
                 },
             }
