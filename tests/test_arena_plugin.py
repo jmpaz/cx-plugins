@@ -76,6 +76,12 @@ def _install_fake_arena_clock(monkeypatch) -> tuple[list[float], list[float]]:
     return now, sleeps
 
 
+def _use_arena_rate_limiter(monkeypatch, tmp_path: Path):
+    limiter = arena._ArenaApiRateLimiter(tmp_path / "arena-rate-limit.sqlite")
+    monkeypatch.setattr(arena, "_ARENA_API_RATE_LIMITER", limiter)
+    return limiter
+
+
 def test_apply_channel_safety_defaults_caps_explicit_rich_media_channel() -> None:
     overrides = _arena_runtime_overrides({"block": {"pdf-content": True}})
     settings = ArenaSettings(include_pdf_content=True)
@@ -139,8 +145,8 @@ def test_resolve_channel_records_cached_channel_progress(monkeypatch) -> None:
     reset_progress()
 
 
-def test_api_get_paces_requests_from_rate_limit_headers(monkeypatch) -> None:
-    arena._ARENA_API_RATE_LIMITER.reset()
+def test_api_get_paces_requests_from_rate_limit_headers(monkeypatch, tmp_path) -> None:
+    limiter = _use_arena_rate_limiter(monkeypatch, tmp_path)
     _now, sleeps = _install_fake_arena_clock(monkeypatch)
     monkeypatch.setattr(
         arena,
@@ -182,7 +188,7 @@ def test_api_get_paces_requests_from_rate_limit_headers(monkeypatch) -> None:
         assert arena._api_get("/two") == {"ok": 2}
         assert arena._api_get("/three") == {"ok": 3}
     finally:
-        arena._ARENA_API_RATE_LIMITER.reset()
+        limiter.reset()
 
     assert len(fake_requests.calls) == 3
     assert sleeps == [
@@ -191,8 +197,8 @@ def test_api_get_paces_requests_from_rate_limit_headers(monkeypatch) -> None:
     ]
 
 
-def test_api_get_waits_until_rate_limit_reset_after_429(monkeypatch) -> None:
-    arena._ARENA_API_RATE_LIMITER.reset()
+def test_api_get_waits_until_rate_limit_reset_after_429(monkeypatch, tmp_path) -> None:
+    limiter = _use_arena_rate_limiter(monkeypatch, tmp_path)
     _now, sleeps = _install_fake_arena_clock(monkeypatch)
     monkeypatch.setattr(
         arena,
@@ -225,9 +231,38 @@ def test_api_get_waits_until_rate_limit_reset_after_429(monkeypatch) -> None:
     try:
         assert arena._api_get("/limited") == {"ok": True}
     finally:
-        arena._ARENA_API_RATE_LIMITER.reset()
+        limiter.reset()
 
     assert len(fake_requests.calls) == 2
+    assert sleeps == [pytest.approx(25.0)]
+
+
+def test_api_rate_limiter_shares_state_between_instances(monkeypatch, tmp_path) -> None:
+    _now, sleeps = _install_fake_arena_clock(monkeypatch)
+    store_path = tmp_path / "arena-rate-limit.sqlite"
+    first = arena._ArenaApiRateLimiter(store_path)
+    second = arena._ArenaApiRateLimiter(store_path)
+    key = "api.are.na:auth:test"
+
+    first.wait_for_slot(key=key, authenticated=True)
+    second.wait_for_slot(key=key, authenticated=True)
+
+    assert sleeps == [pytest.approx(60.0 / (120.0 * 0.9))]
+
+
+def test_api_rate_limiter_shares_429_deferral_between_instances(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _now, sleeps = _install_fake_arena_clock(monkeypatch)
+    store_path = tmp_path / "arena-rate-limit.sqlite"
+    first = arena._ArenaApiRateLimiter(store_path)
+    second = arena._ArenaApiRateLimiter(store_path)
+    key = "api.are.na:auth:test"
+
+    first.defer_for(key=key, seconds=25.0)
+    second.wait_for_slot(key=key, authenticated=True)
+
     assert sleeps == [pytest.approx(25.0)]
 
 
