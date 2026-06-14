@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 PLUGIN_API_VERSION = "1"
-PLUGIN_NAME = "xwitter"
+PLUGIN_NAME = "twitter"
 PLUGIN_PRIORITY = 100
 
 _EXPECTED_RESOLUTION_ERRORS = (RuntimeError, ValueError, OSError)
@@ -15,56 +15,63 @@ def normalize_manifest_config(
     if raw_config is None:
         return None
     if not isinstance(raw_config, dict):
-        raise ValueError("xwitter config must be a mapping")
+        raise ValueError("twitter config must be a mapping")
     return dict(raw_config)
 
 
-def _xwitter_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
+def _twitter_runtime_overrides(raw: dict[str, Any]) -> dict[str, Any] | None:
     result: dict[str, Any] = {}
     for key in (
         "include_html",
-        "use_alias_fallback",
-        "resolve_tco_links",
+        "use_fx_api",
+        "include_media_descriptions",
+        "media_mode",
         "quote_depth",
     ):
         if key in raw:
             result[key] = raw[key]
     for config_key, result_key in (
         ("include-html", "include_html"),
-        ("alias-fallback", "use_alias_fallback"),
-        ("use-alias-fallback", "use_alias_fallback"),
-        ("resolve-tco-links", "resolve_tco_links"),
+        ("use-fx-api", "use_fx_api"),
+        ("fx-api", "use_fx_api"),
+        ("include-media-descriptions", "include_media_descriptions"),
+        ("media-descriptions", "include_media_descriptions"),
+        ("media-mode", "media_mode"),
         ("quote-depth", "quote_depth"),
     ):
         if config_key in raw:
             result[result_key] = raw.get(config_key)
+    media = raw.get("media")
+    if isinstance(media, dict):
+        if "describe" in media:
+            result["include_media_descriptions"] = media["describe"]
+        if "mode" in media:
+            result["media_mode"] = media["mode"]
     return result or None
 
 
-def _xwitter_overrides(context: dict[str, Any]) -> dict[str, Any] | None:
+def _twitter_overrides(context: dict[str, Any]) -> dict[str, Any] | None:
     overrides = context.get("overrides")
     if not isinstance(overrides, dict):
         return None
-    for key in ("xwitter", "x", "twitter"):
-        value = overrides.get(key)
-        if value is None:
-            continue
-        if not isinstance(value, dict):
-            raise ValueError(f"{key} overrides must be a mapping")
-        return _xwitter_runtime_overrides(value)
-    return None
+    value = overrides.get("twitter")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("twitter overrides must be a mapping")
+    return _twitter_runtime_overrides(value)
 
 
 def can_resolve(target: str, context: dict[str, Any]) -> bool:
-    from .xwitter import is_xwitter_url
+    from .twitter import is_twitter_url
 
-    return is_xwitter_url(target)
+    return is_twitter_url(target)
 
 
 def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | None:
-    from .xwitter import parse_xwitter_target
+    from .twitter import parse_twitter_target
 
-    parsed = parse_xwitter_target(target)
+    parsed = parse_twitter_target(target)
     if parsed is None:
         return None
     return {
@@ -76,9 +83,9 @@ def classify_target(target: str, context: dict[str, Any]) -> dict[str, Any] | No
 
 
 def _failure_document(target: str, exc: BaseException) -> dict[str, Any]:
-    from .xwitter import parse_xwitter_target
+    from .twitter import parse_twitter_target
 
-    parsed = parse_xwitter_target(target)
+    parsed = parse_twitter_target(target)
     source_path = target
     canonical_url = None
     tweet_id = None
@@ -98,7 +105,7 @@ def _failure_document(target: str, exc: BaseException) -> dict[str, Any]:
             "provider": PLUGIN_NAME,
             "source_ref": "x.com",
             "source_path": source_path,
-            "context_subpath": "xwitter-error.md",
+            "context_subpath": "twitter-error.md",
             "kind": "tweet",
             "canonical_url": canonical_url,
             "tweet_id": tweet_id,
@@ -108,16 +115,16 @@ def _failure_document(target: str, exc: BaseException) -> dict[str, Any]:
 
 
 def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
-    from .xwitter import (
-        build_xwitter_settings,
-        resolve_xwitter_url,
-        xwitter_settings_cache_key,
+    from .twitter import (
+        build_twitter_settings,
+        resolve_twitter_url,
+        twitter_settings_cache_key,
     )
 
-    settings = build_xwitter_settings(_xwitter_overrides(context))
-    settings_key = xwitter_settings_cache_key(settings)
+    settings = build_twitter_settings(_twitter_overrides(context))
+    settings_key = twitter_settings_cache_key(settings)
     try:
-        documents = resolve_xwitter_url(
+        documents = resolve_twitter_url(
             target,
             settings=settings,
             use_cache=bool(context.get("use_cache", True)),
@@ -150,7 +157,7 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
                     "hydrate_dedupe": {
                         "mode": "canonical_symlink",
                         "key": (
-                            f"xwitter-tweet:{document.tweet_id}:"
+                            f"twitter-tweet:{document.tweet_id}:"
                             f"{settings_key}:{document.source_path}"
                         ),
                         "rank": 0,

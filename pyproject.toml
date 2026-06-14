@@ -31,7 +31,7 @@ snipd = "cx_plugins.providers.snipd.plugin"
 transcribe = "cx_plugins.providers.transcribe.plugin"
 wikipedia = "cx_plugins.providers.wikipedia.plugin"
 whatsapp = "cx_plugins.providers.whatsapp.plugin"
-xwitter = "cx_plugins.providers.xwitter.plugin"
+twitter = "cx_plugins.providers.twitter.plugin"
 ytdlp = "cx_plugins.providers.ytdlp.plugin"
 
 [build-system]

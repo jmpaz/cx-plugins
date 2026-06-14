@@ -22,6 +22,7 @@ This package provides the following plugins:
 | `itchio` | [itch.io](https://itch.io/) | game/software pages, profiles, collections |
 | `soundcloud` | SoundCloud | tracks, playlists, profiles |
 | `snipd` | Snipd | public shared snips |
+| `twitter` | Twitter/X | public tweet URLs |
 | `wikipedia` | Wikipedia | article pages |
 | `whatsapp` | WhatsApp | exported chat archives |
 | `ytdlp` | [yt-dlp](https://github.com/yt-dlp/yt-dlp) | supported media URLs (YouTube/Vimeo, TikTok/IG, etc) |
