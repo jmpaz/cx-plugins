@@ -86,6 +86,7 @@ class GoogleDocsResolvedDocument:
     canonical_id: str
     title: str | None
     media_count: int = 0
+    prose: str = ""
 
 
 @dataclass(frozen=True)
@@ -263,6 +264,7 @@ def resolve_google_doc(
         canonical_id=parsed.canonical_id,
         title=title,
         media_count=rendered.media_count,
+        prose=_build_document_prose(body),
     )
     if use_cache:
         _store_cached_document(cache_key, document)
@@ -681,6 +683,21 @@ def _render_document(
     return "\n".join(lines)
 
 
+_PROSE_FRONTMATTER_RE = re.compile(r"\A---\n.*?\n---\n", re.S)
+_PROSE_MEDIA_TAG_RE = re.compile(
+    r"<(?P<tag>image|video)\b[^>]*?(?:/>|>.*?</(?P=tag)>)",
+    re.S,
+)
+_PROSE_HEADING_RE = re.compile(r"(?m)^[ \t]*#{1,6}[ \t].*$\n?")
+
+
+def _build_document_prose(body: str) -> str:
+    without_frontmatter = _PROSE_FRONTMATTER_RE.sub("", body, count=1)
+    without_media = _PROSE_MEDIA_TAG_RE.sub("", without_frontmatter)
+    without_headings = _PROSE_HEADING_RE.sub("", without_media)
+    return _clean_text(without_headings, preserve_newlines=True)
+
+
 def _title_from_markdown(markdown: str) -> str | None:
     for line in markdown.splitlines():
         stripped = line.strip()
@@ -803,6 +820,7 @@ def _read_cached_document(key: str, cache_ttl: Any) -> GoogleDocsResolvedDocumen
             canonical_id=str(payload["canonical_id"]),
             title=_parse_optional_str(payload.get("title")),
             media_count=int(payload.get("media_count") or 0),
+            prose=str(payload.get("prose") or ""),
         )
     except Exception:
         return None
@@ -821,6 +839,7 @@ def _store_cached_document(key: str, document: GoogleDocsResolvedDocument) -> No
             "canonical_id": document.canonical_id,
             "title": document.title,
             "media_count": document.media_count,
+            "prose": document.prose,
         }
         _cache_path(key).write_text(
             json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8"

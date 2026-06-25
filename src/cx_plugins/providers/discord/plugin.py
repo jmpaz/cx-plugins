@@ -674,6 +674,7 @@ def _render_documents(
     category_name: str | None = None,
 ) -> list[dict[str, Any]]:
     from .discord import (
+        discord_document_prose,
         discord_document_timestamps,
         render_discord_document_with_metadata,
         split_discord_document_by_utc_day,
@@ -699,6 +700,7 @@ def _render_documents(
                 ),
             )
             source_created, source_modified = discord_document_timestamps(day_document)
+            prose, prose_authors = discord_document_prose(day_document)
             day_slug = source_created[:10] if source_created else "undated"
             scope_id = rendered_document.thread_id or rendered_document.channel_id
             ext = ".yaml" if settings.format == "yaml" else ".md"
@@ -716,6 +718,8 @@ def _render_documents(
                     "source": source_url,
                     "label": rendered_document.label,
                     "content": rendered_document.rendered,
+                    "prose": prose,
+                    "prose_authors": prose_authors,
                     "metadata": {
                         "trace_path": rendered_document.trace_path,
                         "provider": PLUGIN_NAME,
@@ -922,6 +926,8 @@ def _resolve_guild(target: str, context: dict[str, Any]) -> list[dict[str, Any]]
             "source": target,
             "label": "manifest",
             "content": manifest_body,
+            "prose": "",
+            "prose_authors": [],
             "metadata": {
                 "provider": PLUGIN_NAME,
                 "kind": "manifest",

@@ -103,6 +103,7 @@ def _failure_document(
         "source": target,
         "label": label,
         "content": message,
+        "prose": "",
         "metadata": {
             "trace_path": label,
             "provider": PLUGIN_NAME,
@@ -171,6 +172,7 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
             "source": target,
             "label": document.label,
             "content": document.rendered,
+            "prose": document.prose,
             "metadata": metadata,
         }
     ]

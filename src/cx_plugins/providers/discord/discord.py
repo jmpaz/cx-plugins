@@ -44,6 +44,10 @@ _GUILD_TEXT_CHANNEL_TYPES = frozenset({0, 5, 15})
 _DISCORD_EPOCH_MS = 1420070400000
 _DISCORD_THREAD_TYPES = frozenset({10, 11, 12})
 _NON_SYSTEM_MESSAGE_TYPES = frozenset({0, 19, 20, 21})
+# Only default messages (0) and replies (19) carry authored prose; thread-starter
+# (21) and app-command (20) messages can be authorless and get system-generated
+# content, which must not be scored as authored text.
+_PROSE_MESSAGE_TYPES = frozenset({0, 19})
 _DISCORD_THREAD_STARTER_MESSAGE_TYPE = 21
 _REPLY_QUOTE_MAX_CHARS = 600
 _VALID_FORMATS = frozenset({"transcript", "yaml"})
@@ -809,6 +813,29 @@ def discord_document_timestamps(
         first.isoformat(timespec="microseconds").replace("+00:00", "Z"),
         last.isoformat(timespec="microseconds").replace("+00:00", "Z"),
     )
+
+
+def discord_document_prose(
+    document: DiscordDocument,
+) -> tuple[str, list[str]]:
+    bodies: list[str] = []
+    authors: list[str] = []
+    seen_authors: set[str] = set()
+    for message in document.messages:
+        if not isinstance(message, dict):
+            continue
+        discord_type = int(message.get("discord_type") or 0)
+        if discord_type not in _PROSE_MESSAGE_TYPES:
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        bodies.append(content)
+        sender = message.get("sender")
+        if isinstance(sender, str) and sender and sender not in seen_authors:
+            seen_authors.add(sender)
+            authors.append(sender)
+    return "\n".join(bodies), authors
 
 
 def discord_anchor_message_url(source_url: str | None) -> str | None:

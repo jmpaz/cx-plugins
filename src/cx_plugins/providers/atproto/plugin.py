@@ -194,6 +194,8 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
                 "source": target,
                 "label": document.label,
                 "content": document.rendered,
+                "prose": document.prose,
+                "prose_authors": list(document.prose_authors),
                 "metadata": metadata,
             }
         )

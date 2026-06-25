@@ -139,6 +139,8 @@ class AtprotoDocument:
     rendered: str
     source_created: str | None = None
     source_modified: str | None = None
+    prose: str = ""
+    prose_authors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1945,7 +1947,7 @@ def _render_post_document(
     activity_at: str | None = None,
     resolved_reply_root_uri: str | None = None,
     lineage_role: str | None = None,
-) -> str:
+) -> tuple[str, str, str | None]:
     record = post.get("record")
     if not isinstance(record, dict):
         record = post.get("value") if isinstance(post.get("value"), dict) else {}
@@ -2012,7 +2014,13 @@ def _render_post_document(
     ]
     if sections:
         lines.extend(["***", "\n\n".join(sections)])
-    return "\n\n".join(part.strip() for part in lines if part.strip())
+    rendered = "\n\n".join(part.strip() for part in lines if part.strip())
+    prose_author = (
+        display_name.strip()
+        if isinstance(display_name, str) and display_name.strip()
+        else None
+    )
+    return rendered, rendered_text, prose_author
 
 
 def _post_source_timestamps(post: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -2149,7 +2157,7 @@ def _collect_post_documents(
 
     index_counter[0] += 1
     label = _post_document_label(root, index_counter[0], post)
-    rendered = _render_post_document(
+    rendered, prose, prose_author = _render_post_document(
         post=post,
         source_url=source_url,
         settings=settings,
@@ -2175,6 +2183,8 @@ def _collect_post_documents(
             rendered=rendered,
             source_created=source_created,
             source_modified=source_modified,
+            prose=prose,
+            prose_authors=(prose_author,) if prose_author else (),
         )
     ]
     documents.extend(nested_docs)
