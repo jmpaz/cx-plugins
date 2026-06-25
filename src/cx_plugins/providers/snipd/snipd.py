@@ -27,6 +27,8 @@ _STATE_RE = re.compile(
 )
 _PAGE_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.DOTALL | re.IGNORECASE)
 _NOTE_HEADING_RE = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
+_FRONTMATTER_RE = re.compile(r"\A---\n.*?\n---\n\n", re.DOTALL)
+_NO_TRANSCRIPT_BODY = "*No transcript available.*"
 _USER_AGENT = "contextualize/snipd"
 _RENDER_CACHE_SCHEMA = 2
 
@@ -301,8 +303,15 @@ def _format_output(clip: SnipdClip, transcript: str) -> str:
     if transcript.strip():
         lines.append(transcript.strip())
     else:
-        lines.append("*No transcript available.*")
+        lines.append(_NO_TRANSCRIPT_BODY)
     return "\n".join(lines)
+
+
+def _prose_from_output(text: str) -> str:
+    body = _FRONTMATTER_RE.sub("", text, count=1).strip()
+    if body == _NO_TRANSCRIPT_BODY:
+        return ""
+    return body
 
 
 @dataclass
@@ -313,6 +322,7 @@ class SnipdReference:
     refresh_cache: bool = False
     plugin_overrides: dict[str, Any] | None = None
     _clip: SnipdClip | None = field(default=None, init=False, repr=False)
+    _prose: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if parse_snipd_target(self.url) is None:
@@ -329,6 +339,9 @@ class SnipdReference:
 
     def loaded_clip(self) -> SnipdClip | None:
         return self._clip
+
+    def prose_text(self) -> str | None:
+        return self._prose
 
     def clip_id(self) -> str:
         target = parse_snipd_target(self.url)
@@ -389,6 +402,7 @@ class SnipdReference:
         )
         self.original_file_content = cached
         self.file_content = cached
+        self._prose = _prose_from_output(cached)
         return cached
 
     def _extract_audio(self) -> Path:
@@ -480,6 +494,7 @@ class SnipdReference:
         text = _format_output(clip, transcript)
         self.original_file_content = text
         self.file_content = text
+        self._prose = transcript.strip()
 
         if self.use_cache:
             from .cache import store_transcript

@@ -85,6 +85,8 @@ class TwitterDocument:
     context_subpath: str
     source_path: str
     rendered: str
+    prose: str
+    prose_authors: list[str]
     source_created: str | None = None
     source_modified: str | None = None
 
@@ -1347,17 +1349,20 @@ def _document_from_resolved(
         resolved=resolved,
         settings=settings,
     )
+    author = resolved.author_name or resolved.author_handle or target.author
     return TwitterDocument(
         source_url=source_url,
         kind="tweet",
         canonical_url=resolved.canonical_url,
         tweet_id=target.tweet_id,
-        author=resolved.author_name or resolved.author_handle or target.author,
+        author=author,
         label=label,
         trace_path=label,
         context_subpath=f"{label}.md",
         source_path=target.source_path,
         rendered=rendered,
+        prose=resolved.tweet_text or "",
+        prose_authors=[author] if author else [],
         source_created=resolved.source_created,
     )
 

@@ -991,6 +991,7 @@ def _owner_profile_document(
             profile,
             user_groups=user_groups if kind == "user" else None,
         ),
+        "prose": "",
         "metadata": {
             "trace_path": f"{context_prefix}/{profile_id or profile_slug}",
             "provider": PLUGIN_NAME,
@@ -1058,6 +1059,7 @@ def _channel_documents(
             "source": target,
             "label": channel_ref.get_label(),
             "content": channel_ref.read(),
+            "prose": "",
             "metadata": {
                 "trace_path": channel_ref.trace_path,
                 "provider": PLUGIN_NAME,
@@ -1124,6 +1126,8 @@ def _channel_documents(
                 "source": target,
                 "label": ref_label,
                 "content": ref.read(),
+                "prose": ref.prose_text(),
+                "prose_authors": ref.prose_authors_list(),
                 "metadata": {
                     "trace_path": ref.trace_path,
                     "provider": PLUGIN_NAME,
@@ -1640,6 +1644,7 @@ def _arena_digest_document(
         "source": target,
         "label": f"{title} digest",
         "content": _render_arena_digest_document(digest),
+        "prose": "",
         "metadata": {
             "trace_path": f"{slug}/_digest",
             "provider": PLUGIN_NAME,
@@ -1948,6 +1953,8 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
                 "source": target,
                 "label": ref.get_label(),
                 "content": ref.read(),
+                "prose": ref.prose_text(),
+                "prose_authors": ref.prose_authors_list(),
                 "metadata": {
                     "trace_path": ref.trace_path,
                     "provider": PLUGIN_NAME,

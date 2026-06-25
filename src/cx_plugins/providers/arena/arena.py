@@ -3486,6 +3486,56 @@ def resolve_channel(
     return metadata, flat
 
 
+def _clean_block_prose_text(text: str) -> str:
+    """Strip Are.na link-capture scaffolding so prose is authored text, not markup:
+    YAML frontmatter blocks, code-fence markers (keeping their contents), and lone
+    ``---`` separator lines, wherever they appear in the captured field."""
+    text = (text or "").strip()
+    text = re.sub(r"\A---\n.*?\n---\s*\n+", "", text, flags=re.DOTALL)
+    text = re.sub(r"\n---\n.*?\n---\s*\n+", "\n", text, flags=re.DOTALL)
+    text = re.sub(r"(?m)^[ \t]*```[^\n]*$\n?", "", text)
+    text = re.sub(r"(?m)^[ \t]*---[ \t]*$\n?", "", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _block_prose(block: dict) -> str:
+    """The block's own authored text for AI-edit detection.
+
+    Text blocks contribute their user description plus body content; Link blocks
+    contribute their captured/authored text (with Are.na's fence/frontmatter
+    capture scaffolding removed). Image/attachment/channel blocks carry no
+    authored prose (only auto-generated media description or a stub), so "".
+    """
+    block_type = block.get("class") or block.get("type", "")
+    if block_type == "Text":
+        parts = []
+        description = _clean_block_prose_text(
+            _extract_markdown_like_text(block.get("description") or "")
+        )
+        if description:
+            parts.append(description)
+        content = _clean_block_prose_text(
+            _extract_markdown_like_text(block.get("content") or "")
+        )
+        if content:
+            parts.append(content)
+        return "\n\n".join(parts)
+    if block_type == "Link":
+        return _clean_block_prose_text(
+            _extract_markdown_like_text(block.get("description") or "")
+        )
+    return ""
+
+
+def _block_prose_authors(block: dict) -> list[str]:
+    user = block.get("user")
+    if isinstance(user, dict):
+        name = user.get("full_name") or user.get("username") or user.get("slug")
+        if isinstance(name, str) and name.strip():
+            return [name.strip()]
+    return []
+
+
 @dataclass
 class ArenaReference:
     url: str
@@ -3528,6 +3578,12 @@ class ArenaReference:
 
     def read(self) -> str:
         return self.original_file_content
+
+    def prose_text(self) -> str:
+        return _block_prose(self.block)
+
+    def prose_authors_list(self) -> list[str]:
+        return _block_prose_authors(self.block)
 
     def exists(self) -> bool:
         return True

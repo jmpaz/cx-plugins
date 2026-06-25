@@ -1531,6 +1531,26 @@ def whatsapp_document_timestamps(
     return _format_local_iso(min(parsed)), _format_local_iso(max(parsed))
 
 
+def whatsapp_document_prose(
+    document: WhatsAppDocument,
+) -> tuple[str, list[str]]:
+    bodies: list[str] = []
+    authors: list[str] = []
+    seen_authors: set[str] = set()
+    for message in document.messages:
+        if message.get("is_system"):
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        bodies.append(content)
+        sender = message.get("sender")
+        if isinstance(sender, str) and sender and sender not in seen_authors:
+            seen_authors.add(sender)
+            authors.append(sender)
+    return "\n".join(bodies), authors
+
+
 def whatsapp_scope_title(document: WhatsAppDocument) -> str:
     return f"WhatsApp -> {document.chat_name}"
 

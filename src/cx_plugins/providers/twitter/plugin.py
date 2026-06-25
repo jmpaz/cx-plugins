@@ -100,6 +100,7 @@ def _failure_document(target: str, exc: BaseException) -> dict[str, Any]:
             "X/Twitter tweet URL was recognized but could not be resolved through "
             f"the public embed surfaces: {exc}"
         ),
+        "prose": "",
         "metadata": {
             "trace_path": source_path,
             "provider": PLUGIN_NAME,
@@ -141,6 +142,8 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
                 "source": target,
                 "label": document.label,
                 "content": document.rendered,
+                "prose": document.prose,
+                "prose_authors": document.prose_authors,
                 "metadata": {
                     "trace_path": document.trace_path,
                     "provider": PLUGIN_NAME,

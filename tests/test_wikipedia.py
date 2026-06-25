@@ -280,6 +280,7 @@ def test_plugin_resolve_emits_metadata_and_dedupe(monkeypatch) -> None:
         lambda *_args, **_kwargs: wikipedia.WikipediaResolvedDocument(
             label="wikipedia/en/Alan_Turing",
             rendered="# Alan Turing",
+            prose="Alan Turing was a mathematician.",
             source_ref="en.wikipedia.org",
             source_path="en/Alan_Turing",
             context_subpath="wikipedia/en/Alan_Turing.md",
@@ -294,6 +295,7 @@ def test_plugin_resolve_emits_metadata_and_dedupe(monkeypatch) -> None:
     )
 
     assert len(docs) == 1
+    assert docs[0]["prose"] == "Alan Turing was a mathematician."
     metadata = docs[0]["metadata"]
     assert metadata["provider"] == "wikipedia"
     assert metadata["source_ref"] == "en.wikipedia.org"

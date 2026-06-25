@@ -105,6 +105,7 @@ class WikipediaSummary:
 class WikipediaResolvedDocument:
     label: str
     rendered: str
+    prose: str
     source_ref: str
     source_path: str
     context_subpath: str
@@ -1098,6 +1099,28 @@ def _render_article_document(
     return "\n".join(lines)
 
 
+def _build_article_prose(
+    *,
+    intro: str,
+    sections: tuple[WikipediaSection, ...],
+) -> str:
+    parts: list[str] = []
+    intro_text = intro.strip()
+    if intro_text:
+        parts.append(intro_text)
+
+    for section in sections:
+        content = section.content.strip()
+        if not content:
+            continue
+        heading_lower = section.title.strip().lower()
+        if heading_lower == "introduction" or heading_lower in _META_SECTION_TITLES:
+            continue
+        parts.append(content)
+
+    return "\n\n".join(parts)
+
+
 def resolve_wikipedia_article(
     target: str,
     *,
@@ -1171,6 +1194,8 @@ def resolve_wikipedia_article(
         settings=settings,
     )
 
+    prose = _build_article_prose(intro=intro, sections=body_sections)
+
     safe_title = _safe_path_segment(title.replace(" ", "_"), fallback="article")
     context_subpath = f"wikipedia/{parsed.language}/{safe_title}.md"
     source_path = f"{parsed.language}/{title.replace(' ', '_')}"
@@ -1183,6 +1208,7 @@ def resolve_wikipedia_article(
     return WikipediaResolvedDocument(
         label=f"wikipedia/{parsed.language}/{title.replace(' ', '_')}",
         rendered=rendered,
+        prose=prose,
         source_ref=f"{parsed.language}.wikipedia.org",
         source_path=source_path,
         context_subpath=context_subpath,

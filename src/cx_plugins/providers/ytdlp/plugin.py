@@ -84,6 +84,7 @@ def _failure_document(target: str, exc: BaseException) -> dict[str, Any]:
         "source": target,
         "label": target,
         "content": f"yt-dlp claimed this media URL but failed to resolve it: {exc}",
+        "prose": "",
         "metadata": {
             "trace_path": target,
             "provider": PLUGIN_NAME,
@@ -116,6 +117,7 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
         return [_failure_document(target, exc)]
     try:
         content = reference.read()
+        prose = reference.prose()
         label = reference.get_label()
         source_ref = reference.source_ref()
         source_path = reference.source_path()
@@ -125,18 +127,19 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
         if not looks_like_ytdlp_url(target):
             raise
         return [_failure_document(target, exc)]
-    return [
-        {
-            "source": target,
-            "label": label,
-            "content": content,
-            "metadata": {
-                "trace_path": label,
-                "provider": PLUGIN_NAME,
-                "source_ref": source_ref,
-                "source_path": source_path,
-                "context_subpath": context_subpath,
-                "kind": kind,
-            },
-        }
-    ]
+    document: dict[str, Any] = {
+        "source": target,
+        "label": label,
+        "content": content,
+        "metadata": {
+            "trace_path": label,
+            "provider": PLUGIN_NAME,
+            "source_ref": source_ref,
+            "source_path": source_path,
+            "context_subpath": context_subpath,
+            "kind": kind,
+        },
+    }
+    if prose is not None:
+        document["prose"] = prose
+    return [document]

@@ -245,6 +245,8 @@ class SoundCloudDocument:
     source_created: str | None = None
     source_modified: str | None = None
     scope_id: str | None = None
+    prose: str | None = None
+    prose_authors: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -1443,6 +1445,30 @@ def _resource_artwork_candidates(
     return deduped
 
 
+def _resource_prose(resource: dict[str, Any]) -> str:
+    description = resource.get("description")
+    if isinstance(description, str) and description.strip():
+        return description.strip()
+    return ""
+
+
+def _user_display_name(user: dict[str, Any]) -> str | None:
+    for key in ("username", "full_name", "permalink"):
+        value = user.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _resource_prose_authors(resource: dict[str, Any]) -> list[str] | None:
+    user = resource.get("user")
+    if isinstance(user, dict):
+        name = _user_display_name(user)
+        if name:
+            return [name]
+    return None
+
+
 def _track_source_fields(track: dict[str, Any]) -> tuple[str | None, str | None]:
     created = track.get("created_at")
     modified = track.get("last_modified")
@@ -1828,6 +1854,8 @@ def _track_docs_from_playlist(
                 scope_id=playlist.get("urn")
                 if isinstance(playlist.get("urn"), str)
                 else None,
+                prose=_resource_prose(track),
+                prose_authors=_resource_prose_authors(track),
             )
         )
     return docs
@@ -1875,6 +1903,8 @@ def _resolve_track_documents(
             source_created=created,
             source_modified=modified,
             scope_id=track_urn,
+            prose=_resource_prose(track),
+            prose_authors=_resource_prose_authors(track),
         )
     ]
 
@@ -1915,6 +1945,8 @@ def _resolve_playlist_documents(
         if isinstance(playlist.get("last_modified"), str)
         else None,
         scope_id=playlist_urn,
+        prose=_resource_prose(playlist),
+        prose_authors=_resource_prose_authors(playlist),
     )
     track_docs = _track_docs_from_playlist(
         playlist,
@@ -2082,6 +2114,8 @@ def _resolve_artist_documents(
         if isinstance(user.get("last_modified"), str)
         else None,
         scope_id=user_urn,
+        prose=_resource_prose(user),
+        prose_authors=[name] if (name := _user_display_name(user)) else None,
     )
     docs.append(summary)
 
@@ -2117,6 +2151,8 @@ def _resolve_artist_documents(
                 source_created=created,
                 source_modified=modified,
                 scope_id=user_urn,
+                prose=_resource_prose(track),
+                prose_authors=_resource_prose_authors(track),
             )
         )
 
@@ -2152,6 +2188,8 @@ def _resolve_artist_documents(
                     if isinstance(playlist.get("last_modified"), str)
                     else None,
                     scope_id=user_urn,
+                    prose=_resource_prose(playlist),
+                    prose_authors=_resource_prose_authors(playlist),
                 )
             )
         for track_doc in _track_docs_from_playlist(
@@ -2195,6 +2233,8 @@ def _resolve_artist_documents(
                 source_created=created,
                 source_modified=modified,
                 scope_id=user_urn,
+                prose=_resource_prose(track),
+                prose_authors=_resource_prose_authors(track),
             )
         )
 
@@ -2231,6 +2271,8 @@ def _resolve_artist_documents(
                 if isinstance(playlist.get("last_modified"), str)
                 else None,
                 scope_id=user_urn,
+                prose=_resource_prose(playlist),
+                prose_authors=_resource_prose_authors(playlist),
             )
         )
 

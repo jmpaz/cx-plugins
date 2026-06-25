@@ -160,6 +160,8 @@ class ItchioPage:
     title: str
     itch_path: str | None
     description: str
+    prose: str
+    prose_authors: tuple[str, ...]
     theme: dict[str, str]
     more_info: tuple[tuple[str, str], ...]
     files: tuple[ItchioLink, ...]
@@ -276,6 +278,8 @@ def parse_itchio_page(
     description_media_urls = _extract_node_media_urls(description_node, canonical_url)
     theme = _extract_theme(tree) if settings.theme_enabled else {}
     more_info = tuple(_dedupe_pairs([*_extract_header_info(tree, kind), *_extract_more_info(tree)]))
+    prose = _description_prose(description_node, canonical_url)
+    prose_authors = tuple(_page_authors(tree, kind, canonical_url, more_info))
     files = tuple(_extract_files(tree, canonical_url))
     media = (
         tuple(
@@ -314,6 +318,8 @@ def parse_itchio_page(
         title=title,
         itch_path=itch_path,
         description=description,
+        prose=prose,
+        prose_authors=prose_authors,
         theme=theme,
         more_info=more_info,
         files=files,
@@ -646,6 +652,8 @@ def _page_document(page: ItchioPage, *, settings_key: tuple[Any, ...]) -> dict[s
         "source": page.source_url,
         "label": page.canonical_url,
         "content": _render_page(page),
+        "prose": page.prose,
+        "prose_authors": list(page.prose_authors),
         "metadata": {
             "trace_path": source_path,
             "provider": "itchio",
@@ -927,6 +935,32 @@ def _extract_header_info(tree: HTMLParser, kind: str) -> list[tuple[str, str]]:
         if updated_text:
             rows.append(("Last updated", updated_text))
     return rows
+
+
+def _page_authors(
+    tree: HTMLParser,
+    kind: str,
+    canonical_url: str,
+    more_info: tuple[tuple[str, str], ...],
+) -> list[str]:
+    if kind == "profile":
+        title = _extract_title(tree, kind, canonical_url)
+        return [title] if title else []
+    authors: list[str] = []
+    for key, value in more_info:
+        if key.strip().lower() in {"author", "authors", "creator", "creators"}:
+            authors.extend(part for part in re.split(r",\s*", value) if part)
+    if authors:
+        return _dedupe_strings(authors)
+    owner = _itchio_subdomain_owner(canonical_url)
+    return [owner] if owner else []
+
+
+def _itchio_subdomain_owner(url: str) -> str | None:
+    host = urlparse(url).netloc.lower()
+    if host.endswith(".itch.io") and host not in {"www.itch.io", "itch.io"}:
+        return host[: -len(".itch.io")]
+    return None
 
 
 def _extract_more_info(tree: HTMLParser) -> list[tuple[str, str]]:
@@ -1486,6 +1520,29 @@ def _render_html_fragment(
     return _normalize_markdown(
         _render_node(node, base_url, describe_media=describe_media)
     )
+
+
+def _description_prose(node: Any | None, base_url: str) -> str:
+    if node is None:
+        return ""
+    rendered = _render_node(node, base_url, describe_media=False)
+    rendered = _strip_code_fences(rendered)
+    rendered = _strip_media_tags(rendered)
+    return _normalize_markdown(rendered)
+
+
+def _strip_code_fences(value: str) -> str:
+    return re.sub(r"```.*?```", "", value, flags=re.S)
+
+
+def _strip_media_tags(value: str) -> str:
+    value = re.sub(
+        r"<(image|video|audio|media)\b[^>]*>.*?</\1>",
+        "",
+        value,
+        flags=re.S,
+    )
+    return re.sub(r"<(?:image|video|audio|media)\b[^>]*/?>", "", value)
 
 
 def _render_node(node: Any, base_url: str, *, describe_media: bool = False) -> str:

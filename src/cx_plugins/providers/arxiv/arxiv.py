@@ -89,6 +89,8 @@ class ArxivResolvedDocument:
     dedupe_rank: int
     source_created: str | None
     source_modified: str | None
+    prose: str | None
+    prose_authors: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -956,6 +958,13 @@ def _format_main_document(
     return "\n".join(lines)
 
 
+def _paper_prose(entry: ArxivEntry, paper_text: str) -> str:
+    abstract_text = (entry.summary or "").strip()
+    body_text = _body_from_converted_paper_text(paper_text, abstract_text).strip()
+    parts = [part for part in (abstract_text, body_text) if part]
+    return "\n\n".join(parts)
+
+
 def _body_from_converted_paper_text(paper_text: str, abstract_text: str) -> str:
     cleaned = paper_text.strip()
     if not cleaned:
@@ -1062,6 +1071,8 @@ def resolve_arxiv_paper(
             dedupe_rank=0,
             source_created=entry.published,
             source_modified=entry.updated,
+            prose=_paper_prose(entry, paper_text),
+            prose_authors=entry.authors,
         )
     ]
 
@@ -1079,6 +1090,8 @@ def resolve_arxiv_paper(
                     dedupe_rank=rank,
                     source_created=entry.published,
                     source_modified=entry.updated,
+                    prose="",
+                    prose_authors=(),
                 )
             )
 

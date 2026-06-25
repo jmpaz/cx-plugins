@@ -118,6 +118,7 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
             "source": target,
             "label": document.label,
             "content": document.rendered,
+            "prose": document.prose,
             "metadata": {
                 "trace_path": document.label,
                 "provider": PLUGIN_NAME,

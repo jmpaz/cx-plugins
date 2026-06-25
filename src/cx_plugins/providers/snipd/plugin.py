@@ -86,6 +86,7 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
             "source": target,
             "label": reference.get_label(),
             "content": content,
+            "prose": reference.prose_text(),
             "metadata": {
                 "trace_path": reference.get_label(),
                 "provider": PLUGIN_NAME,

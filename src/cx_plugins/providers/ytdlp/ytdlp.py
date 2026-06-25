@@ -1426,6 +1426,7 @@ class YtDlpReference:
     plugin_overrides: dict[str, Any] | None = None
     _metadata: dict[str, Any] | None = field(default=None, init=False, repr=False)
     _identity: _YtDlpIdentity | None = field(default=None, init=False, repr=False)
+    _prose: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         _check_ytdlp()
@@ -1444,6 +1445,9 @@ class YtDlpReference:
 
     def read(self) -> str:
         return self.original_file_content
+
+    def prose(self) -> str | None:
+        return self._prose
 
     def exists(self) -> bool:
         try:
@@ -1967,6 +1971,7 @@ class YtDlpReference:
         if cached is None:
             return None
         _log(f"image post render cache hit for {base_identity}")
+        self._prose = ""
         self.original_file_content = cached
         self.file_content = cached
         return self._render_output_text(cached)
@@ -1996,6 +2001,7 @@ class YtDlpReference:
         if cached is None:
             return None
         _log(f"Instagram image post render cache hit for {base_identity}")
+        self._prose = ""
         self.original_file_content = cached
         self.file_content = cached
         return self._render_output_text(cached)
@@ -2111,6 +2117,7 @@ class YtDlpReference:
         image_post: dict[str, Any],
         tiktok_item: dict[str, Any] | None = None,
     ) -> str:
+        self._prose = ""
         entries = _tiktok_image_entries(image_post)
         title = metadata.get("title") or "TikTok image post"
         channel = metadata.get("channel") or metadata.get("uploader")
@@ -2183,6 +2190,7 @@ class YtDlpReference:
         metadata: dict[str, Any],
         media: dict[str, Any],
     ) -> str:
+        self._prose = ""
         entries = _instagram_image_entries(media)
         title = metadata.get("title") or "Instagram image post"
         channel = metadata.get("channel") or metadata.get("uploader")
@@ -2256,6 +2264,8 @@ class YtDlpReference:
         channel = metadata.get("channel") or metadata.get("uploader")
         description = metadata.get("description")
         duration = metadata.get("duration", 0)
+
+        self._prose = transcript if (transcript and source != "none") else ""
 
         has_rich_metadata = channel or description
 

@@ -160,6 +160,7 @@ def _render_documents(
     from .whatsapp import (
         render_whatsapp_document_with_metadata,
         split_whatsapp_document_by_day,
+        whatsapp_document_prose,
         whatsapp_document_timestamps,
         with_whatsapp_document_rendered,
     )
@@ -177,6 +178,7 @@ def _render_documents(
                 ),
             )
             source_created, source_modified = whatsapp_document_timestamps(day_document)
+            prose, prose_authors = whatsapp_document_prose(day_document)
             day_slug = source_created[:10] if source_created else "undated"
             ext = ".yaml" if settings.format == "yaml" else ".md"
             out.append(
@@ -184,6 +186,8 @@ def _render_documents(
                     "source": rendered_document.source_url,
                     "label": rendered_document.label,
                     "content": rendered_document.rendered,
+                    "prose": prose,
+                    "prose_authors": prose_authors,
                     "metadata": {
                         "trace_path": rendered_document.trace_path,
                         "provider": PLUGIN_NAME,
