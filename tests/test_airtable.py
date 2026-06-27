@@ -403,6 +403,82 @@ def test_resolve_interface_form_renders_full_form(monkeypatch) -> None:
     assert content.index("What is your name?") < content.index("### Pick")
 
 
+def test_resolve_interface_data_page_renders_records(monkeypatch) -> None:
+    interface_payload = {
+        "data": {
+            "pageBundles": [
+                {
+                    "id": "pbdX",
+                    "name": "My App",
+                    "pages": [{"id": PAGE, "metadata": {"name": "Projects"}}],
+                }
+            ],
+            "tableSchemas": [
+                {
+                    "id": "tblX",
+                    "name": "Table",
+                    "primaryColumnId": "fldName",
+                    "columns": [
+                        {"id": "fldName", "name": "Name", "type": "text"},
+                        {"id": "fldArea", "name": "Area", "type": "text"},
+                        {"id": "fldHidden", "name": "Hidden", "type": "text"},
+                    ],
+                }
+            ],
+            "preloadPageQueryResults": {
+                "querySlices": [
+                    {
+                        "tableId": "tblX",
+                        "columnIds": ["fldName", "fldArea"],
+                        "rowIds": ["rec2", "rec1"],
+                    }
+                ],
+                "tableDataById": {
+                    "tblX": {
+                        "partialRowById": {
+                            "rec1": {
+                                "id": "rec1",
+                                "cellValuesByColumnId": {
+                                    "fldName": "Beta",
+                                    "fldArea": "Two",
+                                    "fldHidden": "secret",
+                                },
+                            },
+                            "rec2": {
+                                "id": "rec2",
+                                "cellValuesByColumnId": {"fldName": "Alpha", "fldArea": "One"},
+                            },
+                        }
+                    }
+                },
+            },
+        }
+    }
+    _install_session(
+        monkeypatch,
+        [
+            (f"/{APP}/{PAGE}", FakeResponse(text=_page_html())),
+            ("readForPages", FakeResponse(payload=interface_payload)),
+        ],
+    )
+
+    docs = airtable_plugin.resolve(
+        f"https://airtable.com/{APP}/{PAGE}", {"use_cache": False}
+    )
+    doc = docs[0]
+    content = doc["content"]
+    assert doc["metadata"]["kind"] == "interface"
+    assert "# My App: Projects" in content
+    assert "records: 2" in content
+    assert "## Alpha" in content and "## Beta" in content
+    assert "- **Area**: One" in content
+    # query-slice column order/visibility respected: hidden column excluded
+    assert "Hidden" not in content and "secret" not in content
+    # row order follows querySlice rowIds (rec2=Alpha before rec1=Beta)
+    assert content.index("## Alpha") < content.index("## Beta")
+    assert "Interface record data is not included" not in content
+
+
 def test_resolve_failure_returns_error_document(monkeypatch) -> None:
     _install_session(
         monkeypatch,

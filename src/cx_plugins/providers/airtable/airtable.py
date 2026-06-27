@@ -1123,6 +1123,95 @@ def _render_interface_form(
     return _render_form_markdown(parsed, app_id, title, description, items)
 
 
+def _render_interface_records(
+    parsed: ParsedAirtableTarget,
+    page_title: str | None,
+    data: dict[str, Any],
+    settings: AirtableSettings,
+    app_id: str | None,
+    page_id: str | None,
+) -> AirtableResolvedDocument | None:
+    preload = data.get("preloadPageQueryResults")
+    if not isinstance(preload, dict):
+        return None
+    slices = preload.get("querySlices")
+    table_data = preload.get("tableDataById")
+    if not isinstance(slices, list) or not isinstance(table_data, dict):
+        return None
+
+    schemas = {
+        schema.get("id"): schema
+        for schema in (data.get("tableSchemas") or [])
+        if isinstance(schema, dict)
+    }
+
+    body_lines: list[str] = []
+    prose_blocks: list[str] = []
+    media_count = 0
+    total_records = 0
+    rendered_any = False
+
+    for query_slice in slices:
+        if not isinstance(query_slice, dict):
+            continue
+        table_id = query_slice.get("tableId")
+        column_ids = query_slice.get("columnIds")
+        row_ids = query_slice.get("rowIds")
+        if not isinstance(column_ids, list) or not isinstance(row_ids, list):
+            continue
+        partial_rows = (table_data.get(table_id) or {}).get("partialRowById")
+        if not isinstance(partial_rows, dict):
+            continue
+        schema = schemas.get(table_id) or {}
+        columns_by_id = {
+            column.get("id"): column
+            for column in (schema.get("columns") or [])
+            if isinstance(column, dict)
+        }
+        columns = [columns_by_id[cid] for cid in column_ids if cid in columns_by_id]
+        if not columns:
+            columns = [c for c in columns_by_id.values() if isinstance(c, dict)]
+        rows = [partial_rows[rid] for rid in row_ids if isinstance(partial_rows.get(rid), dict)]
+        if not rows:
+            continue
+        primary_column_id = _primary_column_id(schema, columns)
+        lines, blocks, mc, total, shown = _render_table(
+            columns=columns,
+            rows=rows,
+            primary_column_id=primary_column_id,
+            settings=settings,
+            heading_level=2,
+        )
+        body_lines.extend(lines)
+        if shown < total:
+            body_lines.extend(
+                ["", f"_Showing {shown} of {total} records (truncated by max_rows)._"]
+            )
+        prose_blocks.extend(blocks)
+        media_count += mc
+        total_records += total
+        rendered_any = True
+
+    if not rendered_any:
+        return None
+
+    title = page_title or _interface_title(data, parsed.primary_id, page_id)
+    lines = _frontmatter(
+        parsed, [("app_id", app_id or ""), ("type", "interface"), ("records", str(total_records))]
+    )
+    lines.extend(["", f"# {title}"])
+    lines.extend(body_lines)
+
+    return _build_document(
+        parsed,
+        kind="interface",
+        title=title,
+        rendered_body=lines,
+        prose="\n\n".join(prose_blocks),
+        media_count=media_count,
+    )
+
+
 def _render_interface_document(
     parsed: ParsedAirtableTarget,
     page_title: str | None,
@@ -1135,13 +1224,19 @@ def _render_interface_document(
     if layout is not None and _form_container(layout.get("elementById") or {}) is not None:
         return _render_interface_form(parsed, page_title, data, layout, app_id)
 
+    records_doc = _render_interface_records(
+        parsed, page_title, data, settings, app_id, page_id
+    )
+    if records_doc is not None:
+        return records_doc
+
     schemas = [s for s in (data.get("tableSchemas") or []) if isinstance(s, dict)]
     datas = {
         d.get("id"): d
         for d in (data.get("tableDatas") or [])
         if isinstance(d, dict)
     }
-    title = page_title or _interface_title(data, parsed.primary_id)
+    title = page_title or _interface_title(data, parsed.primary_id, page_id)
 
     lines = _frontmatter(parsed, [("app_id", app_id or ""), ("type", "interface")])
     lines.extend(["", f"# {title}"])
@@ -1239,21 +1334,43 @@ def _page_title(html_text: str) -> str | None:
     return title
 
 
-def _interface_title(data: dict[str, Any], fallback: str) -> str:
+def _interface_title(
+    data: dict[str, Any], fallback: str, page_id: str | None = None
+) -> str:
     blob = json.dumps(data)
     match = re.search(r'"title":\s*"([^"]{1,80})"\s*,\s*"formCoverImageUrl"', blob)
     if match:
         cleaned = _clean_text(match.group(1))
         if cleaned:
             return cleaned
-    bundles = data.get("pageBundles")
-    if isinstance(bundles, list):
-        for bundle in bundles:
-            if isinstance(bundle, dict):
-                name = bundle.get("name")
+
+    bundles = [b for b in (data.get("pageBundles") or []) if isinstance(b, dict)]
+    page_name = ""
+    bundle_name = ""
+    for bundle in bundles:
+        for page in bundle.get("pages") or []:
+            if isinstance(page, dict) and page.get("id") == page_id:
+                metadata = page.get("metadata")
+                name = metadata.get("name") if isinstance(metadata, dict) else None
+                if not isinstance(name, str) or not name.strip():
+                    name = page.get("name")
                 if isinstance(name, str) and name.strip():
-                    return _clean_text(name)
-    return fallback
+                    page_name = _clean_text(name)
+                    owner = bundle.get("name")
+                    if isinstance(owner, str) and owner.strip():
+                        bundle_name = _clean_text(owner)
+        if page_name:
+            break
+    if not bundle_name:
+        for bundle in bundles:
+            name = bundle.get("name")
+            if isinstance(name, str) and name.strip():
+                bundle_name = _clean_text(name)
+                break
+
+    if page_name and bundle_name and page_name != bundle_name:
+        return f"{bundle_name}: {page_name}"
+    return page_name or bundle_name or fallback
 
 
 def _search(pattern: re.Pattern[str], text: str) -> str:
