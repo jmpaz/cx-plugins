@@ -20,6 +20,7 @@ dependencies = [
 ]
 
 [project.entry-points."contextualize.plugins"]
+airtable = "cx_plugins.providers.airtable.plugin"
 arena = "cx_plugins.providers.arena.plugin"
 arxiv = "cx_plugins.providers.arxiv.plugin"
 atproto = "cx_plugins.providers.atproto.plugin"
