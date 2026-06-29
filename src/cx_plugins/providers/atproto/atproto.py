@@ -2995,6 +2995,20 @@ def _post_and_ancestor_chain(
     return chain
 
 
+def _handle_for_repo(posts: list[dict[str, Any]], repo: str | None) -> str | None:
+    if not repo:
+        return None
+    for post in posts:
+        if not isinstance(post, dict):
+            continue
+        author = post.get("author")
+        if isinstance(author, dict) and author.get("did") == repo:
+            handle = author.get("handle")
+            if isinstance(handle, str) and handle.strip():
+                return handle.strip()
+    return None
+
+
 def _resolve_post_documents(
     target: AtprotoTarget,
     *,
@@ -3011,7 +3025,7 @@ def _resolve_post_documents(
     if not posts:
         return []
     repo, _collection, _rkey = _parse_at_uri(target.uri)
-    root_actor = target.actor or repo or "profile"
+    root_actor = _handle_for_repo(posts, repo) or target.actor or repo or "profile"
     root = "atproto/profile/" + _safe_slug(str(root_actor), "profile")
     documents: list[AtprotoDocument] = []
     emitted_uris: set[str] = set()
