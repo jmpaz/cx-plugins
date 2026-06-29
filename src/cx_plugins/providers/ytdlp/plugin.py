@@ -118,6 +118,7 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
     try:
         content = reference.read()
         prose = reference.prose()
+        transcript_error = reference.transcript_error()
         label = reference.get_label()
         source_ref = reference.source_ref()
         source_path = reference.source_path()
@@ -140,6 +141,8 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
             "kind": kind,
         },
     }
+    if transcript_error:
+        document["metadata"]["transcript_error"] = transcript_error
     if prose is not None:
         document["prose"] = prose
     return [document]

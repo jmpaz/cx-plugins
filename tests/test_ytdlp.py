@@ -331,6 +331,21 @@ def test_format_output_includes_video_frames_before_transcript() -> None:
     assert rendered.index("## Video Frames") < rendered.index("Transcript body.")
 
 
+def test_format_output_marks_transcription_failure_distinctly() -> None:
+    ref = object.__new__(ytdlp.YtDlpReference)
+    ref._transcript_error = "yt-dlp audio extraction failed"
+    rendered = ytdlp.YtDlpReference._format_output(
+        ref,
+        {"title": "Synthetic video", "duration": 12},
+        "",
+        "error",
+    )
+
+    assert ref._prose is None
+    assert "Transcript unavailable: yt-dlp audio extraction failed" in rendered
+    assert "*No transcript available.*" not in rendered
+
+
 def test_transcription_failure_still_renders_video_frames(monkeypatch) -> None:
     ref = object.__new__(ytdlp.YtDlpReference)
     ref.url = "https://example.com/watch"
@@ -357,7 +372,8 @@ def test_transcription_failure_still_renders_video_frames(monkeypatch) -> None:
     transcript, source, frames = ytdlp.YtDlpReference._get_transcript_and_frames(ref, 12)
 
     assert transcript == ""
-    assert source == "none"
+    assert source == "error"
+    assert ref._transcript_error == "missing transcription provider"
     assert "## Video Frames" in frames
 
 
@@ -796,6 +812,12 @@ def test_resolve_uses_generalized_reference_metadata(monkeypatch) -> None:
         def read(self) -> str:
             return "transcript"
 
+        def prose(self) -> str | None:
+            return "transcript"
+
+        def transcript_error(self) -> str | None:
+            return None
+
         def source_ref(self) -> str:
             return "example.com"
 
@@ -825,6 +847,7 @@ def test_resolve_uses_generalized_reference_metadata(monkeypatch) -> None:
     assert metadata["source_path"] == "vimeo:abc123"
     assert metadata["context_subpath"] == "ytdlp-vimeo-abc123.md"
     assert metadata["kind"] == "video"
+    assert "transcript_error" not in metadata
 
 
 def test_resolve_returns_explicit_failure_doc_when_claimed_media_breaks(
@@ -1467,7 +1490,7 @@ def test_extract_audio_requests_audio_only_format(monkeypatch) -> None:
 
     assert audio_path.read_bytes() == b"audio"
     assert calls
-    assert calls[0][0:2] == ["-f", "bestaudio/best"]
+    assert calls[0][0:2] == ["-f", "bestaudio/best[vcodec~='^(avc|h264)']/best"]
     assert calls[0][2:4] == ["--concurrent-fragments", "16"]
 
 

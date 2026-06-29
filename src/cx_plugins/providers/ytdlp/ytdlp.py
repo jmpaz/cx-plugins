@@ -180,6 +180,16 @@ def _log(message: str) -> None:
         return
 
 
+def _warn(message: str) -> None:
+    """Surface a failure unconditionally; `_log` only speaks under verbose mode."""
+    print(f"[ytdlp] {message}", file=sys.stderr, flush=True)
+
+
+_AUDIO_EXTRACTION_SUFFIXES = frozenset(
+    {".mp3", ".m4a", ".aac", ".opus", ".ogg", ".oga", ".webm", ".wav", ".flac"}
+)
+
+
 def _clean_identity_part(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
@@ -1427,6 +1437,7 @@ class YtDlpReference:
     _metadata: dict[str, Any] | None = field(default=None, init=False, repr=False)
     _identity: _YtDlpIdentity | None = field(default=None, init=False, repr=False)
     _prose: str | None = field(default=None, init=False, repr=False)
+    _transcript_error: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         _check_ytdlp()
@@ -1448,6 +1459,9 @@ class YtDlpReference:
 
     def prose(self) -> str | None:
         return self._prose
+
+    def transcript_error(self) -> str | None:
+        return self._transcript_error
 
     def exists(self) -> bool:
         try:
@@ -1557,10 +1571,13 @@ class YtDlpReference:
         tmpdir = tempfile.mkdtemp(prefix="ytdlp-")
         output_template = os.path.join(tmpdir, f"{identity.slug}.%(ext)s")
 
+        # TikTok's h265/bytevc1 formats advertise aac but download audio-less, so a
+        # plain `best` picks one and `-x` fails ("unable to obtain file audio codec");
+        # prefer an audio-bearing avc/h264 combined format before falling back.
         result = _run_ytdlp(
             [
                 "-f",
-                "bestaudio/best",
+                "bestaudio/best[vcodec~='^(avc|h264)']/best",
                 "--concurrent-fragments",
                 "16",
                 "-x",
@@ -1588,7 +1605,11 @@ class YtDlpReference:
         audio_dir = Path(tmpdir)
         audio_files = sorted(audio_dir.glob("*.mp3"))
         if not audio_files:
-            audio_files = sorted(path for path in audio_dir.iterdir() if path.is_file())
+            audio_files = sorted(
+                path
+                for path in audio_dir.iterdir()
+                if path.is_file() and path.suffix.lower() in _AUDIO_EXTRACTION_SUFFIXES
+            )
         if not audio_files:
             raise RuntimeError("yt-dlp audio extraction produced no audio file")
         _log(f"audio extraction finished for {identity.display_name}")
@@ -1733,7 +1754,9 @@ class YtDlpReference:
         except Exception as exc:
             identity = getattr(self, "_identity", None)
             display_name = getattr(identity, "display_name", self.url)
-            _log(f"transcription unavailable for {display_name}: {exc}")
+            source = "error"
+            self._transcript_error = str(exc)
+            _warn(f"transcription failed for {display_name}: {exc}")
         return transcript, source, self._render_video_frames(transcript_result)
 
     def _render_output_text(self, text: str) -> str:
@@ -2265,7 +2288,10 @@ class YtDlpReference:
         description = metadata.get("description")
         duration = metadata.get("duration", 0)
 
-        self._prose = transcript if (transcript and source != "none") else ""
+        if source == "error":
+            self._prose = None
+        else:
+            self._prose = transcript if (transcript and source != "none") else ""
 
         has_rich_metadata = channel or description
 
@@ -2301,6 +2327,9 @@ class YtDlpReference:
         if transcript:
             formatted_transcript = _insert_timestamps(transcript, duration)
             lines.append(formatted_transcript)
+        elif source == "error":
+            detail = self._transcript_error or "transcription failed"
+            lines.append(f"*Transcript unavailable: {detail}*")
         elif source == "none":
             lines.append("*No transcript available.*")
 
@@ -2456,7 +2485,7 @@ class YtDlpReference:
         self.original_file_content = text
         self.file_content = text
 
-        if self.use_cache:
+        if self.use_cache and source not in ("none", "error"):
             self._store_render_cache_aliases(
                 primary_base_identity=identity.cache_identity,
                 text=text,
