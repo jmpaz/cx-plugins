@@ -3390,6 +3390,32 @@ def _limit_flat_blocks(
     return limited
 
 
+def _cached_channel_is_current(slug: str, cached_metadata: dict) -> bool:
+    try:
+        live = _fetch_channel(slug)
+    except Exception:
+        return True
+    if not isinstance(live, dict):
+        return True
+    cached_updated = cached_metadata.get("updated_at")
+    live_updated = live.get("updated_at")
+    if (
+        isinstance(cached_updated, str)
+        and isinstance(live_updated, str)
+        and cached_updated != live_updated
+    ):
+        return False
+    cached_count = _channel_content_count(cached_metadata)
+    live_count = _channel_content_count(live)
+    if (
+        cached_count is not None
+        and live_count is not None
+        and cached_count != live_count
+    ):
+        return False
+    return True
+
+
 def resolve_channel(
     slug: str,
     *,
@@ -3433,20 +3459,25 @@ def resolve_channel(
         if cached is not None:
             data = json.loads(cached)
             metadata = data["metadata"]
-            flat_unsorted = [(path, block) for path, block in data["blocks"]]
-            flat = _sort_blocks(flat_unsorted, sort_order)
-            flat = _filter_flat_blocks(flat, settings)
-            flat = _limit_flat_blocks(flat, settings)
-            channel_title = metadata.get("title") or slug
-            _log(f"  using cached channel: {channel_title}")
-            record_progress(
-                "arena",
-                "channel",
-                "cache_hit",
-                target=str(channel_title),
-                count=len(flat),
+            if _cached_channel_is_current(slug, metadata):
+                flat_unsorted = [(path, block) for path, block in data["blocks"]]
+                flat = _sort_blocks(flat_unsorted, sort_order)
+                flat = _filter_flat_blocks(flat, settings)
+                flat = _limit_flat_blocks(flat, settings)
+                channel_title = metadata.get("title") or slug
+                _log(f"  using cached channel: {channel_title}")
+                record_progress(
+                    "arena",
+                    "channel",
+                    "cache_hit",
+                    target=str(channel_title),
+                    count=len(flat),
+                )
+                return metadata, flat
+            _log(
+                "  cached channel changed upstream; refreshing: "
+                f"{metadata.get('title') or slug}"
             )
-            return metadata, flat
         record_progress("arena", "channel", "cache_miss", target=slug)
 
     metadata, contents = _fetch_all_channel_contents(
