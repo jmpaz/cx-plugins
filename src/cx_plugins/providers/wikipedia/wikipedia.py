@@ -1,14 +1,33 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import timedelta
+from email.utils import parsedate_to_datetime
+import hashlib
 import html
+import os
+from pathlib import Path
+import random
 import re
+import sqlite3
+import sys
+import threading
+import time
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 _DEFAULT_LANGUAGE = "en"
 _DEFAULT_TIMEOUT_SECONDS = 20
-_USER_AGENT = "contextualize/wikipedia"
+_DEFAULT_USER_AGENT = (
+    "contextualize-wikipedia/0.1 "
+    "(https://github.com/jmpaz/contextualize) requests"
+)
+_DEFAULT_REQUESTS_PER_MINUTE = 120.0
+_DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60.0
+_DEFAULT_RATE_LIMIT_SAFETY = 0.9
+_DEFAULT_MIN_REQUEST_DELAY_SECONDS = 0.5
+_RATE_LIMIT_TABLE = "wikimedia_api_rate_limits"
+_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 _WIKI_HOST_RE = re.compile(r"^(?P<lang>[a-z]{2,12})(?:\.m)?\.wikipedia\.org$")
 _WIKI_PATH_RE = re.compile(r"^/wiki/(?P<title>[^#?]+)")
 _LANG_PREFIX_RE = re.compile(r"^[a-z]{2,12}$")
@@ -44,6 +63,16 @@ _EXCLUDED_CLASS_FRAGMENTS = (
     "gallery",
     "metadata",
 )
+
+
+def _log(msg: str) -> None:
+    try:
+        from contextualize.runtime import get_verbose_logging
+
+        if get_verbose_logging():
+            print(msg, file=sys.stderr, flush=True)
+    except Exception:
+        return
 
 
 @dataclass(frozen=True)
@@ -149,6 +178,156 @@ def _parse_lang(value: Any, *, default: str) -> str:
         if _LANG_PREFIX_RE.fullmatch(cleaned):
             return cleaned
     return default
+
+
+def _load_dotenv() -> None:
+    try:
+        from dotenv import find_dotenv, load_dotenv
+
+        env_path = find_dotenv(usecwd=True)
+        if env_path:
+            load_dotenv(env_path, override=False)
+    except Exception:
+        return
+
+
+def _env_value(*names: str) -> str | None:
+    _load_dotenv()
+    for name in names:
+        value = os.environ.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _env_float(*names: str, default: float, minimum: float) -> float:
+    raw = _env_value(*names)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, float(raw))
+    except ValueError:
+        return default
+
+
+def _env_int(*names: str, default: int, minimum: int) -> int:
+    raw = _env_value(*names)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
+
+
+def _api_timeout_seconds() -> float:
+    return _env_float(
+        "CONTEXTUALIZE_WIKIMEDIA_API_TIMEOUT",
+        "WIKIMEDIA_API_TIMEOUT",
+        "WIKIPEDIA_API_TIMEOUT",
+        default=float(_DEFAULT_TIMEOUT_SECONDS),
+        minimum=1.0,
+    )
+
+
+def _api_max_attempts() -> int:
+    return _env_int(
+        "CONTEXTUALIZE_WIKIMEDIA_API_MAX_ATTEMPTS",
+        "WIKIMEDIA_API_MAX_ATTEMPTS",
+        "WIKIPEDIA_API_MAX_ATTEMPTS",
+        default=6,
+        minimum=1,
+    )
+
+
+def _api_requests_per_minute(*, authenticated: bool) -> float:
+    names = (
+        (
+            "CONTEXTUALIZE_WIKIMEDIA_AUTH_REQUESTS_PER_MINUTE",
+            "WIKIMEDIA_AUTH_REQUESTS_PER_MINUTE",
+        )
+        if authenticated
+        else ()
+    )
+    return _env_float(
+        *names,
+        "CONTEXTUALIZE_WIKIMEDIA_REQUESTS_PER_MINUTE",
+        "WIKIMEDIA_REQUESTS_PER_MINUTE",
+        "WIKIPEDIA_REQUESTS_PER_MINUTE",
+        default=_DEFAULT_REQUESTS_PER_MINUTE,
+        minimum=1.0,
+    )
+
+
+def _api_rate_limit_safety() -> float:
+    return min(
+        1.0,
+        _env_float(
+            "CONTEXTUALIZE_WIKIMEDIA_RATE_LIMIT_SAFETY",
+            "WIKIMEDIA_RATE_LIMIT_SAFETY",
+            "WIKIPEDIA_RATE_LIMIT_SAFETY",
+            default=_DEFAULT_RATE_LIMIT_SAFETY,
+            minimum=0.1,
+        ),
+    )
+
+
+def _api_min_request_delay_seconds() -> float:
+    return _env_float(
+        "CONTEXTUALIZE_WIKIMEDIA_MIN_REQUEST_DELAY_SECONDS",
+        "WIKIMEDIA_MIN_REQUEST_DELAY_SECONDS",
+        "WIKIPEDIA_MIN_REQUEST_DELAY_SECONDS",
+        default=_DEFAULT_MIN_REQUEST_DELAY_SECONDS,
+        minimum=0.0,
+    )
+
+
+def _api_user_agent() -> str:
+    return _env_value(
+        "CONTEXTUALIZE_WIKIMEDIA_USER_AGENT",
+        "CONTEXTUALIZE_WIKIPEDIA_USER_AGENT",
+        "WIKIMEDIA_USER_AGENT",
+        "WIKIPEDIA_USER_AGENT",
+    ) or _DEFAULT_USER_AGENT
+
+
+def _get_auth_headers() -> dict[str, str]:
+    headers: dict[str, str] = {}
+    authorization = _env_value(
+        "CONTEXTUALIZE_WIKIMEDIA_AUTHORIZATION",
+        "WIKIMEDIA_AUTHORIZATION",
+        "WIKIPEDIA_AUTHORIZATION",
+    )
+    if authorization:
+        headers["Authorization"] = authorization
+    else:
+        token = _env_value(
+            "CONTEXTUALIZE_WIKIMEDIA_ACCESS_TOKEN",
+            "WIKIMEDIA_ACCESS_TOKEN",
+            "WIKIPEDIA_ACCESS_TOKEN",
+        )
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+    cookie = _env_value(
+        "CONTEXTUALIZE_WIKIMEDIA_COOKIE",
+        "WIKIMEDIA_COOKIE",
+        "WIKIPEDIA_COOKIE",
+    )
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+
+def _request_headers(headers: dict[str, str] | None = None) -> dict[str, str]:
+    merged = {
+        "User-Agent": _api_user_agent(),
+        **_get_auth_headers(),
+        **(headers or {}),
+    }
+    if not merged.get("User-Agent"):
+        merged["User-Agent"] = _DEFAULT_USER_AGENT
+    return merged
 
 
 def _normalize_revision(value: str | None) -> int | None:
@@ -315,12 +494,257 @@ def is_wikipedia_target(target: str, *, default_lang: str = _DEFAULT_LANGUAGE) -
     return parse_wikipedia_target(target, default_lang=default_lang) is not None
 
 
-def _http_get(url: str, *, timeout: int, headers: dict[str, str]) -> Any:
+def _api_rate_limit_db_path() -> Path:
+    raw = _env_value(
+        "CONTEXTUALIZE_WIKIMEDIA_RATE_LIMIT_DB",
+        "CONTEXTUALIZE_WIKIPEDIA_RATE_LIMIT_DB",
+    )
+    if raw:
+        return Path(os.path.expanduser(raw))
+
+    from .cache import WIKIPEDIA_CACHE_ROOT
+
+    return WIKIPEDIA_CACHE_ROOT / "rate-limit.sqlite"
+
+
+def _api_rate_limit_key(headers: dict[str, str]) -> str:
+    auth_parts = [
+        headers.get("Authorization", "").strip(),
+        headers.get("Cookie", "").strip(),
+    ]
+    identity = "\n".join(part for part in auth_parts if part)
+    if not identity:
+        return "wikimedia:guest"
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    return f"wikimedia:auth:{digest}"
+
+
+def _retry_after_seconds(resp: object) -> float | None:
+    headers = getattr(resp, "headers", None) or {}
+    retry_after = headers.get("Retry-After")
+    if not retry_after:
+        return None
+    try:
+        return max(0.0, float(retry_after))
+    except ValueError:
+        pass
+    try:
+        parsed = parsedate_to_datetime(retry_after)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, parsed.timestamp() - time.time())
+
+
+def _retry_delay_seconds(attempt: int) -> float:
+    base = min(60.0, 5.0 * (2 ** max(0, attempt - 1)))
+    return base + random.uniform(0.0, 0.25)
+
+
+@dataclass
+class _WikimediaApiRateLimitState:
+    next_request_at: float = 0.0
+
+
+class _WikimediaApiRateLimiter:
+    def __init__(self, store_path: Path | None = None) -> None:
+        self._lock = threading.Lock()
+        self._store_path = store_path
+        self._fallback_states: dict[str, _WikimediaApiRateLimitState] = {}
+
+    def wait_for_slot(self, *, key: str, authenticated: bool) -> None:
+        while True:
+            wait = self._reserve_or_wait_seconds(key, authenticated=authenticated)
+            if wait <= 0:
+                return
+            if wait >= 1.0:
+                _log(f"  Wikimedia API rate-limit wait: {wait:.1f}s")
+            time.sleep(wait)
+
+    def defer_for(self, *, key: str, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        until = time.time() + seconds
+
+        def defer(state: _WikimediaApiRateLimitState) -> None:
+            state.next_request_at = max(state.next_request_at, until)
+
+        self._with_state(key, defer)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._fallback_states.clear()
+        try:
+            path = self._db_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(path, timeout=30.0, isolation_level=None) as conn:
+                conn.execute(f"DROP TABLE IF EXISTS {_RATE_LIMIT_TABLE}")
+        except (OSError, sqlite3.Error):
+            return
+
+    def _reserve_or_wait_seconds(self, key: str, *, authenticated: bool) -> float:
+        def reserve(state: _WikimediaApiRateLimitState) -> float:
+            now = time.time()
+            if state.next_request_at <= now:
+                state.next_request_at = now + self._request_interval(
+                    authenticated=authenticated,
+                )
+                return 0.0
+            return state.next_request_at - now
+
+        return self._with_state(key, reserve)
+
+    def _request_interval(self, *, authenticated: bool) -> float:
+        rpm = _api_requests_per_minute(authenticated=authenticated)
+        interval = _DEFAULT_RATE_LIMIT_WINDOW_SECONDS / max(
+            1.0,
+            rpm * _api_rate_limit_safety(),
+        )
+        return max(_api_min_request_delay_seconds(), interval)
+
+    def _with_state(self, key: str, action):
+        try:
+            path = self._db_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with sqlite3.connect(path, timeout=30.0, isolation_level=None) as conn:
+                conn.execute("PRAGMA busy_timeout = 30000")
+                conn.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {_RATE_LIMIT_TABLE} (
+                        key TEXT PRIMARY KEY,
+                        next_request_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    )
+                    """
+                )
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    state = self._read_state(conn, key)
+                    result = action(state)
+                    self._write_state(conn, key, state)
+                    conn.commit()
+                    return result
+                except Exception:
+                    conn.rollback()
+                    raise
+        except (OSError, sqlite3.Error):
+            return self._with_fallback_state(key, action)
+
+    def _with_fallback_state(self, key: str, action):
+        with self._lock:
+            state = self._fallback_states.setdefault(
+                key,
+                _WikimediaApiRateLimitState(),
+            )
+            return action(state)
+
+    def _db_path(self) -> Path:
+        return self._store_path or _api_rate_limit_db_path()
+
+    @staticmethod
+    def _read_state(
+        conn: sqlite3.Connection,
+        key: str,
+    ) -> _WikimediaApiRateLimitState:
+        row = conn.execute(
+            f"""
+            SELECT next_request_at
+            FROM {_RATE_LIMIT_TABLE}
+            WHERE key = ?
+            """,
+            (key,),
+        ).fetchone()
+        if row is None:
+            return _WikimediaApiRateLimitState()
+        return _WikimediaApiRateLimitState(next_request_at=float(row[0]))
+
+    @staticmethod
+    def _write_state(
+        conn: sqlite3.Connection,
+        key: str,
+        state: _WikimediaApiRateLimitState,
+    ) -> None:
+        conn.execute(
+            f"""
+            INSERT INTO {_RATE_LIMIT_TABLE}
+                (key, next_request_at, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                next_request_at = excluded.next_request_at,
+                updated_at = excluded.updated_at
+            """,
+            (key, state.next_request_at, time.time()),
+        )
+
+
+_WIKIMEDIA_API_RATE_LIMITER = _WikimediaApiRateLimiter()
+
+
+def _requests_exception_type(requests_module: object) -> type[Exception]:
+    namespace = getattr(requests_module, "exceptions", None)
+    request_exception = getattr(namespace, "RequestException", None)
+    if isinstance(request_exception, type) and issubclass(request_exception, Exception):
+        return request_exception
+    return Exception
+
+
+def _http_get(
+    url: str,
+    *,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+) -> Any:
     import requests
 
-    response = requests.get(url, timeout=timeout, headers=headers)
-    response.raise_for_status()
-    return response
+    request_headers = _request_headers(headers)
+    authenticated = "Authorization" in request_headers or "Cookie" in request_headers
+    rate_limit_key = _api_rate_limit_key(request_headers)
+    max_attempts = _api_max_attempts()
+    request_exception_type = _requests_exception_type(requests)
+    last_exc: Exception | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            _WIKIMEDIA_API_RATE_LIMITER.wait_for_slot(
+                key=rate_limit_key,
+                authenticated=authenticated,
+            )
+            response = requests.get(url, timeout=timeout, headers=request_headers)
+        except request_exception_type as exc:
+            last_exc = exc
+            if attempt >= max_attempts:
+                break
+            wait = _retry_delay_seconds(attempt)
+            _log(
+                "  Wikimedia API request failed "
+                f"({type(exc).__name__}); retrying in {wait:.1f}s "
+                f"(attempt {attempt}/{max_attempts})"
+            )
+            time.sleep(wait)
+            continue
+
+        status_code = int(getattr(response, "status_code", 200) or 200)
+        if status_code in _TRANSIENT_STATUS_CODES and attempt < max_attempts:
+            wait = _retry_after_seconds(response)
+            if wait is None:
+                wait = _retry_delay_seconds(attempt)
+            if status_code in {429, 503}:
+                _WIKIMEDIA_API_RATE_LIMITER.defer_for(
+                    key=rate_limit_key,
+                    seconds=wait,
+                )
+            _log(
+                f"  Wikimedia API returned {status_code}; retrying in {wait:.1f}s "
+                f"(attempt {attempt}/{max_attempts})"
+            )
+            time.sleep(wait)
+            continue
+
+        response.raise_for_status()
+        return response
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"Wikimedia request failed unexpectedly for {url}")
 
 
 def _wiki_api_request(
@@ -334,7 +758,7 @@ def _wiki_api_request(
     response = _http_get(
         url,
         timeout=timeout_seconds,
-        headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
+        headers={"Accept": "application/json"},
     )
     data = response.json()
     if not isinstance(data, dict):
@@ -392,7 +816,7 @@ def _resolve_summary(
         response = _http_get(
             url,
             timeout=timeout_seconds,
-            headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
+            headers={"Accept": "application/json"},
         )
     except Exception:
         return WikipediaSummary(description=None, extract=None)
@@ -738,7 +1162,7 @@ def _resolve_media_list(
         response = _http_get(
             url,
             timeout=timeout_seconds,
-            headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
+            headers={"Accept": "application/json"},
         )
     except Exception:
         return ()
@@ -898,6 +1322,70 @@ def wikipedia_settings_cache_key(settings: WikipediaSettings) -> tuple[Any, ...]
     )
 
 
+def _cache_ttl_as_timedelta(value: Any) -> timedelta | None:
+    if value is None:
+        return None
+    if isinstance(value, timedelta):
+        return value
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return timedelta(seconds=max(0.0, float(value)))
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if not raw:
+            return None
+        try:
+            return timedelta(seconds=max(0.0, float(raw)))
+        except ValueError:
+            pass
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)([smhdw])", raw)
+        if not match:
+            return None
+        amount = float(match.group(1))
+        unit = match.group(2)
+        if unit == "s":
+            return timedelta(seconds=amount)
+        if unit == "m":
+            return timedelta(minutes=amount)
+        if unit == "h":
+            return timedelta(hours=amount)
+        if unit == "d":
+            return timedelta(days=amount)
+        return timedelta(weeks=amount)
+    return None
+
+
+def _document_cache_identity(
+    parsed: ParsedWikipediaTarget,
+    settings: WikipediaSettings,
+) -> str:
+    settings_key = wikipedia_settings_cache_key(settings)
+    return f"v1:article:{parsed.canonical_id}:{settings_key!r}"
+
+
+def _document_from_cached_payload(payload: Any) -> WikipediaResolvedDocument | None:
+    if not isinstance(payload, dict):
+        return None
+    fields = (
+        "label",
+        "rendered",
+        "prose",
+        "source_ref",
+        "source_path",
+        "context_subpath",
+        "kind",
+        "canonical_id",
+    )
+    values: dict[str, str] = {}
+    for field in fields:
+        value = payload.get(field)
+        if not isinstance(value, str):
+            return None
+        values[field] = value
+    return WikipediaResolvedDocument(**values)
+
+
 def _extract_intro_section(
     sections: tuple[WikipediaSection, ...],
 ) -> tuple[str, tuple[WikipediaSection, ...]]:
@@ -947,7 +1435,7 @@ def _describe_media(media: WikipediaMedia) -> str | None:
     tmp = download_cached_media_to_temp(
         media.url,
         suffix=_media_suffix(media.url, media.filename),
-        headers={"User-Agent": _USER_AGENT},
+        headers={"User-Agent": _api_user_agent()},
         cache_identity=cache_identity,
         get_cached_media_bytes=lambda _identity: None,
         store_media_bytes=lambda _identity, _content: None,
@@ -1129,16 +1617,27 @@ def resolve_wikipedia_article(
     cache_ttl: Any,
     refresh_cache: bool,
 ) -> WikipediaResolvedDocument:
-    del use_cache
-    del cache_ttl
-    del refresh_cache
-
     parsed = parse_wikipedia_target(target, default_lang=settings.default_lang)
     if parsed is None:
         raise ValueError(f"Unsupported Wikipedia target: {target}")
 
+    cache_identity = _document_cache_identity(parsed, settings)
+    if use_cache and not refresh_cache:
+        from .cache import get_cached_document
+
+        cached = get_cached_document(
+            cache_identity,
+            ttl=_cache_ttl_as_timedelta(cache_ttl),
+        )
+        document = _document_from_cached_payload(cached)
+        if document is not None:
+            _log(f"  wikipedia resolution cache hit: {target}")
+            return document
+
+    timeout_seconds = _api_timeout_seconds()
     parse_payload = _resolve_parse_payload(
-        parsed, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS
+        parsed,
+        timeout_seconds=timeout_seconds,
     )
     html_payload = parse_payload.get("text")
     html_text = ""
@@ -1148,7 +1647,7 @@ def resolve_wikipedia_article(
             html_text = star
 
     extracted = extract_article_data(html_text)
-    summary = _resolve_summary(parsed, timeout_seconds=_DEFAULT_TIMEOUT_SECONDS)
+    summary = _resolve_summary(parsed, timeout_seconds=timeout_seconds)
     intro, body_sections = _extract_intro_section(extracted.sections)
     if not intro and summary.extract:
         intro = summary.extract
@@ -1157,7 +1656,7 @@ def resolve_wikipedia_article(
     if settings.include_media:
         media = _resolve_media_list(
             parsed,
-            timeout_seconds=_DEFAULT_TIMEOUT_SECONDS,
+            timeout_seconds=timeout_seconds,
         )
         media = _describe_media_items(
             media,
@@ -1205,7 +1704,7 @@ def resolve_wikipedia_article(
         )
         source_path = f"{source_path}@oldid={parsed.revision_id}"
 
-    return WikipediaResolvedDocument(
+    document = WikipediaResolvedDocument(
         label=f"wikipedia/{parsed.language}/{title.replace(' ', '_')}",
         rendered=rendered,
         prose=prose,
@@ -1215,3 +1714,8 @@ def resolve_wikipedia_article(
         kind="article",
         canonical_id=parsed.canonical_id,
     )
+    if use_cache:
+        from .cache import store_document
+
+        store_document(cache_identity, asdict(document))
+    return document
