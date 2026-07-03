@@ -4847,3 +4847,6 @@ def resolve_discord_attachment_target(
             },
         }
     ]
+
+normalize_discord_message = _normalize_message
+filter_discord_messages = _filter_messages
