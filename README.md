@@ -19,7 +19,7 @@ This package provides the following plugins:
 | `arxiv` | [arXiv](https://arxiv.org/) | papers |
 | `atproto` | [AT Protocol](https://atproto.com/docs) | posts, profiles, lists, starter packs |
 | `discord` | Discord | messages, threads, channels |
-| `forum_magnum` | ForumMagnum | LessWrong, GreaterWrong, Alignment Forum, and EA Forum posts and comments |
+| `forum_magnum` | ForumMagnum | LessWrong, GreaterWrong, Alignment Forum, and EA Forum posts, comments, and embedded image captions |
 | `googledocs` | Google Docs public export | public documents |
 | `itchio` | [itch.io](https://itch.io/) | game/software pages, profiles, collections |
 | `soundcloud` | SoundCloud | tracks, playlists, profiles |

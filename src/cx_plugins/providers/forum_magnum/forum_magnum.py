@@ -109,6 +109,12 @@ class ForumMagnumSettings:
 
 
 @dataclass(frozen=True)
+class ForumMagnumRenderedHtml:
+    markdown: str
+    images: tuple[dict[str, str | None], ...] = ()
+
+
+@dataclass(frozen=True)
 class ForumMagnumResolvedDocument:
     label: str
     rendered: str
@@ -130,6 +136,14 @@ class ForumMagnumResolvedDocument:
     author: str | None
     score: int | float | None
     dedupe_rank: int
+    images: tuple[dict[str, str | None], ...] = ()
+
+
+@dataclass
+class _HtmlRenderContext:
+    base_url: str
+    images: list[dict[str, str | None]]
+    heading_offset: int = 0
 
 
 _SITES: dict[str, ForumSite] = {
@@ -401,7 +415,8 @@ def _render_post_document(
     author = _author(post)
     canonical_url = _post_canonical_url(parsed, post)
     html_body = _content_html(post)
-    body = _html_to_markdown(html_body, canonical_url)
+    rendered_html = _render_html(html_body, canonical_url, heading_offset=1)
+    body = rendered_html.markdown
     tags = _tags(post)
     frontmatter = {
         "url": canonical_url,
@@ -446,6 +461,7 @@ def _render_post_document(
         author=author,
         score=_number_or_none(post.get("baseScore")),
         dedupe_rank=0,
+        images=rendered_html.images,
     )
 
 
@@ -465,7 +481,8 @@ def _render_comment_document(
         _string_or_none(comment.get("pageUrl"))
         or f"{post_canonical_url}#comment-{comment_id}"
     )
-    body = _html_to_markdown(_content_html(comment), canonical_url)
+    rendered_html = _render_html(_content_html(comment), canonical_url, heading_offset=1)
+    body = rendered_html.markdown
     title = f"Comment by {author}" if author else "Comment"
     frontmatter = {
         "url": canonical_url,
@@ -512,20 +529,47 @@ def _render_comment_document(
         author=author,
         score=_number_or_none(comment.get("baseScore")),
         dedupe_rank=index,
+        images=rendered_html.images,
     )
 
 
-def _html_to_markdown(html_text: str, base_url: str) -> str:
+def _render_html(
+    html_text: str,
+    base_url: str,
+    *,
+    heading_offset: int = 0,
+) -> ForumMagnumRenderedHtml:
     if not html_text.strip():
-        return ""
+        return ForumMagnumRenderedHtml(markdown="")
     tree = HTMLParser(f"<div>{html_text}</div>")
     root = tree.body or tree.root
     if root is None:
-        return _clean_text(html_text, preserve_newlines=True)
-    return _normalize_markdown(_render_children(root, base_url))
+        return ForumMagnumRenderedHtml(
+            markdown=_clean_text(html_text, preserve_newlines=True),
+        )
+    context = _HtmlRenderContext(
+        base_url=base_url,
+        images=[],
+        heading_offset=heading_offset,
+    )
+    markdown = _normalize_markdown(_render_children(root, context))
+    return ForumMagnumRenderedHtml(markdown=markdown, images=tuple(context.images))
 
 
-def _render_node(node: Any, base_url: str) -> str:
+def _html_to_markdown(
+    html_text: str,
+    base_url: str,
+    *,
+    heading_offset: int = 0,
+) -> str:
+    return _render_html(
+        html_text,
+        base_url,
+        heading_offset=heading_offset,
+    ).markdown
+
+
+def _render_node(node: Any, context: _HtmlRenderContext) -> str:
     tag = _node_tag(node)
     if tag == "-text":
         return html.unescape(node.html or node.text() or "")
@@ -536,9 +580,9 @@ def _render_node(node: Any, base_url: str) -> str:
     if tag == "hr":
         return "\n\n---\n\n"
     if tag in {"strong", "b"}:
-        return _wrap_inline(_render_children(node, base_url), "**")
+        return _wrap_inline(_render_children(node, context), "**")
     if tag in {"em", "i"}:
-        return _wrap_inline(_render_children(node, base_url), "*")
+        return _wrap_inline(_render_children(node, context), "*")
     if tag == "code":
         text = _clean_inline(node.text(separator=" "))
         return f"`{text}`" if text else ""
@@ -546,49 +590,84 @@ def _render_node(node: Any, base_url: str) -> str:
         text = (node.text(separator="\n") or "").strip("\n")
         return f"\n\n```\n{text}\n```\n\n" if text else ""
     if tag == "a":
-        text = _clean_inline(_render_children(node, base_url)) or _node_attr(
+        text = _clean_inline(_render_children(node, context)) or _node_attr(
             node,
             "href",
         )
-        href = _absolute_url(base_url, _node_attr(node, "href"))
+        href = _absolute_url(context.base_url, _node_attr(node, "href"))
         if text and href:
-            return f"[{text}]({href})"
+            label = text if _looks_like_markdown_image(text) else _escape_link_label(text)
+            return f"[{label}]({_markdown_url(href)})"
         return text or ""
     if tag == "img":
-        src = _absolute_url(base_url, _node_attr(node, "src"))
-        alt = _clean_inline(_node_attr(node, "alt") or _node_attr(node, "title"))
+        src = _image_source(node, context.base_url)
+        alt = _clean_inline(
+            _node_attr(node, "alt")
+            or _node_attr(node, "title")
+            or _node_attr(node, "aria-label"),
+        )
         if not src:
             return alt or ""
-        return f"\n\n![{alt or 'image'}]({src})\n\n"
+        context.images.append({"url": src, "alt": alt or None, "caption": None})
+        return f"\n\n![{_escape_link_label(alt or 'image')}]({_markdown_url(src)})\n\n"
+    if tag == "figure":
+        return _render_figure(node, context)
+    if tag == "figcaption":
+        rendered = _normalize_markdown(_render_children(node, context))
+        return f"\n\n*Caption:* {rendered}\n\n" if rendered else ""
     if tag in {"h1", "h2", "h3", "h4", "h5", "h6"}:
-        level = int(tag[1])
-        text = _clean_inline(_render_children(node, base_url))
+        level = min(6, int(tag[1]) + context.heading_offset)
+        text = _clean_inline(_render_children(node, context))
         return f"\n\n{'#' * level} {text}\n\n" if text else ""
     if tag == "blockquote":
-        rendered = _normalize_markdown(_render_children(node, base_url))
+        rendered = _normalize_markdown(_render_children(node, context))
         quoted = "\n".join(f"> {line}" if line else ">" for line in rendered.splitlines())
         return f"\n\n{quoted}\n\n" if quoted else ""
     if tag in {"ul", "ol"}:
-        return _render_list(node, base_url, ordered=tag == "ol")
+        return _render_list(node, context, ordered=tag == "ol")
     if tag == "table":
-        return _render_table(node, base_url)
-    rendered = _render_children(node, base_url)
+        return _render_table(node, context)
+    rendered = _render_children(node, context)
     if tag in _BLOCK_TAGS:
         return f"\n\n{rendered}\n\n"
     return rendered
 
 
-def _render_children(node: Any, base_url: str) -> str:
-    return "".join(_render_node(child, base_url) for child in _children(node))
+def _render_children(
+    node: Any,
+    context: _HtmlRenderContext,
+    *,
+    skip_tags: set[str] | None = None,
+) -> str:
+    return "".join(
+        _render_node(child, context)
+        for child in _children(node)
+        if skip_tags is None or _node_tag(child) not in skip_tags
+    )
 
 
-def _render_list(node: Any, base_url: str, *, ordered: bool) -> str:
+def _render_figure(node: Any, context: _HtmlRenderContext) -> str:
+    image_start = len(context.images)
+    rendered = _render_children(node, context, skip_tags={"figcaption"})
+    caption_node = node.css_first("figcaption")
+    if caption_node is not None:
+        caption_markdown = _normalize_markdown(_render_children(caption_node, context))
+        if caption_markdown:
+            caption_text = _clean_inline(caption_node.text(separator=" "))
+            for image in context.images[image_start:]:
+                if image.get("caption") is None:
+                    image["caption"] = caption_text or caption_markdown
+            rendered = f"{rendered}\n\n*Caption:* {caption_markdown}\n\n"
+    return f"\n\n{rendered}\n\n" if rendered else ""
+
+
+def _render_list(node: Any, context: _HtmlRenderContext, *, ordered: bool) -> str:
     lines: list[str] = []
     index = 1
     for child in _children(node):
         if _node_tag(child) != "li":
             continue
-        rendered = _normalize_markdown(_render_children(child, base_url))
+        rendered = _normalize_markdown(_render_children(child, context))
         if not rendered:
             continue
         prefix = f"{index}. " if ordered else "- "
@@ -597,11 +676,11 @@ def _render_list(node: Any, base_url: str, *, ordered: bool) -> str:
     return "\n\n" + "\n".join(lines) + "\n\n" if lines else ""
 
 
-def _render_table(node: Any, base_url: str) -> str:
+def _render_table(node: Any, context: _HtmlRenderContext) -> str:
     rows: list[list[str]] = []
     for tr in node.css("tr"):
         cells = [
-            _clean_inline(_render_children(cell, base_url))
+            _clean_inline(_render_children(cell, context))
             for cell in tr.css("td, th")
         ]
         cells = [cell for cell in cells if cell]
@@ -841,6 +920,62 @@ def _safe_path_segment(value: str, *, fallback: str) -> str:
     return cleaned or fallback
 
 
+def _image_source(node: Any, base_url: str) -> str | None:
+    for attr in (
+        "src",
+        "data-src",
+        "data-original",
+        "data-lazy-src",
+        "data-url",
+    ):
+        value = _absolute_url(base_url, _node_attr(node, attr))
+        if value:
+            return value
+    for attr in ("srcset", "data-srcset"):
+        value = _best_srcset_url(_node_attr(node, attr))
+        if value:
+            return _absolute_url(base_url, value)
+    return None
+
+
+def _best_srcset_url(value: str | None) -> str | None:
+    if not value:
+        return None
+    best_url: str | None = None
+    best_score = -1.0
+    best_index = 0
+    for index, raw_candidate in enumerate(value.split(",")):
+        candidate = raw_candidate.strip()
+        if not candidate:
+            continue
+        parts = candidate.split()
+        url = parts[0]
+        score = _srcset_descriptor_score(parts[1:])
+        if score > best_score or (
+            score == best_score and best_score > 0 and index > best_index
+        ):
+            best_url = url
+            best_score = score
+            best_index = index
+    return best_url
+
+
+def _srcset_descriptor_score(descriptors: list[str]) -> float:
+    score = 0.0
+    for descriptor in descriptors:
+        if descriptor.endswith("w"):
+            try:
+                score = max(score, float(descriptor[:-1]))
+            except ValueError:
+                continue
+        elif descriptor.endswith("x"):
+            try:
+                score = max(score, float(descriptor[:-1]) * 1000)
+            except ValueError:
+                continue
+    return score
+
+
 def _absolute_url(base_url: str, value: str | None) -> str | None:
     if not value:
         return None
@@ -848,6 +983,25 @@ def _absolute_url(base_url: str, value: str | None) -> str | None:
     if parsed.scheme in {"http", "https"}:
         return value
     return urljoin(base_url, value)
+
+
+def _markdown_url(value: str) -> str:
+    if re.search(r"[\s()]", value):
+        return f"<{value.replace('>', '%3E')}>"
+    return value
+
+
+def _escape_link_label(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace("\n", " ")
+    )
+
+
+def _looks_like_markdown_image(value: str) -> bool:
+    return value.lstrip().startswith("![")
 
 
 def _node_tag(node: Any) -> str:

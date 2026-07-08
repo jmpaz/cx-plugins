@@ -136,6 +136,8 @@ def resolve(target: str, context: dict[str, Any]) -> list[dict[str, Any]]:
             "parent_comment_id": document.parent_comment_id,
             "author": document.author,
             "score": document.score,
+            "image_count": len(document.images),
+            "images": list(document.images),
             "settings_key": settings_key,
             "hydrate_dedupe": {
                 "mode": "canonical_symlink",

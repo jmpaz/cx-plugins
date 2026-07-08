@@ -89,6 +89,41 @@ def test_html_to_markdown_preserves_emphasis_boundary_spaces() -> None:
     )
 
 
+def test_html_to_markdown_renders_images_and_captions_cleanly() -> None:
+    markdown = forum_magnum._html_to_markdown(  # noqa: SLF001
+        """
+        <figure>
+          <img src="/img.png" alt="Diagram [v1]">
+          <figcaption>Caption <a href="/source">source</a></figcaption>
+        </figure>
+        <p>Before</p>
+        <img data-src="/lazy.png" alt="Lazy image">
+        <img srcset="/small.png 400w, /large.png 1200w" alt="Responsive only">
+        <img alt="">
+        <a href="/full"><img src="/thumb.png" alt="Thumbnail"></a>
+        """,
+        "https://example.com/posts/post",
+    )
+
+    assert "![Diagram \\[v1\\]](https://example.com/img.png)" in markdown
+    assert "*Caption:* Caption [source](https://example.com/source)" in markdown
+    assert "![Lazy image](https://example.com/lazy.png)" in markdown
+    assert "![Responsive only](https://example.com/large.png)" in markdown
+    assert "![image]" not in markdown
+    assert "[![Thumbnail](https://example.com/thumb.png)](https://example.com/full)" in markdown
+
+
+def test_html_to_markdown_can_demote_body_headings() -> None:
+    markdown = forum_magnum._html_to_markdown(  # noqa: SLF001
+        "<h1>Part One</h1><h6>Deep Header</h6>",
+        "https://example.com/posts/post",
+        heading_offset=1,
+    )
+
+    assert "## Part One" in markdown
+    assert "###### Deep Header" in markdown
+
+
 def test_resolve_forum_magnum_url_renders_post_and_comments(monkeypatch) -> None:
     calls: list[dict[str, Any]] = []
 
@@ -108,7 +143,15 @@ def test_resolve_forum_magnum_url_renders_post_and_comments(monkeypatch) -> None
                             "voteCount": 47,
                             "commentCount": 2,
                             "contents": {
-                                "html": "<p>Hello <strong>world</strong>. <a href='/x'>relative</a></p>"
+                                "html": (
+                                    "<h1>Part One</h1>"
+                                    "<p>Hello <strong>world</strong>. "
+                                    "<a href='/x'>relative</a></p>"
+                                    "<figure>"
+                                    "<img src='/diagram.png' alt='Diagram'>"
+                                    "<figcaption>Caption <a href='/source'>source</a></figcaption>"
+                                    "</figure>"
+                                )
                             },
                             "user": {
                                 "username": "author-handle",
@@ -172,8 +215,18 @@ def test_resolve_forum_magnum_url_renders_post_and_comments(monkeypatch) -> None
     assert documents[0].canonical_id == "ea_forum:post:post123"
     assert documents[0].prose_authors == ("Author Name",)
     assert "# Deep Models" in documents[0].rendered
+    assert "## Part One" in documents[0].rendered
     assert "**world**" in documents[0].rendered
     assert "[relative](https://forum.effectivealtruism.org/x)" in documents[0].rendered
+    assert "![Diagram](https://forum.effectivealtruism.org/diagram.png)" in documents[0].rendered
+    assert "*Caption:* Caption [source](https://forum.effectivealtruism.org/source)" in documents[0].rendered
+    assert documents[0].images == (
+        {
+            "url": "https://forum.effectivealtruism.org/diagram.png",
+            "alt": "Diagram",
+            "caption": "Caption source",
+        },
+    )
     assert "resolved_comment_count: 2" in documents[0].rendered
     assert documents[1].kind == "comment"
     assert documents[1].parent_comment_id is None
@@ -203,6 +256,13 @@ def test_plugin_resolve_returns_contextualize_documents(monkeypatch) -> None:
         author="Author",
         score=10,
         dedupe_rank=0,
+        images=(
+            {
+                "url": "https://www.lesswrong.com/image.png",
+                "alt": "Image",
+                "caption": "An image",
+            },
+        ),
     )
     monkeypatch.setattr(
         forum_magnum,
@@ -239,6 +299,14 @@ def test_plugin_resolve_returns_contextualize_documents(monkeypatch) -> None:
                 "parent_comment_id": None,
                 "author": "Author",
                 "score": 10,
+                "image_count": 1,
+                "images": [
+                    {
+                        "url": "https://www.lesswrong.com/image.png",
+                        "alt": "Image",
+                        "caption": "An image",
+                    },
+                ],
                 "settings_key": (
                     ("include_comments", False),
                     ("max_comments", 500),
