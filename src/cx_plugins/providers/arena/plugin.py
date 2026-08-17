@@ -1033,6 +1033,11 @@ def _channel_documents(
     channel_block.setdefault("type", "Channel")
     channel_block.setdefault("base_type", "Channel")
     channel_block.setdefault("slug", slug)
+    freshness_receipt = _channel_freshness_receipt(
+        channel_block,
+        target=target,
+        slug=slug,
+    )
     channel_ref = ArenaReference(
         target,
         block=channel_block,
@@ -1078,6 +1083,7 @@ def _channel_documents(
                 "dir_created": channel_block.get("created_at"),
                 "dir_modified": channel_block.get("updated_at"),
                 "settings_key": settings_key,
+                "freshness_receipt": freshness_receipt,
                 "hydrate_dedupe": channel_dedupe,
             },
         }
@@ -1153,11 +1159,52 @@ def _channel_documents(
                     **_block_connection_metadata(block),
                     **_block_source_metadata(block),
                     "settings_key": settings_key,
+                    "freshness_receipt": freshness_receipt,
+                    "enrichment_completeness": dict(
+                        block.get("_contextualize_enrichment") or {}
+                    ),
                     "hydrate_dedupe": dedupe,
                 },
             }
         )
     return out
+
+
+def _channel_freshness_receipt(
+    channel: dict[str, Any],
+    *,
+    target: str,
+    slug: str,
+) -> dict[str, Any]:
+    from .arena import _channel_content_count
+
+    return {
+        "provider": PLUGIN_NAME,
+        "kind": "channel",
+        "target": target,
+        "slug": slug,
+        "revision": channel.get("updated_at"),
+        "content_count": _channel_content_count(channel),
+    }
+
+
+def probe_freshness(
+    receipt: dict[str, Any],
+    _context: dict[str, Any],
+) -> dict[str, Any]:
+    if receipt.get("kind") != "channel" or not isinstance(receipt.get("slug"), str):
+        return {"state": "unknown", "reason": "unsupported Are.na receipt"}
+    from .arena import _channel_content_count, _fetch_channel
+
+    live = _fetch_channel(receipt["slug"])
+    live_revision = live.get("updated_at")
+    live_count = _channel_content_count(live)
+    if receipt.get("revision") != live_revision:
+        return {"state": "stale", "revision": str(live_revision or "")}
+    expected_count = receipt.get("content_count")
+    if expected_count is not None and live_count != expected_count:
+        return {"state": "stale", "revision": str(live_revision or "")}
+    return {"state": "fresh", "revision": str(live_revision or "")}
 
 
 def _arena_listing_settings(settings: Any) -> dict[str, Any]:

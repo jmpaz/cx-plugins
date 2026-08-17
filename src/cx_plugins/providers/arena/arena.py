@@ -552,6 +552,7 @@ def _api_get(path: str, params: dict | None = None) -> dict:
                 key=rate_limit_key,
                 authenticated=authenticated,
             )
+            record_progress("arena", "remote-request", "request", target=path)
             resp = requests.get(url, headers=headers, params=params, timeout=timeout)
         except request_exception_type as exc:
             last_exc = exc
@@ -562,6 +563,7 @@ def _api_get(path: str, params: dict | None = None) -> dict:
                 f"  Are.na request failed ({type(exc).__name__}); retrying in {wait:.1f}s "
                 f"(attempt {attempt}/{max_attempts})"
             )
+            record_progress("arena", "remote-request", "retry", target=path)
             time.sleep(wait)
             continue
 
@@ -594,6 +596,7 @@ def _api_get(path: str, params: dict | None = None) -> dict:
                     f"{wait:.1f}s (attempt {attempt}/{max_attempts})"
                 )
             _log(message)
+            record_progress("arena", "remote-request", "retry", target=path)
             time.sleep(wait)
             continue
 
@@ -1725,6 +1728,40 @@ def _render_block_binary(
     media_cache_identity: str | None = None,
     send_label: str | None = None,
 ) -> str:
+    from ..shared.singleflight import singleflight
+    from contextualize.runtime import get_refresh_media
+
+    key = (
+        "arena-media",
+        url,
+        suffix,
+        bool(get_refresh_media()),
+        os.getenv("OPENAI_BASE_URL"),
+        os.getenv("OPENAI_MODEL"),
+        os.getenv("OPENAI_PROMPT"),
+        os.getenv("OPENAI_VIDEO_PROMPT"),
+    )
+    return singleflight.run(
+        key,
+        lambda: _render_block_binary_uncollapsed(
+            url,
+            suffix,
+            media_cache_identity=media_cache_identity,
+            send_label=send_label,
+        ),
+        provider="arena",
+        operation="media",
+        target=url,
+    )
+
+
+def _render_block_binary_uncollapsed(
+    url: str,
+    suffix: str,
+    *,
+    media_cache_identity: str | None = None,
+    send_label: str | None = None,
+) -> str:
     from contextualize.render.markitdown import (
         MarkItDownConversionError,
         convert_path_to_markdown,
@@ -2194,6 +2231,37 @@ def _block_connections_output(
     include_connections: bool,
     max_items: int | None,
 ) -> str:
+    if not include_connections:
+        return ""
+    from ..shared.singleflight import singleflight
+    from contextualize.runtime import get_refresh_cache
+
+    block_id = block.get("id")
+    source_context = _block_source_channel_context(block)
+    identity = _block_connection_cache_identity(
+        block,
+        max_items=max_items,
+        source_context=source_context,
+    ) or f"block:{block_id}:max={max_items}:source={source_context}"
+    return singleflight.run(
+        ("arena-connections", identity, bool(get_refresh_cache())),
+        lambda: _block_connections_output_uncollapsed(
+            block,
+            include_connections=include_connections,
+            max_items=max_items,
+        ),
+        provider="arena",
+        operation="block-connections",
+        target=str(block_id) if block_id is not None else None,
+    )
+
+
+def _block_connections_output_uncollapsed(
+    block: dict,
+    *,
+    include_connections: bool,
+    max_items: int | None,
+) -> str:
     from .cache import (
         get_cached_block_connections,
         store_block_connections,
@@ -2202,9 +2270,11 @@ def _block_connections_output(
     from contextualize.runtime import get_refresh_cache
 
     if not include_connections:
+        block["_contextualize_connections_complete"] = True
         return ""
     block_id = block.get("id")
     if not isinstance(block_id, int):
+        block["_contextualize_connections_complete"] = True
         return ""
 
     source_context = _block_source_channel_context(block)
@@ -2218,6 +2288,7 @@ def _block_connections_output(
             cache_identity, ttl=_get_connections_cache_ttl()
         )
         if cached is not None:
+            block["_contextualize_connections_complete"] = True
             return cached
 
     connected_section = ""
@@ -2236,8 +2307,11 @@ def _block_connections_output(
         _log(
             f"  failed to fetch connected channels for block {block_id}: {type(exc).__name__}"
         )
+        block["_contextualize_connections_complete"] = False
+        return ""
 
     rendered = connected_section
+    block["_contextualize_connections_complete"] = True
     if cache_identity is not None:
         store_block_connections(cache_identity, rendered)
     return rendered
@@ -2550,6 +2624,137 @@ def _format_media_fallback_output(
 
 
 def _render_block(
+    block: dict,
+    *,
+    include_descriptions: bool | None = None,
+    include_comments: bool | None = None,
+    include_connections: bool | None = None,
+    connections_max_items: int | None = None,
+    include_link_image_descriptions: bool | None = None,
+    include_pdf_content: bool | None = None,
+    include_media_descriptions: bool | None = None,
+) -> str | None:
+    from ..shared.singleflight import singleflight
+    from contextualize.runtime import (
+        get_refresh_cache,
+        get_refresh_images,
+        get_refresh_media,
+        get_refresh_videos,
+    )
+
+    block_id = block.get("id")
+    identity = block_id if block_id is not None else json.dumps(
+        block, sort_keys=True, default=str
+    )
+    key = (
+        "arena-block-render",
+        identity,
+        block.get("updated_at"),
+        include_descriptions,
+        include_comments,
+        include_connections,
+        connections_max_items,
+        include_link_image_descriptions,
+        include_pdf_content,
+        include_media_descriptions,
+        bool(get_refresh_cache()),
+        bool(get_refresh_images()),
+        bool(get_refresh_videos()),
+        bool(get_refresh_media()),
+    )
+    result, enrichment = singleflight.run(
+        key,
+        lambda: _render_block_with_enrichment(
+            block,
+            include_descriptions,
+            include_comments,
+            include_connections,
+            connections_max_items,
+            include_link_image_descriptions,
+            include_pdf_content,
+            include_media_descriptions,
+        ),
+        provider="arena",
+        operation="block-render",
+        target=str(block_id) if block_id is not None else None,
+    )
+    block["_contextualize_enrichment"] = enrichment
+    return result
+
+
+def _render_block_with_enrichment(
+    block: dict,
+    include_descriptions: bool | None,
+    include_comments: bool | None,
+    include_connections: bool | None,
+    connections_max_items: int | None,
+    include_link_image_descriptions: bool | None,
+    include_pdf_content: bool | None,
+    include_media_descriptions: bool | None,
+) -> tuple[str | None, dict[str, bool]]:
+    rendered = _render_block_uncollapsed(
+        block,
+        include_descriptions=include_descriptions,
+        include_comments=include_comments,
+        include_connections=include_connections,
+        connections_max_items=connections_max_items,
+        include_link_image_descriptions=include_link_image_descriptions,
+        include_pdf_content=include_pdf_content,
+        include_media_descriptions=include_media_descriptions,
+    )
+    connections_requested = (
+        _get_include_connections()
+        if include_connections is None
+        else include_connections
+    )
+    media_requested = (
+        _get_include_media_descriptions()
+        if include_media_descriptions is None
+        else include_media_descriptions
+    )
+    enrichment = {
+        "connections": (
+            not connections_requested
+            or block.get("_contextualize_connections_complete") is True
+        ),
+        "media_descriptions": _media_description_is_complete(
+            block,
+            rendered or "",
+            requested=bool(media_requested),
+        ),
+    }
+    return rendered, enrichment
+
+
+def _media_description_is_complete(
+    block: dict,
+    rendered: str,
+    *,
+    requested: bool,
+) -> bool:
+    if not requested:
+        return True
+    block_type = block.get("class") or block.get("type", "")
+    if block_type == "Image":
+        return "(auto-generated)" in rendered
+    if block_type == "Attachment":
+        attachment = block.get("attachment")
+        if not isinstance(attachment, dict):
+            return True
+        filename = _attachment_filename(attachment)
+        extension = Path(filename).suffix.lower()
+        content_type = str(attachment.get("content_type") or "")
+        kind = _attachment_media_kind(
+            filename=filename,
+            extension=extension,
+            content_type=content_type,
+        )
+        if kind in {"image", "video", "audio"}:
+            return "(auto-generated)" in rendered
+    return True
+
+
+def _render_block_uncollapsed(
     block: dict,
     *,
     include_descriptions: bool | None = None,
@@ -3417,6 +3622,40 @@ def _cached_channel_is_current(slug: str, cached_metadata: dict) -> bool:
 
 
 def resolve_channel(
+    slug: str,
+    *,
+    use_cache: bool = True,
+    cache_ttl: timedelta | None = None,
+    refresh_cache: bool = False,
+    settings: ArenaSettings | None = None,
+) -> tuple[dict, list[tuple[str, dict]]]:
+    from ..shared.singleflight import singleflight
+
+    effective_settings = settings or _arena_settings_from_env()
+    key = (
+        "arena-channel",
+        slug,
+        use_cache,
+        cache_ttl.total_seconds() if cache_ttl is not None else None,
+        refresh_cache,
+        repr(effective_settings),
+    )
+    return singleflight.run(
+        key,
+        lambda: _resolve_channel_uncollapsed(
+            slug,
+            use_cache=use_cache,
+            cache_ttl=cache_ttl,
+            refresh_cache=refresh_cache,
+            settings=effective_settings,
+        ),
+        provider="arena",
+        operation="channel",
+        target=slug,
+    )
+
+
+def _resolve_channel_uncollapsed(
     slug: str,
     *,
     use_cache: bool = True,

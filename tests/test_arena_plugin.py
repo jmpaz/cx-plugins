@@ -1,10 +1,13 @@
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import click
 import pytest
+from contextualize.progress import progress_summary_lines, reset_progress
 
 from cx_plugins.providers.arena import arena
 from cx_plugins.providers.arena import plugin as arena_plugin
@@ -21,7 +24,6 @@ from cx_plugins.providers.arena.plugin import (
     collect_cli_overrides,
     register_cli_options,
 )
-from contextualize.progress import progress_summary_lines, reset_progress
 
 
 def _listed_targets(result: dict) -> list[dict]:
@@ -2056,3 +2058,106 @@ def test_recurse_blocks_uses_stricter_global_channel_limit(monkeypatch) -> None:
     assert len(flat) == 26
     assert flat[0][1]["type"] == "Channel"
     assert [block["id"] for _, block in flat[1:]] == list(range(1000, 1025))
+
+
+@pytest.mark.parametrize(
+    ("operation", "progress_operation", "invoke", "replacement"),
+    [
+        (
+            "channel",
+            "channel",
+            lambda: arena.resolve_channel(
+                "overlap",
+                use_cache=False,
+                settings=ArenaSettings(max_depth=0),
+            ),
+            "_resolve_channel_uncollapsed",
+        ),
+        (
+            "block",
+            "block-render",
+            lambda: arena._render_block(
+                {"id": 7, "type": "Text", "updated_at": "now", "content": "x"},
+                include_connections=False,
+            ),
+            "_render_block_with_enrichment",
+        ),
+        (
+            "connections",
+            "block-connections",
+            lambda: arena._block_connections_output(
+                {"id": 7, "type": "Text"},
+                include_connections=True,
+                max_items=30,
+            ),
+            "_block_connections_output_uncollapsed",
+        ),
+        (
+            "media",
+            "media",
+            lambda: arena._render_block_binary(
+                "https://example.test/video.mp4",
+                ".mp4",
+            ),
+            "_render_block_binary_uncollapsed",
+        ),
+    ],
+)
+def test_overlapping_arena_work_is_coalesced(
+    monkeypatch,
+    operation: str,
+    progress_operation: str,
+    invoke,
+    replacement: str,
+) -> None:
+    reset_progress()
+    calls = 0
+
+    def _work(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        time.sleep(0.05)
+        if operation == "channel":
+            return ({"id": 1, "title": "Overlap"}, [])
+        if operation == "block":
+            return ("rendered", {"connections": True, "media_descriptions": True})
+        return "rendered"
+
+    monkeypatch.setattr(arena, replacement, _work)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _index: invoke(), range(2)))
+
+    assert calls == 1
+    assert results[0] == results[1]
+    assert f"  arena {progress_operation}: coalesced=1" in progress_summary_lines()
+    reset_progress()
+
+
+def test_singleflight_failure_does_not_poison_later_retry(monkeypatch) -> None:
+    calls = 0
+
+    def _work(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient")
+        return ({"id": 1, "title": "Recovered"}, [])
+
+    monkeypatch.setattr(arena, "_resolve_channel_uncollapsed", _work)
+    settings = ArenaSettings(max_depth=0)
+
+    with pytest.raises(RuntimeError, match="transient"):
+        arena.resolve_channel("retry", use_cache=False, settings=settings)
+    recovered = arena.resolve_channel("retry", use_cache=False, settings=settings)
+
+    assert recovered[0]["title"] == "Recovered"
+    assert calls == 2
+
+
+def test_default_nested_channel_recursion_is_same_owner() -> None:
+    same_owner = {"owner": {"id": 10, "slug": "root"}}
+    other_owner = {"owner": {"id": 20, "slug": "other"}}
+
+    assert arena._should_recurse(same_owner, {"self"}, 10) is True
+    assert arena._should_recurse(other_owner, {"self"}, 10) is False
+    assert arena._should_recurse(other_owner, None, 10) is True

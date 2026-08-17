@@ -81,7 +81,7 @@ def get_cached_block_render(
     record_progress(
         "arena",
         "block-render",
-        "cache_hit" if cached is not None else "cache_miss",
+        "cache_hit" if cached is not None else "backfill",
         target=str(block_id),
     )
     return cached
@@ -136,7 +136,7 @@ def get_cached_block_connections(
     record_progress(
         "arena",
         "block-connections",
-        "cache_hit" if cached is not None else "cache_miss",
+        "cache_hit" if cached is not None else "backfill",
     )
     return cached
 
