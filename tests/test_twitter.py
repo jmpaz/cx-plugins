@@ -238,6 +238,22 @@ def test_fx_url_facets_are_resolved_without_links_section(monkeypatch) -> None:
     assert "## Links" not in docs[0].rendered
 
 
+def test_fx_tweet_preserves_paragraph_breaks(monkeypatch) -> None:
+    tweet = _fx_tweet(
+        handle="synthetic_root",
+        tweet_id=_ROOT_ID,
+        text="First paragraph.\n\nSecond paragraph.",
+    )
+    _patch_fx_payloads(monkeypatch, {_fx_url("synthetic_root", _ROOT_ID): tweet})
+
+    docs = twitter.resolve_twitter_url(
+        f"https://x.com/synthetic_root/status/{_ROOT_ID}",
+        use_cache=False,
+    )
+
+    assert _body(docs[0].rendered) == "First paragraph.\n\nSecond paragraph."
+
+
 def test_default_quote_depth_fetches_direct_and_nested_quotes(monkeypatch) -> None:
     nested = _fx_tweet(
         handle="synthetic_nested",

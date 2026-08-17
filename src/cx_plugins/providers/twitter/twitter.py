@@ -372,7 +372,7 @@ def _http_get_text(url: str, *, timeout: int) -> str:
 def _clean_text(value: str) -> str:
     text = unescape(value)
     text = re.sub(r"[ \t\r\f\v]+", " ", text)
-    text = re.sub(r" *\n+ *", "\n", text)
+    text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
