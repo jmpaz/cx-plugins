@@ -1725,9 +1725,9 @@ class YtDlpReference:
                 render_video_frame_section,
                 resolve_video_frame_settings,
             )
-            from contextualize.runtime import get_skip_media
+            from contextualize.runtime import get_cache_only, get_skip_media
 
-            if get_skip_media():
+            if get_skip_media() or get_cache_only():
                 return ""
             if not resolve_video_frame_settings(self.plugin_overrides).frames:
                 return ""

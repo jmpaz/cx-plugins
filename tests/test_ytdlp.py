@@ -363,6 +363,20 @@ def test_fetch_metadata_wraps_subprocess_timeout(monkeypatch) -> None:
         ytdlp.YtDlpReference._fetch_metadata(ref)
 
 
+def test_render_video_frames_skips_download_when_cache_only(monkeypatch) -> None:
+    ref = object.__new__(ytdlp.YtDlpReference)
+    ref.url = "https://example.com/watch"
+    ref.plugin_overrides = None
+
+    def _extract_video(_self):
+        raise AssertionError("cache-only must not download the frame video")
+
+    monkeypatch.setattr(ytdlp.YtDlpReference, "_extract_video", _extract_video)
+    monkeypatch.setattr("contextualize.runtime.get_cache_only", lambda: True)
+
+    assert ytdlp.YtDlpReference._render_video_frames(ref, None) == ""
+
+
 def test_transcription_failure_still_renders_video_frames(monkeypatch) -> None:
     ref = object.__new__(ytdlp.YtDlpReference)
     ref.url = "https://example.com/watch"
