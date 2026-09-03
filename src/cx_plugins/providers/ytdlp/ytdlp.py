@@ -1564,6 +1564,7 @@ class YtDlpReference:
             store_media_bytes,
         )
         from ..shared.concurrency import download_lane
+        from ..shared.progress import record_progress
         from contextualize.runtime import get_refresh_audio
 
         identity = self._get_identity()
@@ -1580,6 +1581,7 @@ class YtDlpReference:
         tmpdir = tempfile.mkdtemp(prefix="ytdlp-")
         output_template = os.path.join(tmpdir, f"{identity.slug}.%(ext)s")
 
+        record_progress("ytdlp", "download", "start", target=identity.display_name)
         with download_lane():
             # TikTok's h265/bytevc1 formats advertise aac but download audio-less, so a
             # plain `best` picks one and `-x` fails ("unable to obtain file audio codec");
@@ -1624,6 +1626,14 @@ class YtDlpReference:
             if not audio_files:
                 raise RuntimeError("yt-dlp audio extraction produced no audio file")
             _log(f"audio extraction finished for {identity.display_name}")
+            record_progress(
+                "ytdlp",
+                "download",
+                "processed",
+                target=identity.display_name,
+                detail="audio",
+                size_bytes=audio_files[0].stat().st_size,
+            )
             if self.use_cache:
                 try:
                     store_media_bytes(cache_identity, audio_files[0].read_bytes())
@@ -1638,6 +1648,7 @@ class YtDlpReference:
             store_media_bytes,
         )
         from ..shared.concurrency import download_lane
+        from ..shared.progress import record_progress
         from contextualize.runtime import get_refresh_videos
 
         identity = self._get_identity()
@@ -1654,6 +1665,7 @@ class YtDlpReference:
         tmpdir = tempfile.mkdtemp(prefix="ytdlp-video-")
         output_template = os.path.join(tmpdir, f"{identity.slug}.%(ext)s")
 
+        record_progress("ytdlp", "download", "start", target=identity.display_name)
         with download_lane():
             result = _run_ytdlp(
                 [
@@ -1689,6 +1701,14 @@ class YtDlpReference:
             if not video_files:
                 raise RuntimeError("yt-dlp video extraction produced no video file")
             _log(f"video extraction finished for {identity.display_name}")
+            record_progress(
+                "ytdlp",
+                "download",
+                "processed",
+                target=identity.display_name,
+                detail="video",
+                size_bytes=video_files[0].stat().st_size,
+            )
             if self.use_cache:
                 try:
                     store_media_bytes(cache_identity, video_files[0].read_bytes())
