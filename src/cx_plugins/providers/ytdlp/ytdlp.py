@@ -1509,16 +1509,24 @@ class YtDlpReference:
             return self._metadata
 
         _log(f"fetching metadata for {self.url}")
-        result = _run_ytdlp(
-            [
-                "--dump-single-json",
-                "--no-download",
-                "--no-playlist",
-                "--",
-                self._metadata_url(),
-            ],
-            timeout_seconds=60,
-        )
+        try:
+            result = _run_ytdlp(
+                [
+                    "--dump-single-json",
+                    "--no-download",
+                    "--no-playlist",
+                    "--",
+                    self._metadata_url(),
+                ],
+                timeout_seconds=60,
+            )
+        except subprocess.SubprocessError as exc:
+            if is_instagram_media_url(self.url):
+                metadata = _fetch_instagram_metadata(self.url)
+                if metadata is not None:
+                    self._metadata = metadata
+                    return self._metadata
+            raise RuntimeError(f"yt-dlp metadata failed: {exc}") from exc
         if result.returncode != 0:
             if is_instagram_media_url(self.url):
                 metadata = _fetch_instagram_metadata(self.url)

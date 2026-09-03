@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 import sys
+
+import pytest
 
 from contextualize import transcription
 from contextualize.plugins.api import TranscriptionResult
@@ -344,6 +347,20 @@ def test_format_output_marks_transcription_failure_distinctly() -> None:
     assert ref._prose is None
     assert "Transcript unavailable: yt-dlp audio extraction failed" in rendered
     assert "*No transcript available.*" not in rendered
+
+
+def test_fetch_metadata_wraps_subprocess_timeout(monkeypatch) -> None:
+    ref = object.__new__(ytdlp.YtDlpReference)
+    ref.url = "https://www.reddit.com/r/raspberry_pi/comments/1ons5bd/"
+    ref._metadata = None
+
+    def _run_ytdlp(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd="yt-dlp", timeout=60)
+
+    monkeypatch.setattr(ytdlp, "_run_ytdlp", _run_ytdlp)
+
+    with pytest.raises(RuntimeError, match="yt-dlp metadata failed"):
+        ytdlp.YtDlpReference._fetch_metadata(ref)
 
 
 def test_transcription_failure_still_renders_video_frames(monkeypatch) -> None:
