@@ -377,6 +377,34 @@ def test_render_video_frames_skips_download_when_cache_only(monkeypatch) -> None
     assert ytdlp.YtDlpReference._render_video_frames(ref, None) == ""
 
 
+def test_transient_transcription_failure_skips_video_frames(monkeypatch) -> None:
+    from contextualize.transcription import TransientTranscriptionError
+
+    ref = object.__new__(ytdlp.YtDlpReference)
+    ref.url = "https://example.com/watch"
+    ref._identity = ytdlp._identity_from_cache_identity("youtube:abc123")
+
+    def _get_transcript_result(_self, _duration):
+        raise TransientTranscriptionError("transcription queue is full")
+
+    def _render_video_frames(_self, _transcript_result):
+        raise AssertionError("transient failure must not download the frame video")
+
+    monkeypatch.setattr(
+        ytdlp.YtDlpReference, "_get_transcript_result", _get_transcript_result
+    )
+    monkeypatch.setattr(
+        ytdlp.YtDlpReference, "_render_video_frames", _render_video_frames
+    )
+
+    transcript, source, frames = ytdlp.YtDlpReference._get_transcript_and_frames(ref, 12)
+
+    assert transcript == ""
+    assert source == "error"
+    assert frames == ""
+    assert "temporarily unavailable" in ref._transcript_error
+
+
 def test_transcription_failure_still_renders_video_frames(monkeypatch) -> None:
     ref = object.__new__(ytdlp.YtDlpReference)
     ref.url = "https://example.com/watch"
@@ -475,6 +503,19 @@ def test_providers_do_not_import_private_transcription_helpers() -> None:
         text = path.read_text(encoding="utf-8")
         if "contextualize.references.audio_transcription import _" in text:
             offenders.append(path.relative_to(provider_root).as_posix())
+
+    assert offenders == []
+
+
+def test_transcribe_providers_do_not_acquire_the_transcription_lane() -> None:
+    transcribe_root = (
+        Path(__file__).parents[1] / "src" / "cx_plugins" / "providers" / "transcribe"
+    )
+    offenders = [
+        path.relative_to(transcribe_root).as_posix()
+        for path in transcribe_root.rglob("*.py")
+        if "transcription_lane" in path.read_text(encoding="utf-8")
+    ]
 
     assert offenders == []
 

@@ -1760,18 +1760,39 @@ class YtDlpReference:
             return ""
 
     def _get_transcript_and_frames(self, duration: int) -> tuple[str, str, str]:
+        from ..shared.progress import record_progress
+        from contextualize.transcription import TransientTranscriptionError
+
         transcript_result = None
         transcript = ""
         source = "none"
+        transient = False
         try:
             transcript_result, source = self._get_transcript_result(duration)
             transcript = transcript_result.text
+        except TransientTranscriptionError as exc:
+            identity = getattr(self, "_identity", None)
+            display_name = getattr(identity, "display_name", self.url)
+            source = "error"
+            transient = True
+            self._transcript_error = f"transcription temporarily unavailable: {exc}"
+            _warn(f"transcription temporarily unavailable for {display_name}: {exc}")
         except Exception as exc:
             identity = getattr(self, "_identity", None)
             display_name = getattr(identity, "display_name", self.url)
             source = "error"
             self._transcript_error = str(exc)
             _warn(f"transcription failed for {display_name}: {exc}")
+        if transient:
+            identity = getattr(self, "_identity", None)
+            record_progress(
+                "ytdlp",
+                "video-frames",
+                "skipped",
+                target=getattr(identity, "display_name", self.url),
+                detail="transient transcription failure",
+            )
+            return transcript, source, ""
         return transcript, source, self._render_video_frames(transcript_result)
 
     def _render_output_text(self, text: str) -> str:
