@@ -1563,6 +1563,7 @@ class YtDlpReference:
             get_cached_media_bytes,
             store_media_bytes,
         )
+        from ..shared.concurrency import download_lane
         from contextualize.runtime import get_refresh_audio
 
         identity = self._get_identity()
@@ -1579,61 +1580,64 @@ class YtDlpReference:
         tmpdir = tempfile.mkdtemp(prefix="ytdlp-")
         output_template = os.path.join(tmpdir, f"{identity.slug}.%(ext)s")
 
-        # TikTok's h265/bytevc1 formats advertise aac but download audio-less, so a
-        # plain `best` picks one and `-x` fails ("unable to obtain file audio codec");
-        # prefer an audio-bearing avc/h264 combined format before falling back.
-        result = _run_ytdlp(
-            [
-                "-f",
-                "bestaudio/best[vcodec~='^(avc|h264)']/best",
-                "--concurrent-fragments",
-                "16",
-                "-x",
-                "--newline",
-                "--progress",
-                "--socket-timeout",
-                "30",
-                "--audio-format",
-                "mp3",
-                "--audio-quality",
-                "5",
-                "--no-playlist",
-                "-o",
-                output_template,
-                "--",
-                self._metadata_url(),
-            ],
-            timeout_seconds=None,
-            idle_timeout_seconds=180,
-            stream_progress=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"yt-dlp audio extraction failed: {result.stderr}")
-
-        audio_dir = Path(tmpdir)
-        audio_files = sorted(audio_dir.glob("*.mp3"))
-        if not audio_files:
-            audio_files = sorted(
-                path
-                for path in audio_dir.iterdir()
-                if path.is_file() and path.suffix.lower() in _AUDIO_EXTRACTION_SUFFIXES
+        with download_lane():
+            # TikTok's h265/bytevc1 formats advertise aac but download audio-less, so a
+            # plain `best` picks one and `-x` fails ("unable to obtain file audio codec");
+            # prefer an audio-bearing avc/h264 combined format before falling back.
+            result = _run_ytdlp(
+                [
+                    "-f",
+                    "bestaudio/best[vcodec~='^(avc|h264)']/best",
+                    "--concurrent-fragments",
+                    "16",
+                    "-x",
+                    "--newline",
+                    "--progress",
+                    "--socket-timeout",
+                    "30",
+                    "--audio-format",
+                    "mp3",
+                    "--audio-quality",
+                    "5",
+                    "--no-playlist",
+                    "-o",
+                    output_template,
+                    "--",
+                    self._metadata_url(),
+                ],
+                timeout_seconds=None,
+                idle_timeout_seconds=180,
+                stream_progress=True,
             )
-        if not audio_files:
-            raise RuntimeError("yt-dlp audio extraction produced no audio file")
-        _log(f"audio extraction finished for {identity.display_name}")
-        if self.use_cache:
-            try:
-                store_media_bytes(cache_identity, audio_files[0].read_bytes())
-                _log(f"stored extracted audio cache for {identity.display_name}")
-            except OSError:
-                pass
-        return audio_files[0]
+            if result.returncode != 0:
+                raise RuntimeError(f"yt-dlp audio extraction failed: {result.stderr}")
+
+            audio_dir = Path(tmpdir)
+            audio_files = sorted(audio_dir.glob("*.mp3"))
+            if not audio_files:
+                audio_files = sorted(
+                    path
+                    for path in audio_dir.iterdir()
+                    if path.is_file()
+                    and path.suffix.lower() in _AUDIO_EXTRACTION_SUFFIXES
+                )
+            if not audio_files:
+                raise RuntimeError("yt-dlp audio extraction produced no audio file")
+            _log(f"audio extraction finished for {identity.display_name}")
+            if self.use_cache:
+                try:
+                    store_media_bytes(cache_identity, audio_files[0].read_bytes())
+                    _log(f"stored extracted audio cache for {identity.display_name}")
+                except OSError:
+                    pass
+            return audio_files[0]
 
     def _extract_video(self) -> Path:
         from .cache import (
             get_cached_media_bytes,
             store_media_bytes,
         )
+        from ..shared.concurrency import download_lane
         from contextualize.runtime import get_refresh_videos
 
         identity = self._get_identity()
@@ -1650,45 +1654,48 @@ class YtDlpReference:
         tmpdir = tempfile.mkdtemp(prefix="ytdlp-video-")
         output_template = os.path.join(tmpdir, f"{identity.slug}.%(ext)s")
 
-        result = _run_ytdlp(
-            [
-                "-f",
-                "bv*[height<=720][ext=mp4]/bv*[height<=720]/best[height<=720]/best",
-                "--merge-output-format",
-                "mp4",
-                "--concurrent-fragments",
-                "16",
-                "--newline",
-                "--progress",
-                "--socket-timeout",
-                "30",
-                "--no-playlist",
-                "-o",
-                output_template,
-                "--",
-                self._metadata_url(),
-            ],
-            timeout_seconds=None,
-            idle_timeout_seconds=180,
-            stream_progress=True,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"yt-dlp video extraction failed: {result.stderr}")
+        with download_lane():
+            result = _run_ytdlp(
+                [
+                    "-f",
+                    "bv*[height<=720][ext=mp4]/bv*[height<=720]/best[height<=720]/best",
+                    "--merge-output-format",
+                    "mp4",
+                    "--concurrent-fragments",
+                    "16",
+                    "--newline",
+                    "--progress",
+                    "--socket-timeout",
+                    "30",
+                    "--no-playlist",
+                    "-o",
+                    output_template,
+                    "--",
+                    self._metadata_url(),
+                ],
+                timeout_seconds=None,
+                idle_timeout_seconds=180,
+                stream_progress=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"yt-dlp video extraction failed: {result.stderr}")
 
-        video_dir = Path(tmpdir)
-        video_files = sorted(video_dir.glob("*.mp4"))
-        if not video_files:
-            video_files = sorted(path for path in video_dir.iterdir() if path.is_file())
-        if not video_files:
-            raise RuntimeError("yt-dlp video extraction produced no video file")
-        _log(f"video extraction finished for {identity.display_name}")
-        if self.use_cache:
-            try:
-                store_media_bytes(cache_identity, video_files[0].read_bytes())
-                _log(f"stored extracted video cache for {identity.display_name}")
-            except OSError:
-                pass
-        return video_files[0]
+            video_dir = Path(tmpdir)
+            video_files = sorted(video_dir.glob("*.mp4"))
+            if not video_files:
+                video_files = sorted(
+                    path for path in video_dir.iterdir() if path.is_file()
+                )
+            if not video_files:
+                raise RuntimeError("yt-dlp video extraction produced no video file")
+            _log(f"video extraction finished for {identity.display_name}")
+            if self.use_cache:
+                try:
+                    store_media_bytes(cache_identity, video_files[0].read_bytes())
+                    _log(f"stored extracted video cache for {identity.display_name}")
+                except OSError:
+                    pass
+            return video_files[0]
 
     def _get_transcript_result(self, _duration: int):
         audio_path = None
