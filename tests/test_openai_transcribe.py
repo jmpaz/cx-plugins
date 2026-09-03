@@ -17,10 +17,12 @@ class _Response:
         *,
         text: str = "",
         payload: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.status_code = status_code
         self.text = text
         self._payload = payload
+        self.headers = headers or {}
 
     def json(self) -> dict[str, object]:
         if self._payload is None:
@@ -302,7 +304,70 @@ def test_openai_provider_uses_bounded_network_timeout_when_unbounded(
     )
 
     assert result.text == "transcribed"
-    assert captured["timeout"] == (10.0, 1800.0)
+    assert captured["timeout"] == (10.0, 300.0)
+
+
+def test_openai_provider_read_timeout_is_env_overridable(
+    openai_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _post(url: str, **kwargs: object) -> _Response:
+        captured["timeout"] = kwargs.get("timeout")
+        return _Response(200, payload={"text": "transcribed"})
+
+    monkeypatch.setattr(openai, "_requests_post", _post)
+    monkeypatch.setenv("OPENAI_TRANSCRIPTION_READ_TIMEOUT", "45")
+
+    openai.build_openai_provider().transcribe(
+        TranscriptionRequest(
+            data=b"audio",
+            filename="clip.mp3",
+            content_type="audio/mpeg",
+            timeout=None,
+            language=None,
+            prompt="",
+            bias_terms=(),
+            diarize=False,
+            speaker_count=None,
+        )
+    )
+
+    assert captured["timeout"] == (10.0, 45.0)
+
+
+def test_openai_provider_populates_retry_after_on_429(
+    openai_env: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _post(url: str, **kwargs: object) -> _Response:
+        return _Response(
+            429,
+            text='{"error":{"message":"transcription queue is full"}}',
+            headers={"Retry-After": "7"},
+        )
+
+    monkeypatch.setattr(openai, "_requests_post", _post)
+
+    with pytest.raises(TranscriptionProviderError) as excinfo:
+        openai.build_openai_provider().transcribe(
+            TranscriptionRequest(
+                data=b"audio",
+                filename="clip.mp3",
+                content_type="audio/mpeg",
+                timeout=None,
+                language=None,
+                prompt="",
+                bias_terms=(),
+                diarize=False,
+                speaker_count=None,
+            )
+        )
+
+    assert excinfo.value.status_code == 429
+    assert excinfo.value.retryable is True
+    assert excinfo.value.retry_after == 7.0
 
 
 def test_openai_provider_verbose_logs_to_stderr(

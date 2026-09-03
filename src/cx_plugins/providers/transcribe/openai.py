@@ -5,7 +5,9 @@ import mimetypes
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 import shutil
 import subprocess
@@ -37,7 +39,7 @@ _PARAGRAPH_TARGET_CHARS = 420
 _PARAGRAPH_MAX_CHARS = 620
 _TRANSCRIPT_FORMAT_VERSION = 2
 _UNBOUNDED_CONNECT_TIMEOUT_SECONDS = 10.0
-_UNBOUNDED_READ_TIMEOUT_SECONDS = 1800.0
+_UNBOUNDED_READ_TIMEOUT_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -74,10 +76,37 @@ def _log(message: str) -> None:
         return
 
 
+def _unbounded_read_timeout_seconds() -> float:
+    raw = (os.environ.get("OPENAI_TRANSCRIPTION_READ_TIMEOUT") or "").strip()
+    if not raw:
+        return _UNBOUNDED_READ_TIMEOUT_SECONDS
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return _UNBOUNDED_READ_TIMEOUT_SECONDS
+    return parsed if parsed > 0 else _UNBOUNDED_READ_TIMEOUT_SECONDS
+
+
 def _network_timeout(timeout: float | None) -> float | tuple[float, float]:
     if timeout is not None:
         return timeout
-    return (_UNBOUNDED_CONNECT_TIMEOUT_SECONDS, _UNBOUNDED_READ_TIMEOUT_SECONDS)
+    return (_UNBOUNDED_CONNECT_TIMEOUT_SECONDS, _unbounded_read_timeout_seconds())
+
+
+def _retry_after_seconds(resp: object) -> float | None:
+    headers = getattr(resp, "headers", None) or {}
+    retry_after = headers.get("Retry-After")
+    if not retry_after:
+        return None
+    try:
+        return max(0.0, float(retry_after))
+    except ValueError:
+        pass
+    try:
+        parsed = parsedate_to_datetime(retry_after)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, parsed.timestamp() - time.time())
 
 
 def build_openai_provider() -> TranscriptionProvider:
@@ -584,6 +613,7 @@ def _transcribe_openai_once(
             f"OpenAI-compatible transcription failed: {response.status_code} {response.text}",
             retryable=response.status_code >= 500 or response.status_code == 429,
             status_code=response.status_code,
+            retry_after=_retry_after_seconds(response),
         )
     try:
         payload = response.json()
