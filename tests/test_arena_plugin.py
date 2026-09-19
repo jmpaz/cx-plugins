@@ -1399,7 +1399,7 @@ def test_render_pdf_attachment_preview_ignores_old_render_cache(
 
     def _cached(_block_id, _updated_at, *, render_variant):
         seen_variants.append(render_variant)
-        if "attachment-fallback=2" not in render_variant:
+        if "attachment-fallback=3" not in render_variant:
             return "[Attachment: stale.pdf]"
         return None
 
@@ -1435,9 +1435,30 @@ def test_render_pdf_attachment_preview_ignores_old_render_cache(
     )
 
     assert seen_variants
-    assert all("attachment-fallback=2" in variant for variant in seen_variants)
+    assert all("attachment-fallback=3" in variant for variant in seen_variants)
     assert "[Attachment: stale.pdf]" not in rendered
     assert "Fresh preview." in rendered
+
+
+def test_video_attachment_fallback_is_not_complete() -> None:
+    block = {
+        "type": "Attachment",
+        "attachment": {
+            "filename": "demo.mp4",
+            "content_type": "video/mp4",
+        },
+    }
+
+    assert not arena._media_description_is_complete(
+        block,
+        "# Video (auto-generated):\nDetailed video analysis was unavailable; this fallback preserves video modality.",
+        requested=True,
+    )
+    assert arena._media_description_is_complete(
+        block,
+        "# Video (auto-generated):\nA person demonstrates a voice-controlled application.",
+        requested=True,
+    )
 
 
 def test_render_channel_block_uses_header_added_line_and_other_channels(

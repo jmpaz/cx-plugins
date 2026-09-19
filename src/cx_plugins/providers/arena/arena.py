@@ -2734,6 +2734,8 @@ def _media_description_is_complete(
 ) -> bool:
     if not requested:
         return True
+    if "detailed video analysis was unavailable" in rendered.lower():
+        return False
     block_type = block.get("class") or block.get("type", "")
     if block_type == "Image":
         return "(auto-generated)" in rendered
@@ -2809,7 +2811,7 @@ def _render_block_uncollapsed(
         f":media={int(bool(include_media_descriptions))}"
     )
     if block_type == "Attachment":
-        render_variant += ":attachment-fallback=2"
+        render_variant += ":attachment-fallback=3"
 
     date = _format_date_line(block, block_title=title, block_type=str(block_type))
     core_output: str | None = None
